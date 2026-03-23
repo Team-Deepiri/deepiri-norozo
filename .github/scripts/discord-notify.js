@@ -19,8 +19,7 @@ if (!EVENT_PATH || !fs.existsSync(EVENT_PATH)) {
 }
 
 function readEventPayload() {
-  const raw = fs.readFileSync(EVENT_PATH, "utf8");
-  return JSON.parse(raw);
+  return JSON.parse(fs.readFileSync(EVENT_PATH, "utf8"));
 }
 
 function truncate(text, max = 180) {
@@ -35,80 +34,130 @@ function normalizeRef(ref) {
   return ref;
 }
 
-function colorForEvent(eventName, action) {
-  if (eventName === "push") return 0x57f287;
-  if (eventName === "pull_request" && action === "closed") return 0xed4245;
-  if (eventName === "issues" && action === "closed") return 0xed4245;
-  if (eventName === "release") return 0xfee75c;
-  return 0x5865f2;
+function colorForEvent(eventName, action, extra = {}) {
+  if (eventName === "push") return 0x2f855a;
+  if (eventName === "pull_request" && action === "opened") return 0x2563eb;
+  if (eventName === "pull_request" && action === "reopened") return 0x2563eb;
+  if (eventName === "pull_request" && action === "closed" && extra.merged) return 0x7c3aed;
+  if (eventName === "pull_request" && action === "closed") return 0x6b7280;
+  if (eventName === "issues" && action === "opened") return 0x2563eb;
+  if (eventName === "issues" && action === "labeled") return 0xb45309;
+  if (eventName === "issues" && action === "closed") return 0x6b7280;
+  if (eventName === "create") return 0x0f766e;
+  if (eventName === "release") return 0xb45309;
+  return 0x374151;
+}
+
+function baseEmbed({ title, description, url, color, fields }) {
+  const embed = {
+    title,
+    description,
+    color,
+    fields,
+    timestamp: new Date().toISOString()
+  };
+
+  if (url) {
+    embed.url = url;
+  }
+
+  if (RUN_ID) {
+    embed.footer = {
+      text: `GitHub Actions • Run ${RUN_ID}`
+    };
+  }
+
+  return embed;
+}
+
+function commonFields(common, eventValue, extraFields = []) {
+  return [
+    { name: "Repository", value: `\`${common.repo}\``, inline: true },
+    { name: "Event", value: `\`${eventValue}\``, inline: true },
+    { name: "Actor", value: `\`${common.actor}\``, inline: true },
+    ...extraFields
+  ];
 }
 
 function buildPushEmbed(payload, common) {
   const branch = normalizeRef(payload.ref);
   const commits = Array.isArray(payload.commits) ? payload.commits : [];
-  const commitLines = commits.slice(0, 5).map((commit) => {
+
+  const commitLines = commits.slice(0, 4).map((commit) => {
     const shortSha = (commit.id || "").slice(0, 7);
-    const message = truncate((commit.message || "").split("\n")[0], 90);
+    const summary = truncate((commit.message || "").split("\n")[0], 72);
     const url = commit.url || common.link;
-    return `• [\`${shortSha}\`](${url}) ${message}`;
+    return `[\`${shortSha}\`](${url}) ${summary}`;
   });
 
-  const extraCommitCount = commits.length > 5 ? `\n• and ${commits.length - 5} more commit(s)` : "";
-  const description =
-    `${commits.length} commit(s) pushed to \`${branch}\`` +
-    (commitLines.length ? `\n\n${commitLines.join("\n")}${extraCommitCount}` : "");
+  const commitBlock = commitLines.length
+    ? `\n\n${commitLines.join("\n")}${commits.length > 4 ? `\n…and ${commits.length - 4} more commit(s).` : ""}`
+    : "";
 
-  return {
-    title: "Push",
-    description,
-    fields: [
-      { name: "Repository", value: common.repo, inline: true },
-      { name: "Event", value: "push", inline: true },
-      { name: "Actor", value: common.actor, inline: true }
-    ],
-    color: colorForEvent("push"),
+  return baseEmbed({
+    title: `Push to ${branch}`,
+    description: `${commits.length} commit(s) pushed to \`${branch}\`.${commitBlock}`,
     url: payload.compare || payload.head_commit?.url || common.link,
-    timestamp: new Date().toISOString()
-  };
+    color: colorForEvent("push"),
+    fields: commonFields(common, "push", [
+      { name: "Branch", value: `\`${branch}\``, inline: true }
+    ])
+  });
 }
 
 function buildPullRequestEmbed(payload, common) {
   const pr = payload.pull_request || {};
-  const isMerged = payload.action === "closed" && pr.merged;
-  const actionLabel = isMerged ? "merged" : payload.action;
+  const merged = payload.action === "closed" && pr.merged;
 
-  return {
-    title: `Pull Request ${actionLabel}`,
-    description: `[#${pr.number || "?"}](${pr.html_url || common.link}) ${truncate(pr.title || "(no title)", 140)}`,
-    fields: [
-      { name: "Repository", value: common.repo, inline: true },
-      { name: "Event", value: `pull_request.${actionLabel}`, inline: true },
-      { name: "Actor", value: common.actor, inline: true }
-    ],
-    color: colorForEvent("pull_request", payload.action),
+  let title = "Pull request updated";
+  let eventValue = `pull_request.${payload.action}`;
+
+  if (payload.action === "opened") title = "Pull request opened";
+  if (payload.action === "reopened") title = "Pull request reopened";
+  if (payload.action === "closed" && !merged) title = "Pull request closed";
+  if (merged) {
+    title = "Pull request merged";
+    eventValue = "pull_request.merged";
+  }
+
+  const branchInfo = [];
+  if (pr.head?.ref) branchInfo.push(`Source: \`${pr.head.ref}\``);
+  if (pr.base?.ref) branchInfo.push(`Target: \`${pr.base.ref}\``);
+
+  return baseEmbed({
+    title,
+    description: `[#${pr.number || "?"}](${pr.html_url || common.link}) ${truncate(pr.title || "(no title)", 140)}${branchInfo.length ? `\n\n${branchInfo.join("\n")}` : ""}`,
     url: pr.html_url || common.link,
-    timestamp: new Date().toISOString()
-  };
+    color: colorForEvent("pull_request", payload.action, { merged }),
+    fields: commonFields(common, eventValue)
+  });
 }
 
 function buildIssuesEmbed(payload, common) {
   const issue = payload.issue || {};
   const labelName = payload.label?.name;
-  const eventValue = labelName ? `issues.${payload.action} (${labelName})` : `issues.${payload.action}`;
-  const labelLine = labelName ? `\nLabel: \`${labelName}\`` : "";
 
-  return {
-    title: `Issue ${payload.action}`,
-    description: `[#${issue.number || "?"}](${issue.html_url || common.link}) ${truncate(issue.title || "(no title)", 140)}${labelLine}`,
-    fields: [
-      { name: "Repository", value: common.repo, inline: true },
-      { name: "Event", value: eventValue, inline: true },
-      { name: "Actor", value: common.actor, inline: true }
-    ],
-    color: colorForEvent("issues", payload.action),
+  let title = "Issue updated";
+  if (payload.action === "opened") title = "Issue opened";
+  if (payload.action === "closed") title = "Issue closed";
+  if (payload.action === "labeled") title = "Issue labeled";
+
+  const extraFields = [];
+  if (labelName) {
+    extraFields.push({ name: "Label", value: `\`${labelName}\``, inline: true });
+  }
+
+  return baseEmbed({
+    title,
+    description: `[#${issue.number || "?"}](${issue.html_url || common.link}) ${truncate(issue.title || "(no title)", 140)}`,
     url: issue.html_url || common.link,
-    timestamp: new Date().toISOString()
-  };
+    color: colorForEvent("issues", payload.action),
+    fields: commonFields(
+      common,
+      labelName ? `issues.${payload.action}` : `issues.${payload.action}`,
+      extraFields
+    )
+  });
 }
 
 function buildCreateEmbed(payload, common) {
@@ -118,37 +167,31 @@ function buildCreateEmbed(payload, common) {
 
   const branch = payload.ref || "unknown";
 
-  return {
+  return baseEmbed({
     title: "Branch created",
-    description: `Branch \`${branch}\` was created.`,
-    fields: [
-      { name: "Repository", value: common.repo, inline: true },
-      { name: "Event", value: "create.branch", inline: true },
-      { name: "Actor", value: common.actor, inline: true }
-    ],
-    color: colorForEvent("create"),
+    description: `A new branch was created: \`${branch}\`.`,
     url: `${SERVER_URL}/${common.repo}/tree/${encodeURIComponent(branch)}`,
-    timestamp: new Date().toISOString()
-  };
+    color: colorForEvent("create"),
+    fields: commonFields(common, "create.branch", [
+      { name: "Branch", value: `\`${branch}\``, inline: true }
+    ])
+  });
 }
 
 function buildReleaseEmbed(payload, common) {
   const release = payload.release || {};
   const tag = release.tag_name || "unknown-tag";
-  const title = release.name ? truncate(release.name, 120) : `Release ${tag}`;
+  const releaseName = release.name ? truncate(release.name, 120) : `Release ${tag}`;
 
-  return {
+  return baseEmbed({
     title: "Release published",
-    description: `[${title}](${release.html_url || common.link})`,
-    fields: [
-      { name: "Repository", value: common.repo, inline: true },
-      { name: "Event", value: "release.published", inline: true },
-      { name: "Actor", value: common.actor, inline: true }
-    ],
-    color: colorForEvent("release"),
+    description: `[${releaseName}](${release.html_url || common.link})`,
     url: release.html_url || common.link,
-    timestamp: new Date().toISOString()
-  };
+    color: colorForEvent("release"),
+    fields: commonFields(common, "release.published", [
+      { name: "Tag", value: `\`${tag}\``, inline: true }
+    ])
+  });
 }
 
 function buildEmbed(eventName, payload, common) {
@@ -171,15 +214,13 @@ function buildEmbed(eventName, payload, common) {
 async function sendToDiscord(webhookUrl, body) {
   const response = await fetch(webhookUrl, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body)
   });
 
   if (!response.ok) {
-    const responseText = await response.text();
-    throw new Error(`Discord webhook failed: ${response.status} ${responseText}`);
+    const text = await response.text();
+    throw new Error(`Discord webhook failed: ${response.status} ${text}`);
   }
 }
 
@@ -188,19 +229,13 @@ async function main() {
   const repo = payload.repository?.full_name || REPO_FALLBACK;
   const actor = payload.sender?.login || ACTOR_FALLBACK;
   const link = payload.repository?.html_url || `${SERVER_URL}/${repo}`;
-
   const common = { repo, actor, link };
+
   const embed = buildEmbed(EVENT_NAME, payload, common);
 
   if (!embed) {
     console.log(`No Discord message sent for event: ${EVENT_NAME}`);
     return;
-  }
-
-  if (RUN_ID) {
-    embed.footer = {
-      text: `GitHub Actions run ${RUN_ID}`
-    };
   }
 
   const body = {
