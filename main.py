@@ -13,6 +13,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 from github import invite_user
+from meetings import setup_meeting_features
 from onboarding import ApprovalView
 from plaky import create_task, get_tasks
 
@@ -99,6 +100,7 @@ class DeepiriBot(commands.Bot):
 
 
 bot = DeepiriBot()
+meeting_service = setup_meeting_features(bot)
 
 
 def _extract_github_profile_username(message_content: str) -> Optional[str]:
@@ -164,6 +166,8 @@ async def _channel_from_id(channel_id: Optional[int]) -> Optional[discord.TextCh
 @bot.event
 async def on_ready() -> None:
     print(f"Logged in as {bot.user} (id={bot.user.id if bot.user else 'unknown'})")
+
+    meeting_service.start_loop()
 
     if bot.webhook_runner is None:
         await start_webhook_server()
