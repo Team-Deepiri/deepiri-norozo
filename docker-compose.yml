@@ -1,34 +1,11 @@
-version: '3.8'
-
 services:
-  discord-bot:
+  discord-github-discussions-bridge:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: deepiri-notideep-bot
+    container_name: deepiri-discussions-bridge
     restart: unless-stopped
-    ports:
-      - "8080:8080"
-    environment:
-      - DISCORD_TOKEN=${DISCORD_TOKEN}
-      - GITHUB_PAT=${GITHUB_PAT}
-      - GITHUB_ORG=${GITHUB_ORG}
-      - PLAKY_API_KEY=${PLAKY_API_KEY}
-      - PLAKY_WEBHOOK_SECRET=${PLAKY_WEBHOOK_SECRET}
-      - STAFF_CHANNEL_ID=${STAFF_CHANNEL_ID}
-      - PR_CHANNEL_ID=${PR_CHANNEL_ID}
-      - QA_CHANNEL_ID=${QA_CHANNEL_ID}
-      - SERVER_COM_CHANNEL_ID=${SERVER_COM_CHANNEL_ID}
-      - DEV_TEAM_ROLE_ID=${DEV_TEAM_ROLE_ID}
-      - WEBHOOK_HOST=0.0.0.0
-      - WEBHOOK_PORT=8080
     env_file:
       - .env
-    volumes:
-      - ./logs:/app/logs
-    networks:
-      - deepiri-network
-
-networks:
-  deepiri-network:
-    driver: bridge
+    environment:
+      - LOG_LEVEL=INFO
