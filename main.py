@@ -267,8 +267,7 @@ async def on_message(message: discord.Message) -> None:
     await bot.process_commands(message)
 
 
-@bot.tree.command(name="ipca-signed", description="Request DEV team access after signing IPCA")
-async def ipca_signed(interaction: discord.Interaction) -> None:
+async def handle_ipca_signed(interaction: discord.Interaction) -> None:
     if STAFF_CHANNEL_ID is None:
         await interaction.response.send_message("STAFF_CHANNEL_ID is not configured.", ephemeral=True)
         return
@@ -288,9 +287,23 @@ async def ipca_signed(interaction: discord.Interaction) -> None:
         description=f"User {interaction.user.mention} says they signed IPCA. Click Approve to grant DEV team role.",
         color=discord.Color.green(),
     )
-    await staff_channel.send(embed=embed, view=view)
+    await interaction.response.defer(ephemeral=True)
 
-    await interaction.response.send_message("Your approval request was sent to staff.", ephemeral=True)
+    try:
+        await staff_channel.send(embed=embed, view=view)
+    except Exception:
+        logger.exception("Failed to post IPCA approval request to staff channel %s", STAFF_CHANNEL_ID)
+        await interaction.edit_original_response(
+            content="I could not send your approval request to the staff channel."
+        )
+        return
+
+    await interaction.edit_original_response(content="Your approval request was sent to staff.")
+
+
+@bot.tree.command(name="ipca-signed", description="Request DEV team access after signing IPCA")
+async def ipca_signed(interaction: discord.Interaction) -> None:
+    await handle_ipca_signed(interaction)
 
 
 @bot.tree.command(name="plaky-request", description="Create a Plaky task")
