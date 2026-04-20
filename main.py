@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import asyncio
 from urllib.parse import urlparse
 from typing import Optional
 
@@ -49,7 +50,10 @@ PR_CHANNEL_ID = _int_env("PR_CHANNEL_ID")
 QA_CHANNEL_ID = _int_env("QA_CHANNEL_ID")
 SERVER_COM_CHANNEL_ID = _int_env("SERVER_COM_CHANNEL_ID")
 DEV_TEAM_ROLE_ID = _int_env("DEV_TEAM_ROLE_ID")
+AVAILABLE_ROLE_ID = _int_env("AVAILABLE_ROLE_ID")
 STAFF_ROLE_ID = _int_env("STAFF_ROLE_ID")
+SUPPORT_SESSIONS_CHANNEL_ID = _int_env("SUPPORT_SESSIONS_CHANNEL_ID")
+IT_OPERATIONS_SUPPORT_ROLE_ID = _int_env("IT_OPERATIONS_SUPPORT_ROLE_ID") or _int_env("SUPPORT_TEAM_ROLE_ID")
 
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "0.0.0.0")
 WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8080"))
@@ -102,8 +106,8 @@ class DeepiriBot(commands.Bot):
         self.webhook_runner: Optional[web.AppRunner] = None
 
     async def setup_hook(self) -> None:
-        if DEV_TEAM_ROLE_ID is not None:
-            self.add_view(ApprovalView(dev_team_role_id=DEV_TEAM_ROLE_ID))
+        if DEV_TEAM_ROLE_ID is not None and AVAILABLE_ROLE_ID is not None:
+            self.add_view(ApprovalView(dev_team_role_id=DEV_TEAM_ROLE_ID, available_role_id=AVAILABLE_ROLE_ID))
         await self.tree.sync()
 
 
@@ -182,6 +186,55 @@ def _poll_option_emoji(index: int) -> str:
     return emojis[index] if index < len(emojis) else str(index + 1)
 
 
+async def notify_support_team_for_message(message: discord.Message) -> None:
+    if SUPPORT_SESSIONS_CHANNEL_ID is None or IT_OPERATIONS_SUPPORT_ROLE_ID is None:
+        return
+
+    channel_id = getattr(message.channel, "id", None)
+    parent_channel_id = getattr(message.channel, "parent_id", None)
+    if channel_id != SUPPORT_SESSIONS_CHANNEL_ID and parent_channel_id != SUPPORT_SESSIONS_CHANNEL_ID:
+        return
+
+    if not message.guild:
+        return
+
+    support_role = message.guild.get_role(IT_OPERATIONS_SUPPORT_ROLE_ID)
+    if support_role is None:
+        logger.warning(
+            "Support notification skipped: role %s not found in guild %s",
+            IT_OPERATIONS_SUPPORT_ROLE_ID,
+            message.guild.id,
+        )
+        return
+
+    support_members = [member for member in support_role.members if not member.bot and member.id != message.author.id]
+    if not support_members:
+        return
+
+    preview = (message.content or "").strip()
+    if len(preview) > 300:
+        preview = preview[:297].rstrip() + "..."
+
+    message_link = getattr(message, "jump_url", "")
+    body_lines = [
+        "New message in support sessions.",
+        f"From: {message.author}",
+        f"Channel: #{getattr(message.channel, 'name', 'support-sessions')}",
+    ]
+    if preview:
+        body_lines.append(f"Message: {preview}")
+    if message_link:
+        body_lines.append(f"Link: {message_link}")
+
+    dm_text = "\n".join(body_lines)
+    send_tasks = [member.send(dm_text) for member in support_members]
+    results = await asyncio.gather(*send_tasks, return_exceptions=True)
+
+    failures = sum(1 for result in results if isinstance(result, Exception))
+    if failures:
+        logger.warning("Support DM sent with %s failures out of %s recipients", failures, len(support_members))
+
+
 @bot.event
 async def on_ready() -> None:
     print(f"Logged in as {bot.user} (id={bot.user.id if bot.user else 'unknown'})")
@@ -197,13 +250,13 @@ async def on_member_join(member: discord.Member) -> None:
     welcome_channel = await _channel_from_id(SERVER_COM_CHANNEL_ID)
     if welcome_channel:
         await welcome_channel.send(
-            f"Welcome {member.mention}! Please sign the IPCA first, then run /ipca-signed to request DEV team access."
+            f"Welcome {member.mention}! Please sign the IPCA first, then run /ipca-signed to request Available and DEV team roles."
         )
 
     try:
         await member.send(
             "Welcome to Deepiri. Before joining the DEV team, please sign the IPCA. "
-            "After signing, run /ipca-signed in the server so staff can approve your role."
+            "After signing, run /ipca-signed in the server so IT/staff can approve your Available and DEV team roles."
         )
     except discord.Forbidden:
         pass
@@ -215,6 +268,8 @@ async def on_message(message: discord.Message) -> None:
         return
 
     content = message.content or ""
+
+    await notify_support_team_for_message(message)
 
     if PR_CHANNEL_ID and message.channel.id == PR_CHANNEL_ID:
         pr_match = PR_URL_RE.search(content)
@@ -276,29 +331,36 @@ async def handle_ipca_signed(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("DEV_TEAM_ROLE_ID is not configured.", ephemeral=True)
         return
 
-    staff_channel = await _channel_from_id(STAFF_CHANNEL_ID)
-    if not staff_channel:
+    if AVAILABLE_ROLE_ID is None:
+        await interaction.response.send_message("AVAILABLE_ROLE_ID is not configured.", ephemeral=True)
+        return
+
+    approval_channel = await _channel_from_id(STAFF_CHANNEL_ID)
+    if not approval_channel:
         await interaction.response.send_message("Could not find the configured staff channel.", ephemeral=True)
         return
 
-    view = ApprovalView(dev_team_role_id=DEV_TEAM_ROLE_ID)
+    view = ApprovalView(dev_team_role_id=DEV_TEAM_ROLE_ID, available_role_id=AVAILABLE_ROLE_ID)
     embed = discord.Embed(
         title="IPCA Approval Request",
-        description=f"User {interaction.user.mention} says they signed IPCA. Click Approve to grant DEV team role.",
+        description=(
+            f"User {interaction.user.mention} says they signed IPCA. "
+            "Click Approve to grant Available and DEV team roles."
+        ),
         color=discord.Color.green(),
     )
     await interaction.response.defer(ephemeral=True)
 
     try:
-        await staff_channel.send(embed=embed, view=view)
+        await approval_channel.send(embed=embed, view=view)
     except Exception:
-        logger.exception("Failed to post IPCA approval request to staff channel %s", STAFF_CHANNEL_ID)
+        logger.exception("Failed to post IPCA approval request to channel %s", STAFF_CHANNEL_ID)
         await interaction.edit_original_response(
             content="I could not send your approval request to the staff channel."
         )
         return
 
-    await interaction.edit_original_response(content="Your approval request was sent to staff.")
+    await interaction.edit_original_response(content="Your approval request was sent to staff for review.")
 
 
 @bot.tree.command(name="ipca-signed", description="Request DEV team access after signing IPCA")

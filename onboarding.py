@@ -5,9 +5,10 @@ import re
 class ApprovalView(discord.ui.View):
     MENTION_RE = re.compile(r"<@!?(\d+)>")
 
-    def __init__(self, dev_team_role_id: int):
+    def __init__(self, dev_team_role_id: int, available_role_id: int):
         super().__init__(timeout=None)
         self.dev_team_role_id = dev_team_role_id
+        self.available_role_id = available_role_id
 
     def _extract_target_user_id(self, interaction: discord.Interaction) -> int | None:
         message = interaction.message
@@ -46,9 +47,13 @@ class ApprovalView(discord.ui.View):
             await interaction.response.send_message("You do not have permission to approve this request.", ephemeral=True)
             return
 
-        role = interaction.guild.get_role(self.dev_team_role_id)
-        if role is None:
-            await interaction.response.send_message("Configured DEV team role was not found.", ephemeral=True)
+        dev_role = interaction.guild.get_role(self.dev_team_role_id)
+        available_role = interaction.guild.get_role(self.available_role_id)
+        if dev_role is None or available_role is None:
+            await interaction.response.send_message(
+                "Configured Available/DEV team roles were not found.",
+                ephemeral=True,
+            )
             return
 
         member = interaction.guild.get_member(target_user_id)
@@ -63,10 +68,10 @@ class ApprovalView(discord.ui.View):
             return
 
         try:
-            await member.add_roles(role, reason="IPCA approved by staff")
+            await member.add_roles(available_role, dev_role, reason="IPCA approved by staff")
         except discord.Forbidden:
             await interaction.response.send_message(
-                "I do not have permission to assign this role. Check role hierarchy and permissions.",
+                "I do not have permission to assign these roles. Check role hierarchy and permissions.",
                 ephemeral=True,
             )
             return
@@ -84,4 +89,6 @@ class ApprovalView(discord.ui.View):
             )
             await interaction.message.edit(view=disabled_view)
 
-        await interaction.response.send_message(f"Approved. {member.mention} has been assigned {role.mention}.")
+        await interaction.response.send_message(
+            f"Approved. {member.mention} has been assigned {available_role.mention} and {dev_role.mention}."
+        )
