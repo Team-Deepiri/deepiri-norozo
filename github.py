@@ -45,6 +45,16 @@ def _get_user_id(username: str, github_pat: str) -> Dict[str, Any]:
     url = f"{GITHUB_API_BASE}/users/{username}"
     response = _request_with_rate_limit_retry("GET", url, headers=headers)
 
+    if response.status_code in (401, 403):
+        return {
+            "ok": False,
+            "status": response.status_code,
+            "message": (
+                "GitHub authentication failed while resolving the username. "
+                "Check that GITHUB_PAT is valid and has permission to read GitHub users."
+            ),
+        }
+
     if response.status_code != 200:
         return {
             "ok": False,
@@ -100,6 +110,17 @@ def invite_user(username: str, github_org: str, github_pat: str) -> Dict[str, An
             "ok": False,
             "status": 429,
             "message": "GitHub API rate limited the request. Please retry shortly.",
+        }
+
+    if response.status_code == 403:
+        return {
+            "ok": False,
+            "status": 403,
+            "message": (
+                "GitHub invite failed (403): the PAT does not have permission to create organization "
+                "invitations. Use an org owner/admin token with the required organization permissions "
+                "(and SSO authorization if your org requires it)."
+            ),
         }
 
     if response.status_code == 422:

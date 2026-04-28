@@ -1,11 +1,18 @@
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import discord
 import pytest
 
 import main
+import onboarding
+
+
+class FakeInviteView:
+    def __init__(self, github_org: str, github_pat: str):
+        self.github_org = github_org
+        self.github_pat = github_pat
 
 
 class FakeApprovalView:
@@ -19,15 +26,6 @@ class FakeRole:
         self.id = role_id
         self.mention = mention
         self.members = members or []
-
-
-class FakeGuild:
-    def __init__(self, roles):
-        self.roles = {role.id: role for role in roles}
-        self.id = 999
-
-    def get_role(self, role_id: int):
-        return self.roles.get(role_id)
 
 
 class FakeMember:
@@ -46,50 +44,103 @@ class FakeMember:
         return None
 
 
+class FakeStaffMember(FakeMember):
+    def __init__(self, member_id: int, mention: str):
+        super().__init__(member_id, mention)
+        self.guild_permissions = SimpleNamespace(manage_roles=True, administrator=False)
+
+
+class FakeGuild:
+    def __init__(self, roles):
+        self.roles = {role.id: role for role in roles}
+        self.id = 999
+
+    def get_role(self, role_id: int):
+        return self.roles.get(role_id)
+
+
+class FakeGuildWithMember:
+    def __init__(self, member):
+        self.member = member
+        self.id = 999
+
+    def get_member(self, member_id: int):
+        return self.member if member_id == self.member.id else None
+
+    async def fetch_member(self, member_id: int):
+        if member_id == self.member.id:
+            return self.member
+        raise discord.NotFound(response=cast(Any, SimpleNamespace(status=404)), message="missing")
+
+
 @pytest.mark.asyncio
-async def test_ipca_signed_acknowledges_before_posting(monkeypatch):
+async def test_github_invite_request_requires_support_channel(monkeypatch):
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=1, mention="@test-user"),
+        channel=SimpleNamespace(id=777),
+        response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+        edit_original_response=AsyncMock(),
+    )
+
+    monkeypatch.setattr(main, "SUPPORT_SESSIONS_CHANNEL_ID", 888)
+
+    await main.handle_github_invite_request(cast(discord.Interaction, interaction), "SomeUser")
+
+    interaction.response.send_message.assert_awaited_once_with(
+        "Please run /github-invite-request in the support tickets channel.",
+        ephemeral=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_github_invite_request_acknowledges_before_posting(monkeypatch):
     channel = SimpleNamespace(send=AsyncMock())
     interaction = SimpleNamespace(
-        user=SimpleNamespace(mention="@test-user"),
+        user=SimpleNamespace(id=10, mention="@test-user"),
+        channel=SimpleNamespace(id=888),
         response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
         edit_original_response=AsyncMock(),
     )
 
     monkeypatch.setattr(main, "STAFF_CHANNEL_ID", 999)
-    monkeypatch.setattr(main, "AVAILABLE_ROLE_ID", 123)
-    monkeypatch.setattr(main, "DEV_TEAM_ROLE_ID", 456)
-    monkeypatch.setattr(main, "ApprovalView", FakeApprovalView)
+    monkeypatch.setattr(main, "GITHUB_ORG", "Team-Deepiri")
+    monkeypatch.setattr(main, "GITHUB_PAT", "token")
+    monkeypatch.setattr(main, "GitHubInviteApprovalView", FakeInviteView)
     monkeypatch.setattr(main, "_channel_from_id", AsyncMock(return_value=channel))
+    monkeypatch.setattr(main, "SUPPORT_SESSIONS_CHANNEL_ID", 888)
 
-    await main.handle_ipca_signed(cast(discord.Interaction, interaction))
+    await main.handle_github_invite_request(cast(discord.Interaction, interaction), "HTTPS://github.com/SomeUser")
 
     interaction.response.defer.assert_awaited_once_with(ephemeral=True)
     channel.send.assert_awaited_once()
     send_kwargs = channel.send.await_args.kwargs
-    assert isinstance(send_kwargs["view"], FakeApprovalView)
-    assert send_kwargs["view"].available_role_id == 123
-    assert send_kwargs["view"].dev_team_role_id == 456
+    assert isinstance(send_kwargs["view"], FakeInviteView)
+    assert send_kwargs["view"].github_org == "Team-Deepiri"
+    assert send_kwargs["view"].github_pat == "token"
+    assert send_kwargs["embed"].fields[0].value == "someuser"
     interaction.edit_original_response.assert_awaited_once_with(
-        content="Your approval request was sent to staff for review.",
+        content="Your GitHub invite request was sent to staff for review.",
     )
 
 
 @pytest.mark.asyncio
-async def test_ipca_signed_reports_staff_post_failure(monkeypatch):
+async def test_github_invite_request_reports_staff_post_failure(monkeypatch):
     channel = SimpleNamespace(send=AsyncMock(side_effect=RuntimeError("no permission")))
     interaction = SimpleNamespace(
-        user=SimpleNamespace(mention="@test-user"),
+        user=SimpleNamespace(id=10, mention="@test-user"),
+        channel=SimpleNamespace(id=888),
         response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
         edit_original_response=AsyncMock(),
     )
 
     monkeypatch.setattr(main, "STAFF_CHANNEL_ID", 999)
-    monkeypatch.setattr(main, "AVAILABLE_ROLE_ID", 123)
-    monkeypatch.setattr(main, "DEV_TEAM_ROLE_ID", 456)
-    monkeypatch.setattr(main, "ApprovalView", FakeApprovalView)
+    monkeypatch.setattr(main, "GITHUB_ORG", "Team-Deepiri")
+    monkeypatch.setattr(main, "GITHUB_PAT", "token")
+    monkeypatch.setattr(main, "GitHubInviteApprovalView", FakeInviteView)
     monkeypatch.setattr(main, "_channel_from_id", AsyncMock(return_value=channel))
+    monkeypatch.setattr(main, "SUPPORT_SESSIONS_CHANNEL_ID", 888)
 
-    await main.handle_ipca_signed(cast(discord.Interaction, interaction))
+    await main.handle_github_invite_request(cast(discord.Interaction, interaction), "SomeUser")
 
     interaction.response.defer.assert_awaited_once_with(ephemeral=True)
     channel.send.assert_awaited_once()
@@ -179,3 +230,77 @@ async def test_support_session_thread_message_uses_parent_channel(monkeypatch):
     await main.notify_support_team_for_message(cast(discord.Message, message))
 
     support_member.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_github_invite_approval_view_invites_and_disables_button(monkeypatch):
+    requester = FakeMember(42, "@requester")
+    staff = FakeStaffMember(11, "@staff")
+    guild = FakeGuildWithMember(requester)
+    message = SimpleNamespace(
+        embeds=[
+            SimpleNamespace(
+                fields=[
+                    SimpleNamespace(name="GitHub Username", value="SomeUser"),
+                    SimpleNamespace(name="Discord User ID", value="42"),
+                ]
+            )
+        ],
+        edit=AsyncMock(),
+    )
+    interaction = SimpleNamespace(
+        guild=guild,
+        user=staff,
+        message=message,
+        response=SimpleNamespace(send_message=AsyncMock()),
+    )
+    seen = {}
+
+    def fake_invite_user(*, username: str, github_org: str, github_pat: str):
+        seen["username"] = username
+        seen["github_org"] = github_org
+        seen["github_pat"] = github_pat
+        return {"ok": True, "status": 201, "message": "Invite sent"}
+
+    monkeypatch.setattr(onboarding.discord, "Member", FakeStaffMember)
+    monkeypatch.setattr(onboarding, "invite_user", fake_invite_user)
+
+    view = onboarding.GitHubInviteApprovalView(github_org="Team-Deepiri", github_pat="token")
+
+    approve_button = view.children[0]
+    await approve_button.callback(cast(discord.Interaction, interaction))
+
+    assert seen["username"] == "SomeUser"
+    assert seen["github_org"] == "Team-Deepiri"
+    assert seen["github_pat"] == "token"
+    interaction.response.send_message.assert_awaited_once()
+    message.edit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ipca_signed_requests_roles(monkeypatch):
+    channel = SimpleNamespace(send=AsyncMock())
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=10, mention="@test-user"),
+        channel=SimpleNamespace(id=888),
+        response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+        edit_original_response=AsyncMock(),
+    )
+
+    monkeypatch.setattr(main, "STAFF_CHANNEL_ID", 999)
+    monkeypatch.setattr(main, "DEV_TEAM_ROLE_ID", 456)
+    monkeypatch.setattr(main, "AVAILABLE_ROLE_ID", 123)
+    monkeypatch.setattr(main, "ApprovalView", FakeApprovalView)
+    monkeypatch.setattr(main, "_channel_from_id", AsyncMock(return_value=channel))
+
+    await main.handle_ipca_signed(cast(discord.Interaction, interaction), "SomeUser")
+
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    channel.send.assert_awaited_once()
+    send_kwargs = channel.send.await_args.kwargs
+    assert isinstance(send_kwargs["view"], FakeApprovalView)
+    assert send_kwargs["view"].dev_team_role_id == 456
+    assert send_kwargs["view"].available_role_id == 123
+    interaction.edit_original_response.assert_awaited_once_with(
+        content="Your approval request was sent to staff for review.",
+    )
