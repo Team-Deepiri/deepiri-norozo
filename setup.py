@@ -1,7 +1,7 @@
 import argparse
 import asyncio
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Dict, List, Tuple
 
 from dotenv import load_dotenv
 
