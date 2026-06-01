@@ -14,7 +14,9 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
+from bot import format_discussion_body, format_discussion_title
 from github import invite_user
+from github_discussion import GitHubDiscussionError, create_github_discussion
 from meetings import setup_meeting_features
 from onboarding import ApprovalView, GitHubInviteApprovalView
 from plaky import create_task, get_tasks
@@ -54,6 +56,8 @@ AVAILABLE_ROLE_ID = _int_env("AVAILABLE_ROLE_ID")
 STAFF_ROLE_ID = _int_env("STAFF_ROLE_ID")
 SUPPORT_SESSIONS_CHANNEL_ID = _int_env("SUPPORT_SESSIONS_CHANNEL_ID")
 IT_OPERATIONS_SUPPORT_ROLE_ID = _int_env("IT_OPERATIONS_SUPPORT_ROLE_ID") or _int_env("SUPPORT_TEAM_ROLE_ID")
+ANNOUNCEMENTS_CHANNEL_ID = _int_env("DISCORD_CHANNEL_ID") or _int_env("ANNOUNCEMENTS_CHANNEL_ID")
+ANNOUNCEMENTS_CHANNEL_NAME = os.getenv("DISCORD_CHANNEL_NAME", "announcements")
 
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "0.0.0.0")
 WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8080"))
@@ -155,6 +159,12 @@ def _extract_github_profile_username(message_content: str) -> Optional[str]:
         return username.lower()
 
     return None
+
+
+def _is_announcements_channel(channel: object) -> bool:
+    if ANNOUNCEMENTS_CHANNEL_ID is not None:
+        return getattr(channel, "id", None) == ANNOUNCEMENTS_CHANNEL_ID
+    return getattr(channel, "name", None) == ANNOUNCEMENTS_CHANNEL_NAME
 
 
 def _is_support_sessions_channel(channel: object) -> bool:
@@ -286,6 +296,16 @@ async def on_message(message: discord.Message) -> None:
     content = message.content or ""
 
     await notify_support_team_for_message(message)
+
+    if _is_announcements_channel(message.channel):
+        title = format_discussion_title(message.content)
+        body = format_discussion_body(message)
+        try:
+            await create_github_discussion(title, body)
+            await message.add_reaction("✅")
+        except GitHubDiscussionError as exc:
+            logger.error("Discussion bridge failed for message %s: %s", message.id, exc)
+            await message.add_reaction("❌")
 
     if PR_CHANNEL_ID and message.channel.id == PR_CHANNEL_ID:
         pr_match = PR_URL_RE.search(content)

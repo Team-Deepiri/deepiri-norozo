@@ -1,8 +1,11 @@
+import logging
 import time
 from urllib.parse import urlparse
 from typing import Any, Dict, Optional
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 
 GITHUB_API_BASE = "https://api.github.com"
@@ -96,7 +99,9 @@ def invite_user(username: str, github_org: str, github_pat: str) -> Dict[str, An
     url = f"{GITHUB_API_BASE}/orgs/{normalized_org}/invitations"
     body = {"invitee_id": invitee_id}
 
+    logger.info("POST %s body=%s", url, body)
     response = _request_with_rate_limit_retry("POST", url, headers=headers, json=body)
+    logger.info("GitHub invite response: status=%s body=%s", response.status_code, response.text[:500])
 
     if response.status_code in (201, 202):
         return {
