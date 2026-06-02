@@ -264,11 +264,7 @@ async def notify_support_team_for_message(message: discord.Message) -> None:
 @bot.event
 async def on_ready() -> None:
     print(f"Logged in as {bot.user} (id={bot.user.id if bot.user else 'unknown'})")
-
     meeting_service.start_loop()
-
-    if bot.webhook_runner is None:
-        await start_webhook_server()
 
 
 @bot.event
@@ -604,8 +600,13 @@ async def start_webhook_server() -> None:
     print(f"Plaky webhook server listening on http://{WEBHOOK_HOST}:{WEBHOOK_PORT}/plaky/webhook")
 
 
+async def main() -> None:
+    await start_webhook_server()
+    await bot.start(DISCORD_TOKEN)
+
+
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         raise RuntimeError("DISCORD_TOKEN is required in .env")
 
-    bot.run(DISCORD_TOKEN)
+    asyncio.run(main())
