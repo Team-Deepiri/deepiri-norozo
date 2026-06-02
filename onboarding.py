@@ -1,5 +1,12 @@
+import asyncio
+import logging
+
 import discord
 import re
+
+from github import invite_user
+
+logger = logging.getLogger(__name__)
 
 
 class ApprovalView(discord.ui.View):
@@ -92,3 +99,109 @@ class ApprovalView(discord.ui.View):
         await interaction.response.send_message(
             f"Approved. {member.mention} has been assigned {available_role.mention} and {dev_role.mention}."
         )
+
+
+class GitHubInviteApprovalView(discord.ui.View):
+    GITHUB_USERNAME_FIELD = "GitHub Username"
+    DISCORD_USER_ID_FIELD = "Discord User ID"
+
+    def __init__(self, github_org: str, github_pat: str):
+        super().__init__(timeout=None)
+        self.github_org = github_org
+        self.github_pat = github_pat
+
+    def _extract_embed_field(self, interaction: discord.Interaction, field_name: str) -> str | None:
+        message = interaction.message
+        if not message or not message.embeds:
+            return None
+
+        for field in message.embeds[0].fields:
+            if field.name == field_name:
+                return (field.value or "").strip() or None
+
+        return None
+
+    async def _disable_button(self, interaction: discord.Interaction) -> None:
+        if not interaction.message:
+            return
+
+        disabled_view = discord.ui.View(timeout=None)
+        disabled_view.add_item(
+            discord.ui.Button(
+                label="Approve",
+                style=discord.ButtonStyle.success,
+                custom_id="github_invite_approve",
+                disabled=True,
+            )
+        )
+        await interaction.message.edit(view=disabled_view)
+
+    @discord.ui.button(label="Approve", style=discord.ButtonStyle.success, custom_id="github_invite_approve")
+    async def approve(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if not interaction.guild or not interaction.user:
+            await interaction.response.send_message("This action must be used in a server.", ephemeral=True)
+            return
+
+        clicker = interaction.user
+        is_staff = isinstance(clicker, discord.Member) and (
+            clicker.guild_permissions.manage_roles or clicker.guild_permissions.administrator
+        )
+        if not is_staff:
+            await interaction.response.send_message("You do not have permission to approve this request.", ephemeral=True)
+            return
+
+        github_username = self._extract_embed_field(interaction, self.GITHUB_USERNAME_FIELD)
+        discord_user_id = self._extract_embed_field(interaction, self.DISCORD_USER_ID_FIELD)
+        if not github_username or not discord_user_id:
+            await interaction.response.send_message(
+                "Could not determine the GitHub username or requester from this request message.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        logger.info("Sending GitHub invite for %s to org %s", github_username, self.github_org)
+        result = await asyncio.to_thread(
+            invite_user,
+            username=github_username,
+            github_org=self.github_org,
+            github_pat=self.github_pat,
+        )
+
+        if not result.get("ok"):
+            logger.error("GitHub invite failed for %s: %s", github_username, result.get("message"))
+            await interaction.followup.send(result.get("message", "GitHub invite could not be sent."), ephemeral=True)
+            return
+
+        logger.info("GitHub invite sent successfully for %s", github_username)
+
+        member = interaction.guild.get_member(int(discord_user_id))
+        if member is None:
+            try:
+                member = await interaction.guild.fetch_member(int(discord_user_id))
+            except (discord.NotFound, ValueError):
+                member = None
+
+        if member is not None:
+            org_name = self.github_org.strip("/").split("/")[-1]
+            invite_url = f"https://github.com/orgs/{org_name}/invitation"
+            dm_message = (
+                f"An admin has approved your GitHub invite request!\n\n"
+                f"Click here to accept your invite: {invite_url}\n\n"
+                f"**Important:** You need to have **Two-Factor Authentication (2FA)** enabled on your GitHub account to join the org. "
+                f"You can set that up at https://github.com/settings/security before accepting."
+            )
+            try:
+                await member.send(dm_message, suppress_embeds=True)
+            except discord.Forbidden:
+                logger.warning("Could not DM %s — they likely have DMs disabled", member)
+
+        await interaction.followup.send(
+            f"Approved. GitHub invite sent for {github_username}"
+            + (f" and notified {member.mention} via DM." if member is not None else "."),
+            ephemeral=True,
+        )
+
+        if interaction.message:
+            await self._disable_button(interaction)
