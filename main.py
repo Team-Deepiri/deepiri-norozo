@@ -18,7 +18,7 @@ from bot import format_discussion_body, format_discussion_title
 from github import invite_user
 from github_discussion import GitHubDiscussionError, create_github_discussion
 from meetings import setup_meeting_features
-from onboarding import ApprovalView, GitHubInviteApprovalView
+from onboarding import ApprovalView
 from plaky import create_task, get_tasks
 
 
@@ -342,10 +342,6 @@ async def handle_github_invite_request(interaction: discord.Interaction, github_
         )
         return
 
-    if STAFF_CHANNEL_ID is None:
-        await interaction.response.send_message("STAFF_CHANNEL_ID is not configured.", ephemeral=True)
-        return
-
     if not GITHUB_ORG or not GITHUB_PAT:
         await interaction.response.send_message(
             "GitHub configuration is missing (GITHUB_ORG or GITHUB_PAT).",
@@ -353,31 +349,51 @@ async def handle_github_invite_request(interaction: discord.Interaction, github_
         )
         return
 
-    approval_channel = await _channel_from_id(STAFF_CHANNEL_ID)
-    if not approval_channel:
-        await interaction.response.send_message("Could not find the configured staff channel.", ephemeral=True)
-        return
-
-    view = GitHubInviteApprovalView(github_org=GITHUB_ORG or "", github_pat=GITHUB_PAT or "")
-    embed = discord.Embed(
-        title="GitHub Invite Approval Request",
-        description=(f"User {interaction.user.mention} requests a GitHub invite. Click Approve to send the invite."),
-        color=discord.Color.green(),
-    )
-    embed.add_field(name="GitHub Username", value=normalized_username, inline=False)
-    embed.add_field(name="Discord User ID", value=str(interaction.user.id), inline=False)
     await interaction.response.defer(ephemeral=True)
 
-    try:
-        await approval_channel.send(embed=embed, view=view)
-    except Exception:
-        logger.exception("Failed to post GitHub invite approval request to channel %s", STAFF_CHANNEL_ID)
+    logger.info("Sending GitHub invite for %s to org %s", normalized_username, GITHUB_ORG)
+    result = await asyncio.to_thread(
+        invite_user,
+        username=normalized_username,
+        github_org=GITHUB_ORG,
+        github_pat=GITHUB_PAT,
+    )
+
+    if not result.get("ok"):
+        logger.error("GitHub invite failed for %s: %s", normalized_username, result.get("message"))
         await interaction.edit_original_response(
-            content="I could not send your approval request to the staff channel."
+            content=result.get("message", "GitHub invite could not be sent.")
         )
         return
 
-    await interaction.edit_original_response(content="Your GitHub invite request was sent to staff for review.")
+    logger.info("GitHub invite sent successfully for %s", normalized_username)
+
+    org_name = GITHUB_ORG.strip("/").split("/")[-1]
+    invite_url = f"https://github.com/orgs/{org_name}/invitation"
+    dm_message = (
+        f"Your GitHub org invite has been sent!\n\n"
+        f"Click here to accept your invite: {invite_url}\n\n"
+        f"**Important:** You need to have **Two-Factor Authentication (2FA)** enabled on your GitHub account to join the org. "
+        f"You can set that up at https://github.com/settings/security before accepting."
+    )
+    try:
+        await interaction.user.send(dm_message, suppress_embeds=True)
+    except discord.Forbidden:
+        logger.warning("Could not DM %s — they likely have DMs disabled", interaction.user)
+
+    if STAFF_CHANNEL_ID is not None:
+        staff_channel = await _channel_from_id(STAFF_CHANNEL_ID)
+        if staff_channel:
+            try:
+                await staff_channel.send(
+                    f"GitHub invite auto-sent for `{normalized_username}` requested by {interaction.user.mention}."
+                )
+            except Exception:
+                logger.warning("Could not post GitHub invite log to staff channel %s", STAFF_CHANNEL_ID)
+
+    await interaction.edit_original_response(
+        content="Your GitHub invite has been sent! Check your DMs for the link."
+    )
 
 
 async def handle_ipca_signed(interaction: discord.Interaction, github_username: str) -> None:
