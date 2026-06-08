@@ -298,10 +298,8 @@ async def on_message(message: discord.Message) -> None:
         body = format_discussion_body(message)
         try:
             await create_github_discussion(title, body)
-            await message.add_reaction("✅")
         except GitHubDiscussionError as exc:
             logger.error("Discussion bridge failed for message %s: %s", message.id, exc)
-            await message.add_reaction("❌")
 
     if PR_CHANNEL_ID and message.channel.id == PR_CHANNEL_ID:
         pr_match = PR_URL_RE.search(content)
