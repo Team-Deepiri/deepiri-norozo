@@ -1,15 +1,4 @@
 services:
-  discord-github-discussions-bridge:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: deepiri-discussions-bridge
-    restart: unless-stopped
-    env_file:
-      - .env
-    environment:
-      - LOG_LEVEL=INFO
-
   discord-auto-invite-bot:
     build:
       context: .

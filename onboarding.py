@@ -1,5 +1,9 @@
+import logging
+
 import discord
 import re
+
+logger = logging.getLogger(__name__)
 
 
 class ApprovalView(discord.ui.View):

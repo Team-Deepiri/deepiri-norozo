@@ -107,14 +107,11 @@ class DiscussionsBridgeBot(commands.Bot):
 
         try:
             discussion_url = await create_discussion_fn(title, body)
-            await message.add_reaction("✅")
             logger.info("Bridged Discord message %s -> %s", message.id, discussion_url)
         except GitHubDiscussionError as exc:
             logger.error("Bridge failed for message %s: %s", message.id, exc)
-            await message.add_reaction("❌")
         except Exception as exc:  # pragma: no cover
             logger.exception("Unexpected bridge error for message %s: %s", message.id, exc)
-            await message.add_reaction("❌")
 
     async def on_ready(self) -> None:
         logger.info("Logged in as %s", self.user)

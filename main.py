@@ -14,7 +14,9 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
+from bot import format_discussion_body, format_discussion_title
 from github import invite_user
+from github_discussion import GitHubDiscussionError, create_github_discussion
 from meetings import setup_meeting_features
 from onboarding import ApprovalView
 from plaky import create_task, get_tasks
@@ -54,9 +56,11 @@ AVAILABLE_ROLE_ID = _int_env("AVAILABLE_ROLE_ID")
 STAFF_ROLE_ID = _int_env("STAFF_ROLE_ID")
 SUPPORT_SESSIONS_CHANNEL_ID = _int_env("SUPPORT_SESSIONS_CHANNEL_ID")
 IT_OPERATIONS_SUPPORT_ROLE_ID = _int_env("IT_OPERATIONS_SUPPORT_ROLE_ID") or _int_env("SUPPORT_TEAM_ROLE_ID")
+ANNOUNCEMENTS_CHANNEL_ID = _int_env("DISCORD_CHANNEL_ID") or _int_env("ANNOUNCEMENTS_CHANNEL_ID")
+ANNOUNCEMENTS_CHANNEL_NAME = os.getenv("DISCORD_CHANNEL_NAME", "announcements")
 
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "0.0.0.0")
-WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8080"))
+WEBHOOK_PORT = int(os.getenv("PORT") or os.getenv("WEBHOOK_PORT", "8080"))
 
 URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 PR_URL_RE = re.compile(r"https?://(?:www\.)?github\.com/[^\s]+/[^\s]+/pull/(\d+)", re.IGNORECASE)
@@ -116,6 +120,15 @@ meeting_service = setup_meeting_features(bot)
 
 
 def _extract_github_profile_username(message_content: str) -> Optional[str]:
+    content = (message_content or "").strip()
+    if not content:
+        return None
+
+    if " " not in content:
+        candidate = content.lstrip("@").rstrip(".,!?:;)\"'>]")
+        if candidate and GITHUB_USERNAME_RE.match(candidate) and candidate.lower() not in GITHUB_RESERVED_PATHS:
+            return candidate.lower()
+
     for match in URL_RE.finditer(message_content):
         raw_url = match.group(0).rstrip(".,!?:;)\"'>]")
         if "github.com/" not in raw_url.lower():
@@ -143,9 +156,24 @@ def _extract_github_profile_username(message_content: str) -> Optional[str]:
         if not GITHUB_USERNAME_RE.match(username):
             continue
 
-        return username
+        return username.lower()
 
     return None
+
+
+def _is_announcements_channel(channel: object) -> bool:
+    if ANNOUNCEMENTS_CHANNEL_ID is not None:
+        return getattr(channel, "id", None) == ANNOUNCEMENTS_CHANNEL_ID
+    return getattr(channel, "name", None) == ANNOUNCEMENTS_CHANNEL_NAME
+
+
+def _is_support_sessions_channel(channel: object) -> bool:
+    if SUPPORT_SESSIONS_CHANNEL_ID is None:
+        return False
+
+    channel_id = getattr(channel, "id", None)
+    parent_channel_id = getattr(channel, "parent_id", None)
+    return channel_id == SUPPORT_SESSIONS_CHANNEL_ID or parent_channel_id == SUPPORT_SESSIONS_CHANNEL_ID
 
 
 def _is_valid_plaky_signature(raw_body: bytes, signature_header: str, secret: str) -> bool:
@@ -190,9 +218,7 @@ async def notify_support_team_for_message(message: discord.Message) -> None:
     if SUPPORT_SESSIONS_CHANNEL_ID is None or IT_OPERATIONS_SUPPORT_ROLE_ID is None:
         return
 
-    channel_id = getattr(message.channel, "id", None)
-    parent_channel_id = getattr(message.channel, "parent_id", None)
-    if channel_id != SUPPORT_SESSIONS_CHANNEL_ID and parent_channel_id != SUPPORT_SESSIONS_CHANNEL_ID:
+    if not _is_support_sessions_channel(message.channel):
         return
 
     if not message.guild:
@@ -238,11 +264,7 @@ async def notify_support_team_for_message(message: discord.Message) -> None:
 @bot.event
 async def on_ready() -> None:
     print(f"Logged in as {bot.user} (id={bot.user.id if bot.user else 'unknown'})")
-
     meeting_service.start_loop()
-
-    if bot.webhook_runner is None:
-        await start_webhook_server()
 
 
 @bot.event
@@ -250,13 +272,13 @@ async def on_member_join(member: discord.Member) -> None:
     welcome_channel = await _channel_from_id(SERVER_COM_CHANNEL_ID)
     if welcome_channel:
         await welcome_channel.send(
-            f"Welcome {member.mention}! Please sign the IPCA first, then run /ipca-signed to request Available and DEV team roles."
+            f"Welcome {member.mention}! Please sign the IPCA first, then run /github-invite-request in the support tickets channel to request a GitHub invite."
         )
 
     try:
         await member.send(
             "Welcome to Deepiri. Before joining the DEV team, please sign the IPCA. "
-            "After signing, run /ipca-signed in the server so IT/staff can approve your Available and DEV team roles."
+            "After signing, run /github-invite-request in the support tickets channel so IT/staff can approve your GitHub invite."
         )
     except discord.Forbidden:
         pass
@@ -270,6 +292,14 @@ async def on_message(message: discord.Message) -> None:
     content = message.content or ""
 
     await notify_support_team_for_message(message)
+
+    if _is_announcements_channel(message.channel):
+        title = format_discussion_title(message.content)
+        body = format_discussion_body(message)
+        try:
+            await create_github_discussion(title, body)
+        except GitHubDiscussionError as exc:
+            logger.error("Discussion bridge failed for message %s: %s", message.id, exc)
 
     if PR_CHANNEL_ID and message.channel.id == PR_CHANNEL_ID:
         pr_match = PR_URL_RE.search(content)
@@ -291,38 +321,80 @@ async def on_message(message: discord.Message) -> None:
                 f"{message.author.mention} please include the Plaky task URL (app.plaky.com/...) with your PR link."
             )
 
-    github_username = _extract_github_profile_username(content)
-    if github_username:
-        logger.info(
-            "Auto-invite trigger: message_id=%s channel_id=%s author=%s parsed_username=%s",
-            message.id,
-            message.channel.id,
-            message.author,
-            github_username,
-        )
-        result = invite_user(
-            username=github_username,
-            github_org=GITHUB_ORG or "",
-            github_pat=GITHUB_PAT or "",
-        )
-
-        logger.info(
-            "Auto-invite result: username=%s ok=%s status=%s message=%s",
-            github_username,
-            result.get("ok"),
-            result.get("status"),
-            result.get("message"),
-        )
-
-        if result.get("ok"):
-            await message.reply(result.get("message", "GitHub invite sent."))
-        else:
-            await message.reply(result.get("message", "GitHub invite could not be sent."))
-
     await bot.process_commands(message)
 
 
-async def handle_ipca_signed(interaction: discord.Interaction) -> None:
+async def handle_github_invite_request(interaction: discord.Interaction, github_username: str) -> None:
+    if not interaction.channel or not _is_support_sessions_channel(interaction.channel):
+        await interaction.response.send_message(
+            "Please run /github-invite-request in the support tickets channel.",
+            ephemeral=True,
+        )
+        return
+
+    normalized_username = _extract_github_profile_username(github_username)
+    if not normalized_username:
+        await interaction.response.send_message(
+            "Please provide a valid GitHub profile username.",
+            ephemeral=True,
+        )
+        return
+
+    if not GITHUB_ORG or not GITHUB_PAT:
+        await interaction.response.send_message(
+            "GitHub configuration is missing (GITHUB_ORG or GITHUB_PAT).",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    logger.info("Sending GitHub invite for %s to org %s", normalized_username, GITHUB_ORG)
+    result = await asyncio.to_thread(
+        invite_user,
+        username=normalized_username,
+        github_org=GITHUB_ORG,
+        github_pat=GITHUB_PAT,
+    )
+
+    if not result.get("ok"):
+        logger.error("GitHub invite failed for %s: %s", normalized_username, result.get("message"))
+        await interaction.edit_original_response(
+            content=result.get("message", "GitHub invite could not be sent.")
+        )
+        return
+
+    logger.info("GitHub invite sent successfully for %s", normalized_username)
+
+    org_name = GITHUB_ORG.strip("/").split("/")[-1]
+    invite_url = f"https://github.com/orgs/{org_name}/invitation"
+    dm_message = (
+        f"Your GitHub org invite has been sent!\n\n"
+        f"Click here to accept your invite: {invite_url}\n\n"
+        f"**Important:** You need to have **Two-Factor Authentication (2FA)** enabled on your GitHub account to join the org. "
+        f"You can set that up at https://github.com/settings/security before accepting."
+    )
+    try:
+        await interaction.user.send(dm_message, suppress_embeds=True)
+    except discord.Forbidden:
+        logger.warning("Could not DM %s — they likely have DMs disabled", interaction.user)
+
+    if STAFF_CHANNEL_ID is not None:
+        staff_channel = await _channel_from_id(STAFF_CHANNEL_ID)
+        if staff_channel:
+            try:
+                await staff_channel.send(
+                    f"GitHub invite auto-sent for `{normalized_username}` requested by {interaction.user.mention}."
+                )
+            except Exception:
+                logger.warning("Could not post GitHub invite log to staff channel %s", STAFF_CHANNEL_ID)
+
+    await interaction.edit_original_response(
+        content="Your GitHub invite has been sent! Check your DMs for the link."
+    )
+
+
+async def handle_ipca_signed(interaction: discord.Interaction, github_username: str) -> None:
     if STAFF_CHANNEL_ID is None:
         await interaction.response.send_message("STAFF_CHANNEL_ID is not configured.", ephemeral=True)
         return
@@ -363,9 +435,16 @@ async def handle_ipca_signed(interaction: discord.Interaction) -> None:
     await interaction.edit_original_response(content="Your approval request was sent to staff for review.")
 
 
-@bot.tree.command(name="ipca-signed", description="Request DEV team access after signing IPCA")
-async def ipca_signed(interaction: discord.Interaction) -> None:
-    await handle_ipca_signed(interaction)
+@bot.tree.command(name="github-invite-request", description="Request a GitHub invite after signing ICPA")
+@app_commands.describe(github_username="Your GitHub profile username")
+async def github_invite_request(interaction: discord.Interaction, github_username: str) -> None:
+    await handle_github_invite_request(interaction, github_username)
+
+
+@bot.tree.command(name="ipca-signed", description="Request DEV team and Available roles after signing ICPA")
+@app_commands.describe(github_username="Your GitHub profile username")
+async def ipca_signed(interaction: discord.Interaction, github_username: str) -> None:
+    await handle_ipca_signed(interaction, github_username)
 
 
 @bot.tree.command(name="plaky-request", description="Create a Plaky task")
@@ -535,8 +614,13 @@ async def start_webhook_server() -> None:
     print(f"Plaky webhook server listening on http://{WEBHOOK_HOST}:{WEBHOOK_PORT}/plaky/webhook")
 
 
+async def main() -> None:
+    await start_webhook_server()
+    await bot.start(DISCORD_TOKEN)
+
+
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         raise RuntimeError("DISCORD_TOKEN is required in .env")
 
-    bot.run(DISCORD_TOKEN)
+    asyncio.run(main())
