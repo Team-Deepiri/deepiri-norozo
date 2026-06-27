@@ -108,6 +108,7 @@ class DiscussionsBridgeBot(commands.Bot):
         try:
             discussion_url = await create_discussion_fn(title, body)
             logger.info("Bridged Discord message %s -> %s", message.id, discussion_url)
+            await message.add_reaction("✅")
         except GitHubDiscussionError as exc:
             logger.error("Bridge failed for message %s: %s", message.id, exc)
         except Exception as exc:  # pragma: no cover
