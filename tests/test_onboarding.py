@@ -6,7 +6,6 @@ import discord
 import pytest
 
 import main
-import onboarding
 
 
 class FakeApprovalView:
