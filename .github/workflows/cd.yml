@@ -74,8 +74,14 @@ jobs:
             echo "::warning::RENDER_DEPLOY_HOOK_URL not set — image pushed to GHCR but Render was not triggered."
             exit 0
           fi
-          IMG_URL="$(python -c "import urllib.parse, os; print(urllib.parse.quote(os.environ['IMAGE'], safe=''))")"
-          curl -fsS -X POST "${DEPLOY_HOOK}?imgURL=${IMG_URL}"
+          REQUEST_URL="$(python -c "
+          import os, urllib.parse
+          hook = os.environ['DEPLOY_HOOK'].strip()
+          img = os.environ['IMAGE']
+          sep = '&' if '?' in hook else '?'
+          print(f'{hook}{sep}{urllib.parse.urlencode({\"imgURL\": img})}')
+          ")"
+          curl -fsS -X POST "$REQUEST_URL"
 
       - name: Notify Discord — success
         if: success() && steps.render.outcome == 'success'
