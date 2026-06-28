@@ -4,16 +4,39 @@ on:
   push:
     branches: [main]
 
+concurrency:
+  group: norozo-production
+  cancel-in-progress: false
+
 permissions:
   contents: read
   packages: write
 
+env:
+  REGISTRY_IMAGE: ghcr.io/team-deepiri/deepiri-norozo
+
 jobs:
-  build-and-push:
+  test:
     runs-on: ubuntu-latest
     steps:
-      - name: checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt ruff
+      - run: ruff check .
+      - run: pytest
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: sha-${{ steps.sha.outputs.short }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: short sha
+        id: sha
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
       - name: login GHCR
         uses: docker/login-action@v3
         with:
@@ -24,7 +47,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ env.REGISTRY_IMAGE }}
           tags: |
             type=raw,value=latest
             type=sha,prefix=sha-,format=short
@@ -35,3 +58,53 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Deploy to Render
+        id: render
+        env:
+          DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+          IMAGE: ${{ env.REGISTRY_IMAGE }}:${{ needs.build-and-push.outputs.image_tag }}
+        run: |
+          if [ -z "${DEPLOY_HOOK:-}" ]; then
+            echo "::warning::RENDER_DEPLOY_HOOK_URL not set — image pushed to GHCR but Render was not triggered."
+            exit 0
+          fi
+          IMG_URL="$(python -c "import urllib.parse, os; print(urllib.parse.quote(os.environ['IMAGE'], safe=''))")"
+          curl -fsS -X POST "${DEPLOY_HOOK}?imgURL=${IMG_URL}"
+
+      - name: Notify Discord — success
+        if: success() && steps.render.outcome == 'success'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -z "${DISCORD_WEBHOOK_URL:-}" ]; then
+            exit 0
+          fi
+          curl -sf -X POST "$DISCORD_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+              --arg repo "${{ github.repository }}" \
+              --arg tag "${{ needs.build-and-push.outputs.image_tag }}" \
+              --arg url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              '{content: ("✅ Norozo deployed **" + $repo + "** `" + $tag + "` → Render\n" + $url)}')"
+
+      - name: Notify Discord — failure
+        if: failure()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -z "${DISCORD_WEBHOOK_URL:-}" ]; then
+            exit 0
+          fi
+          curl -sf -X POST "$DISCORD_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+              --arg repo "${{ github.repository }}" \
+              --arg sha "${{ github.sha }}" \
+              --arg url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              '{content: ("❌ Norozo deploy failed **" + $repo + "** `" + $sha[0:7] + "`\n" + $url)}')"
