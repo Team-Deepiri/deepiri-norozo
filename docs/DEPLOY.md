@@ -1,69 +1,83 @@
 # Norozo production deployment (Render)
 
-Norozo runs on [Render](https://render.com) as a Docker web service. CD builds the image on every push to `main`, pushes it to GHCR, then hits Render’s deploy hook so production pulls the new image.
+Norozo runs on [Render](https://render.com). Production is **Git-backed**: Render builds from this repo’s `Dockerfile` when deploy runs — it does not pull from GHCR today.
+
+## What you saw in Render
+
+A log like:
+
+> Deploy live for **a7cfb21**: Merge pull request #24 …
+
+means Render’s **GitHub auto-deploy** fired on the merge to `main`. That is separate from the GitHub Actions CD workflow. Production can be live even when the Actions “Deploy to Render” step fails.
 
 ## What CD does
 
 On push to `main`:
 
 1. Runs tests (pytest + ruff)
-2. Builds and pushes `ghcr.io/team-deepiri/deepiri-norozo:latest` and `ghcr.io/team-deepiri/deepiri-norozo:sha-<short-sha>`
-3. POSTs to `RENDER_DEPLOY_HOOK_URL` with `imgURL` set to the new SHA tag
-4. Optionally posts success/failure to Discord (`DISCORD_WEBHOOK_URL`)
+2. If tests pass → POSTs to `RENDER_DEPLOY_HOOK_URL` to trigger a Render deploy (builds from the repo commit)
+3. In parallel after tests → builds and pushes `ghcr.io/team-deepiri/deepiri-norozo:latest` and `:sha-<short-sha>` (artifact registry; not used by Render unless you switch to image-backed deploy)
 
-Render does **not** auto-detect new GHCR tags — the deploy hook is required.
+## Recommended Render settings (test-gated deploy)
 
-## One-time Render setup
+To avoid deploying **before** tests pass:
 
-In the Render dashboard for the Norozo service:
+1. Render → Norozo service → **Settings** → **Auto-Deploy** → **Off**
+2. Keep `RENDER_DEPLOY_HOOK_URL` in GitHub Actions secrets
+3. CD runs tests first, then hits the deploy hook — Render only deploys green builds
 
-1. **Service type** — Web Service (Docker), image from registry
-2. **Image URL** — `ghcr.io/team-deepiri/deepiri-norozo:latest` (must match the repo image path; CD can override the tag per deploy via `imgURL`)
-3. **Registry credentials** — if the GHCR package is private, add a GitHub PAT with `read:packages` under service → Settings → Registry credentials
-4. **Environment variables** — all bot secrets live here (never in git): `DISCORD_TOKEN`, `GITHUB_PAT`, channel/role IDs, Plaky keys, etc.
-5. **Port** — Render sets `PORT`; the bot reads `PORT` or `WEBHOOK_PORT` (default `8080`). Ensure the service listens on `$PORT` if Render assigns something other than 8080.
-6. **Deploy hook** — Settings → Deploy Hook → copy the URL (see GitHub secret below)
+If auto-deploy stays **On**, every merge to `main` deploys immediately (what happened for `a7cfb21`), and the deploy hook causes a second deploy after tests.
 
-Plaky webhooks should target your Render URL: `https://<your-service>.onrender.com/plaky/webhook`
+## One-time setup
 
-## GitHub secret (required for CD)
+### Render
 
-| Secret | Where to get it |
-|--------|-----------------|
-| `RENDER_DEPLOY_HOOK_URL` | Render → Norozo service → **Settings** → **Deploy Hook** → copy URL |
+- **Source** — GitHub repo `Team-Deepiri/deepiri-norozo`, branch `main`
+- **Runtime** — Docker (uses repo `Dockerfile`)
+- **Environment variables** — `DISCORD_TOKEN`, `GITHUB_PAT`, channel/role IDs, Plaky keys, etc. (never in git)
+- **Port** — Render sets `PORT`; the bot reads `PORT` or `WEBHOOK_PORT` (default `8080`)
+- **Deploy hook** — Settings → Deploy Hook → copy URL → GitHub secret `RENDER_DEPLOY_HOOK_URL`
 
-Add under: GitHub repo → Settings → Secrets and variables → Actions → New repository secret.
+Plaky webhooks: `https://<your-service>.onrender.com/plaky/webhook`
 
-Optional:
+### GitHub secrets
 
 | Secret | Purpose |
 |--------|---------|
-| `DISCORD_WEBHOOK_URL` | Deploy notifications in Discord (already on this repo) |
+| `RENDER_DEPLOY_HOOK_URL` | Trigger Render deploy after tests pass |
+| `DISCORD_WEBHOOK_URL` | Optional deploy notifications in Discord |
+
+## Do not use `imgURL` on this service
+
+`imgURL` is for **image-backed** Render services (pull prebuilt image from GHCR). This service is **Git-backed**. Passing `imgURL` returns **400**.
 
 ## Manual deploy
 
-Render dashboard → **Manual Deploy**, or trigger the deploy hook:
+Render dashboard → **Manual Deploy**, or:
 
 ```bash
 curl -X POST "$RENDER_DEPLOY_HOOK_URL"
 ```
 
-To deploy a specific image tag:
-
-```bash
-IMG="ghcr.io/team-deepiri/deepiri-norozo:sha-abc1234"
-ENC="$(python -c "import urllib.parse; print(urllib.parse.quote('$IMG', safe=''))")"
-curl -X POST "${RENDER_DEPLOY_HOOK_URL}?imgURL=${ENC}"
-```
-
 ## Troubleshooting
 
-**CD pushes image but Render stays on old version** — `RENDER_DEPLOY_HOOK_URL` missing or wrong. Check Actions logs for the warning.
+**Actions failed but Render shows “Deploy live”** — auto-deploy from GitHub ran; fix the Actions step separately.
 
-**Deploy hook 404** — `imgURL` registry path must match the image URL configured on the Render service (same registry, org, repo name).
+**Deploy hook 400** — remove `imgURL`; use plain POST to the hook URL.
 
-**GHCR pull failed on Render** — add registry credentials; PAT needs `read:packages`.
+**Deploy hook skipped** — `RENDER_DEPLOY_HOOK_URL` not set; only auto-deploy (if enabled) will run.
 
-**`CommandNotFound` / duplicate slash commands** — two instances running with the same Discord token. Scale Render to one instance or stop any local/manual copy.
+**`CommandNotFound` / duplicate slash commands** — two bot instances share the same Discord token. Ensure only one Render instance is running.
 
-**Plaky webhooks not arriving** — use the public Render URL; service must be awake (free tier spins down).
+**Plaky webhooks not arriving** — use the public Render URL; free tier spins down when idle.
+
+## Future: image-backed deploy from GHCR
+
+To have Render pull from GHCR instead of building from Git:
+
+1. Create a new Render web service → **Existing Image** → `ghcr.io/team-deepiri/deepiri-norozo:latest`
+2. Add GHCR registry credentials on Render (`read:packages` PAT)
+3. Turn off the Git-backed service (or disable its auto-deploy)
+4. CD already pushes to GHCR; deploy hook without `imgURL` pulls `:latest`
+
+Only use `imgURL` if the image path on Render matches GHCR exactly.
