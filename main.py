@@ -1,10 +1,11 @@
+import asyncio
 import hashlib
 import hmac
+import inspect
 import json
 import logging
 import os
 import re
-import asyncio
 from urllib.parse import urlparse
 from typing import Optional
 
@@ -15,7 +16,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 from bot import format_discussion_body, format_discussion_title
-from github import invite_user
+from github import add_user_to_team, invite_user
 from github_discussion import GitHubDiscussionError, create_github_discussion
 from meetings import setup_meeting_features
 from onboarding import ApprovalView
@@ -33,6 +34,8 @@ logger = logging.getLogger("deepiri.main")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GITHUB_PAT = os.getenv("GITHUB_PAT")
 GITHUB_ORG = os.getenv("GITHUB_ORG")
+GITHUB_SUPPORT_TEAM_SLUG = os.getenv("GITHUB_SUPPORT_TEAM_SLUG", "support-team")
+GITHUB_IT_TEAM_SLUG = os.getenv("GITHUB_IT_TEAM_SLUG", "it-management-team")
 PLAKY_API_KEY = os.getenv("PLAKY_API_KEY")
 PLAKY_WEBHOOK_SECRET = os.getenv("PLAKY_WEBHOOK_SECRET", "")
 
@@ -324,7 +327,7 @@ async def on_message(message: discord.Message) -> None:
     await bot.process_commands(message)
 
 
-async def handle_github_invite_request(interaction: discord.Interaction, github_username: str) -> None:
+async def handle_github_invite_request(interaction: discord.Interaction, github_username: str, team: str | None = None) -> None:
     if not interaction.channel or not _is_support_sessions_channel(interaction.channel):
         await interaction.response.send_message(
             "Please run /github-invite-request in the support tickets channel.",
@@ -364,6 +367,27 @@ async def handle_github_invite_request(interaction: discord.Interaction, github_
         )
         return
 
+    team_slug = None
+    if team:
+        normalized_team = team.strip().lower()
+        if normalized_team == "support":
+            team_slug = GITHUB_SUPPORT_TEAM_SLUG
+        elif normalized_team == "it":
+            team_slug = GITHUB_IT_TEAM_SLUG
+
+    if team_slug:
+        logger.info("Adding GitHub user %s to team %s", normalized_username, team_slug)
+        team_result = add_user_to_team(
+            username=normalized_username,
+            github_org=GITHUB_ORG,
+            github_pat=GITHUB_PAT,
+            team_slug=team_slug,
+        )
+        if inspect.isawaitable(team_result):
+            team_result = await team_result
+        if not team_result.get("ok"):
+            logger.warning("GitHub team assignment failed for %s: %s", normalized_username, team_result.get("message"))
+
     logger.info("GitHub invite sent successfully for %s", normalized_username)
 
     org_name = GITHUB_ORG.strip("/").split("/")[-1]
@@ -388,6 +412,12 @@ async def handle_github_invite_request(interaction: discord.Interaction, github_
                 )
             except Exception:
                 logger.warning("Could not post GitHub invite log to staff channel %s", STAFF_CHANNEL_ID)
+
+    if team_slug:
+        await interaction.edit_original_response(
+            content="Your GitHub invite has been sent and you were added to the support team."
+        )
+        return
 
     await interaction.edit_original_response(
         content="Your GitHub invite has been sent! Check your DMs for the link."
@@ -436,9 +466,15 @@ async def handle_ipca_signed(interaction: discord.Interaction, github_username: 
 
 
 @bot.tree.command(name="github-invite-request", description="Request a GitHub invite after signing ICPA")
-@app_commands.describe(github_username="Your GitHub profile username")
-async def github_invite_request(interaction: discord.Interaction, github_username: str) -> None:
-    await handle_github_invite_request(interaction, github_username)
+@app_commands.describe(github_username="Your GitHub profile username", team="Optional team to add the user to (support or it)")
+@app_commands.choices(
+    team=[
+        app_commands.Choice(name="support", value="support"),
+        app_commands.Choice(name="it", value="it"),
+    ]
+)
+async def github_invite_request(interaction: discord.Interaction, github_username: str, team: app_commands.Choice[str] | None = None) -> None:
+    await handle_github_invite_request(interaction, github_username, team=team.value if team else None)
 
 
 @bot.tree.command(name="ipca-signed", description="Request DEV team and Available roles after signing ICPA")

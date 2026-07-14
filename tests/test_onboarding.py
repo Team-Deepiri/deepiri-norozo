@@ -146,6 +146,44 @@ async def test_github_invite_request_reports_api_failure(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_github_invite_request_adds_user_to_selected_team(monkeypatch):
+    user = SimpleNamespace(id=10, mention="@test-user", send=AsyncMock())
+    interaction = SimpleNamespace(
+        user=user,
+        channel=SimpleNamespace(id=888),
+        response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+        edit_original_response=AsyncMock(),
+    )
+
+    monkeypatch.setattr(main, "STAFF_CHANNEL_ID", None)
+    monkeypatch.setattr(main, "GITHUB_ORG", "Team-Deepiri")
+    monkeypatch.setattr(main, "GITHUB_PAT", "token")
+    monkeypatch.setattr(main, "SUPPORT_SESSIONS_CHANNEL_ID", 888)
+    monkeypatch.setattr(main, "GITHUB_SUPPORT_TEAM_SLUG", "support-team")
+    monkeypatch.setattr(main, "GITHUB_IT_TEAM_SLUG", "it-management-team")
+    monkeypatch.setattr(
+        main,
+        "invite_user",
+        lambda *, username, github_org, github_pat: {"ok": True, "status": 201, "message": "Invite sent"},
+    )
+    add_team_mock = AsyncMock(return_value={"ok": True, "status": 200, "message": "Added to team"})
+    monkeypatch.setattr(main, "add_user_to_team", add_team_mock)
+
+    await main.handle_github_invite_request(cast(discord.Interaction, interaction), "SomeUser", team="support")
+
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    add_team_mock.assert_awaited_once_with(
+        username="someuser",
+        github_org="Team-Deepiri",
+        github_pat="token",
+        team_slug="support-team",
+    )
+    interaction.edit_original_response.assert_awaited_once_with(
+        content="Your GitHub invite has been sent and you were added to the support team."
+    )
+
+
+@pytest.mark.asyncio
 async def test_support_session_message_dms_support_team(monkeypatch):
     author = FakeMember(10, "@author")
     support_member_one = FakeMember(11, "@support1")

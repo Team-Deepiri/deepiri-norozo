@@ -69,6 +69,68 @@ def _get_user_id(username: str, github_pat: str) -> Dict[str, Any]:
     return {"ok": True, "user_id": payload.get("id")}
 
 
+def add_user_to_team(username: str, github_org: str, github_pat: str, team_slug: str) -> Dict[str, Any]:
+    """Add a GitHub user to a team in the configured org by username."""
+    normalized_org = _normalize_org_name(github_org)
+    normalized_team = (team_slug or "").strip()
+    if not github_pat or not normalized_org or not normalized_team:
+        return {
+            "ok": False,
+            "status": 400,
+            "message": "GitHub configuration is missing (GITHUB_PAT, GITHUB_ORG, or team slug).",
+        }
+
+    user_lookup = _get_user_id(username=username, github_pat=github_pat)
+    if not user_lookup.get("ok"):
+        return user_lookup
+
+    user_id = user_lookup.get("user_id")
+    if not user_id:
+        return {
+            "ok": False,
+            "status": 404,
+            "message": f"GitHub user '{username}' does not have a resolvable id.",
+        }
+
+    headers = {
+        "Authorization": f"Bearer {github_pat}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    url = f"{GITHUB_API_BASE}/orgs/{normalized_org}/teams/{normalized_team}/memberships/{username}"
+
+    logger.info("PUT %s", url)
+    response = _request_with_rate_limit_retry("PUT", url, headers=headers, json={"role": "member"})
+    logger.info("GitHub team assignment response: status=%s body=%s", response.status_code, response.text[:500])
+
+    if response.status_code in (200, 201, 202):
+        return {
+            "ok": True,
+            "status": response.status_code,
+            "message": f"Added GitHub user '{username}' to team '{normalized_team}'.",
+        }
+
+    if response.status_code == 404:
+        return {
+            "ok": False,
+            "status": 404,
+            "message": f"GitHub team '{normalized_team}' was not found in org '{normalized_org}'.",
+        }
+
+    if response.status_code == 403:
+        return {
+            "ok": False,
+            "status": 403,
+            "message": "GitHub team assignment failed (403): the PAT does not have permission to manage team membership.",
+        }
+
+    return {
+        "ok": False,
+        "status": response.status_code,
+        "message": f"GitHub team assignment failed ({response.status_code}): {response.text[:200]}",
+    }
+
+
 def invite_user(username: str, github_org: str, github_pat: str) -> Dict[str, Any]:
     """Invite a GitHub user to the configured org by username."""
     normalized_org = _normalize_org_name(github_org)
