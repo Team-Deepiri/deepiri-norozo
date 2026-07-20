@@ -1,7 +1,6 @@
 import asyncio
 import hashlib
 import hmac
-import inspect
 import json
 import logging
 import os
@@ -16,7 +15,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 from bot import format_discussion_body, format_discussion_title
-from github import add_user_to_team, invite_user
+from github import add_user_to_team, invite_user, remove_user_from_org, remove_user_from_team
 from github_discussion import GitHubDiscussionError, create_github_discussion
 from meetings import setup_meeting_features
 from onboarding import ApprovalView
@@ -383,8 +382,6 @@ async def handle_github_invite_request(interaction: discord.Interaction, github_
             github_pat=GITHUB_PAT,
             team_slug=team_slug,
         )
-        if inspect.isawaitable(team_result):
-            team_result = await team_result
         if not team_result.get("ok"):
             logger.warning("GitHub team assignment failed for %s: %s", normalized_username, team_result.get("message"))
 
@@ -413,15 +410,74 @@ async def handle_github_invite_request(interaction: discord.Interaction, github_
             except Exception:
                 logger.warning("Could not post GitHub invite log to staff channel %s", STAFF_CHANNEL_ID)
 
+    team_display_name = "team"
     if team_slug:
-        await interaction.edit_original_response(
-            content="Your GitHub invite has been sent and you were added to the support team."
-        )
+        team_display_name = "support team" if team_slug == GITHUB_SUPPORT_TEAM_SLUG else "IT team" if team_slug == GITHUB_IT_TEAM_SLUG else "team"
+
+    if team_slug:
+        if team_result and team_result.get("ok"):
+            await interaction.edit_original_response(
+                content=f"Your GitHub invite has been sent and you were added to the {team_display_name}."
+            )
+        else:
+            await interaction.edit_original_response(
+                content=f"Your GitHub invite has been sent, but there was an issue adding you to the {team_display_name}: {team_result.get('message', 'Unknown error')}."
+            )
         return
 
     await interaction.edit_original_response(
         content="Your GitHub invite has been sent! Check your DMs for the link."
     )
+
+
+async def handle_offboard_user(interaction: discord.Interaction, member: discord.Member, github_username: str, *, team: Optional[str] = None) -> None:
+    await interaction.response.defer(ephemeral=True)
+
+    normalized_username = (github_username or "").strip().lower()
+    if not normalized_username:
+        await interaction.edit_original_response(content="Could not identify the GitHub username to offboard.")
+        return
+
+    if member is not None and hasattr(member, "guild") and hasattr(member, "remove_roles"):
+        guild = getattr(member, "guild", None)
+        if guild is not None and hasattr(guild, "get_role"):
+            dev_role = guild.get_role(DEV_TEAM_ROLE_ID)
+            available_role = guild.get_role(AVAILABLE_ROLE_ID)
+            roles_to_remove = [role for role in (dev_role, available_role) if role is not None]
+            if roles_to_remove:
+                try:
+                    await member.remove_roles(*roles_to_remove, reason="Offboarding")
+                except discord.Forbidden:
+                    logger.warning("Could not remove roles from %s during offboarding", member)
+
+    team_slug = None
+    if team:
+        normalized_team = team.strip().lower()
+        if normalized_team == "support":
+            team_slug = GITHUB_SUPPORT_TEAM_SLUG
+        elif normalized_team == "it":
+            team_slug = GITHUB_IT_TEAM_SLUG
+
+    org_result = remove_user_from_org(
+        username=normalized_username,
+        github_org=GITHUB_ORG,
+        github_pat=GITHUB_PAT,
+    )
+    if not org_result.get("ok"):
+        logger.warning("GitHub org removal failed for %s: %s", normalized_username, org_result.get("message"))
+
+    team_result = None
+    if team_slug:
+        team_result = remove_user_from_team(
+            username=normalized_username,
+            github_org=GITHUB_ORG,
+            github_pat=GITHUB_PAT,
+            team_slug=team_slug,
+        )
+        if not team_result.get("ok"):
+            logger.warning("GitHub team removal failed for %s: %s", normalized_username, team_result.get("message"))
+
+    await interaction.edit_original_response(content=f"Offboarding completed for {getattr(member, 'mention', normalized_username)}.")
 
 
 async def handle_ipca_signed(interaction: discord.Interaction, github_username: str) -> None:
@@ -435,6 +491,10 @@ async def handle_ipca_signed(interaction: discord.Interaction, github_username: 
 
     if AVAILABLE_ROLE_ID is None:
         await interaction.response.send_message("AVAILABLE_ROLE_ID is not configured.", ephemeral=True)
+        return
+
+    if not interaction.user:
+        await interaction.response.send_message("Could not identify the requesting user.", ephemeral=True)
         return
 
     approval_channel = await _channel_from_id(STAFF_CHANNEL_ID)
@@ -462,6 +522,19 @@ async def handle_ipca_signed(interaction: discord.Interaction, github_username: 
         )
         return
 
+    # The current flow uses staff approval, but the requested behavior is to grant the roles immediately when the user says they signed IPCA.
+    user = interaction.user
+    if hasattr(user, "guild") and hasattr(user, "add_roles"):
+        guild = getattr(user, "guild", None)
+        if guild is not None and hasattr(guild, "get_role"):
+            dev_role = guild.get_role(DEV_TEAM_ROLE_ID)
+            available_role = guild.get_role(AVAILABLE_ROLE_ID)
+            if dev_role is not None and available_role is not None:
+                try:
+                    await user.add_roles(dev_role, available_role, reason="IPCA signed")
+                except discord.Forbidden:
+                    logger.warning("Could not assign roles to %s after IPCA sign-off", user)
+
     await interaction.edit_original_response(content="Your approval request was sent to staff for review.")
 
 
@@ -481,6 +554,24 @@ async def github_invite_request(interaction: discord.Interaction, github_usernam
 @app_commands.describe(github_username="Your GitHub profile username")
 async def ipca_signed(interaction: discord.Interaction, github_username: str) -> None:
     await handle_ipca_signed(interaction, github_username)
+
+
+@bot.tree.command(name="offboard-user", description="Offboard a user from Discord roles and GitHub membership")
+@app_commands.describe(member="The Discord member to offboard", github_username="Their GitHub profile username", team="Optional team to remove them from (support or it)")
+@app_commands.choices(
+    team=[
+        app_commands.Choice(name="support", value="support"),
+        app_commands.Choice(name="it", value="it"),
+    ]
+)
+async def offboard_user(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    github_username: str,
+    team: app_commands.Choice[str] | None = None,
+) -> None:
+    team_value = team.value if hasattr(team, "value") else team
+    await handle_offboard_user(interaction, member, github_username, team=team_value)
 
 
 @bot.tree.command(name="plaky-request", description="Create a Plaky task")
