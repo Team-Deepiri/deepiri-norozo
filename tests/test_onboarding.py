@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import discord
 import pytest
@@ -146,6 +146,74 @@ async def test_github_invite_request_reports_api_failure(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_github_invite_request_adds_user_to_selected_team(monkeypatch):
+    user = SimpleNamespace(id=10, mention="@test-user", send=AsyncMock())
+    interaction = SimpleNamespace(
+        user=user,
+        channel=SimpleNamespace(id=888),
+        response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+        edit_original_response=AsyncMock(),
+    )
+
+    monkeypatch.setattr(main, "STAFF_CHANNEL_ID", None)
+    monkeypatch.setattr(main, "GITHUB_ORG", "Team-Deepiri")
+    monkeypatch.setattr(main, "GITHUB_PAT", "token")
+    monkeypatch.setattr(main, "SUPPORT_SESSIONS_CHANNEL_ID", 888)
+    monkeypatch.setattr(main, "GITHUB_SUPPORT_TEAM_SLUG", "support-team")
+    monkeypatch.setattr(main, "GITHUB_IT_TEAM_SLUG", "it-management-team")
+    monkeypatch.setattr(
+        main,
+        "invite_user",
+        lambda *, username, github_org, github_pat: {"ok": True, "status": 201, "message": "Invite sent"},
+    )
+    add_team_mock = Mock(return_value={"ok": True, "status": 200, "message": "Added to team"})
+    monkeypatch.setattr(main, "add_user_to_team", add_team_mock)
+
+    await main.handle_github_invite_request(cast(discord.Interaction, interaction), "SomeUser", team="support")
+
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    add_team_mock.assert_called_once_with(
+        username="someuser",
+        github_org="Team-Deepiri",
+        github_pat="token",
+        team_slug="support-team",
+    )
+    interaction.edit_original_response.assert_awaited_once_with(
+        content="Your GitHub invite has been sent and you were added to the support team."
+    )
+
+
+@pytest.mark.asyncio
+async def test_github_invite_request_reports_team_assignment_failure(monkeypatch):
+    user = SimpleNamespace(id=10, mention="@test-user", send=AsyncMock())
+    interaction = SimpleNamespace(
+        user=user,
+        channel=SimpleNamespace(id=888),
+        response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+        edit_original_response=AsyncMock(),
+    )
+
+    monkeypatch.setattr(main, "STAFF_CHANNEL_ID", None)
+    monkeypatch.setattr(main, "GITHUB_ORG", "Team-Deepiri")
+    monkeypatch.setattr(main, "GITHUB_PAT", "token")
+    monkeypatch.setattr(main, "SUPPORT_SESSIONS_CHANNEL_ID", 888)
+    monkeypatch.setattr(main, "GITHUB_SUPPORT_TEAM_SLUG", "support-team")
+    monkeypatch.setattr(main, "GITHUB_IT_TEAM_SLUG", "it-management-team")
+    monkeypatch.setattr(
+        main,
+        "invite_user",
+        lambda *, username, github_org, github_pat: {"ok": True, "status": 201, "message": "Invite sent"},
+    )
+    monkeypatch.setattr(main, "add_user_to_team", Mock(return_value={"ok": False, "message": "Team not found."}))
+
+    await main.handle_github_invite_request(cast(discord.Interaction, interaction), "SomeUser", team="support")
+
+    interaction.edit_original_response.assert_awaited_once_with(
+        content="Your GitHub invite has been sent, but there was an issue adding you to the support team: Team not found.."
+    )
+
+
+@pytest.mark.asyncio
 async def test_support_session_message_dms_support_team(monkeypatch):
     author = FakeMember(10, "@author")
     support_member_one = FakeMember(11, "@support1")
@@ -256,3 +324,106 @@ async def test_ipca_signed_requests_roles(monkeypatch):
     interaction.edit_original_response.assert_awaited_once_with(
         content="Your approval request was sent to staff for review.",
     )
+
+
+@pytest.mark.asyncio
+async def test_ipca_signed_assigns_dev_and_available_roles(monkeypatch):
+    role_one = FakeRole(456, "<@&456>")
+    role_two = FakeRole(123, "<@&123>")
+    guild = SimpleNamespace(get_role=lambda role_id: role_one if role_id == 456 else role_two if role_id == 123 else None)
+    member = SimpleNamespace(
+        id=10,
+        mention="@test-user",
+        guild=guild,
+        add_roles=AsyncMock(),
+    )
+    channel = SimpleNamespace(send=AsyncMock())
+    interaction = SimpleNamespace(
+        user=member,
+        channel=SimpleNamespace(id=888),
+        response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+        edit_original_response=AsyncMock(),
+    )
+
+    monkeypatch.setattr(main, "STAFF_CHANNEL_ID", 999)
+    monkeypatch.setattr(main, "DEV_TEAM_ROLE_ID", 456)
+    monkeypatch.setattr(main, "AVAILABLE_ROLE_ID", 123)
+    monkeypatch.setattr(main, "ApprovalView", FakeApprovalView)
+    monkeypatch.setattr(main, "_channel_from_id", AsyncMock(return_value=channel))
+
+    await main.handle_ipca_signed(cast(discord.Interaction, interaction), "SomeUser")
+
+    member.add_roles.assert_awaited_once()
+    args, kwargs = member.add_roles.await_args
+    assert len(args) == 2
+    assert args[0].id == 456
+    assert args[1].id == 123
+    assert kwargs["reason"] == "IPCA signed"
+
+
+@pytest.mark.asyncio
+async def test_handle_offboard_user_removes_roles_and_github_memberships(monkeypatch):
+    dev_role = FakeRole(456, "<@&456>")
+    available_role = FakeRole(123, "<@&123>")
+    guild = SimpleNamespace(get_role=lambda role_id: dev_role if role_id == 456 else available_role if role_id == 123 else None)
+    member = SimpleNamespace(
+        id=10,
+        mention="@test-user",
+        guild=guild,
+        remove_roles=AsyncMock(),
+    )
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=1, mention="@staff"),
+        channel=SimpleNamespace(id=888),
+        response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+        edit_original_response=AsyncMock(),
+    )
+
+    monkeypatch.setattr(main, "DEV_TEAM_ROLE_ID", 456)
+    monkeypatch.setattr(main, "AVAILABLE_ROLE_ID", 123)
+    monkeypatch.setattr(main, "GITHUB_ORG", "Team-Deepiri")
+    monkeypatch.setattr(main, "GITHUB_PAT", "token")
+    monkeypatch.setattr(main, "GITHUB_SUPPORT_TEAM_SLUG", "support-team")
+    monkeypatch.setattr(main, "GITHUB_IT_TEAM_SLUG", "it-management-team")
+    org_mock = Mock(return_value={"ok": True, "message": "Removed from org"})
+    team_mock = Mock(return_value={"ok": True, "message": "Removed from team"})
+    monkeypatch.setattr(main, "remove_user_from_org", org_mock)
+    monkeypatch.setattr(main, "remove_user_from_team", team_mock)
+
+    await main.handle_offboard_user(cast(discord.Interaction, interaction), member, "SomeUser", team="support")
+
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    member.remove_roles.assert_awaited_once()
+    org_mock.assert_called_once_with(username="someuser", github_org="Team-Deepiri", github_pat="token")
+    team_mock.assert_called_once_with(
+        username="someuser",
+        github_org="Team-Deepiri",
+        github_pat="token",
+        team_slug="support-team",
+    )
+    interaction.edit_original_response.assert_awaited_once_with(content="Offboarding completed for @test-user.")
+
+
+@pytest.mark.asyncio
+async def test_offboard_user_command_uses_handler(monkeypatch):
+    called = {}
+
+    async def fake_handler(interaction, member, github_username, *, team=None):
+        called["args"] = (interaction, member, github_username, team)
+
+    monkeypatch.setattr(main, "handle_offboard_user", fake_handler)
+
+    interaction = SimpleNamespace(
+        response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+        user=SimpleNamespace(id=1, mention="@staff"),
+    )
+
+    member = SimpleNamespace(id=10, mention="@test-user")
+    await main.offboard_user.callback(
+        cast(discord.Interaction, interaction),
+        member,
+        "SomeUser",
+        team="support",
+    )
+
+    assert called["args"] == (interaction, member, "SomeUser", "support")
