@@ -413,13 +413,22 @@ async def test_offboard_user_command_uses_handler(monkeypatch):
 
     monkeypatch.setattr(main, "handle_offboard_user", fake_handler)
 
+    # Create bot using factory to access the command
+    bot = main._create_and_register_bot()
+    
+    # Find the offboard-user command in the bot's tree
+    commands = {cmd.name: cmd for cmd in bot.tree._get_all_commands()}
+    assert "offboard-user" in commands, "offboard-user command should be registered"
+    
+    offboard_user_cmd = commands["offboard-user"]
+    
     interaction = SimpleNamespace(
         response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
         user=SimpleNamespace(id=1, mention="@staff"),
     )
 
     member = SimpleNamespace(id=10, mention="@test-user")
-    await main.offboard_user.callback(
+    await offboard_user_cmd.callback(
         cast(discord.Interaction, interaction),
         member,
         "SomeUser",

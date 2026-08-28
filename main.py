@@ -111,6 +111,7 @@ class DeepiriBot(commands.Bot):
 
         super().__init__(command_prefix="!", intents=intents)
         self.webhook_runner: Optional[web.AppRunner] = None
+        self.meeting_service = None  # Will be set by factory
 
     async def setup_hook(self) -> None:
         if DEV_TEAM_ROLE_ID is not None and AVAILABLE_ROLE_ID is not None:
@@ -118,18 +119,205 @@ class DeepiriBot(commands.Bot):
         await self.tree.sync()
 
 
-# Create the initial bot instance; will be replaced during retries.
-bot = DeepiriBot()
-meeting_service = setup_meeting_features(bot)
+# Global reference to current bot; will be replaced on each retry.
+bot: Optional[DeepiriBot] = None
+meeting_service = None
 
 
-def _get_or_create_bot() -> DeepiriBot:
-    """Get the current bot instance, or create a fresh one if needed."""
-    global bot
-    if bot is None or bot.is_closed():
-        bot = DeepiriBot()
-        meeting_service = setup_meeting_features(bot)
-    return bot
+def _create_and_register_bot() -> DeepiriBot:
+    """
+    Factory function that creates a fresh bot instance and registers ALL handlers.
+    
+    This ensures each retry gets a fully configured bot with:
+    - Event handlers (on_ready, on_member_join, on_message)
+    - Slash commands (github-invite-request, ipca-signed, offboard-user, etc.)
+    - Meeting service
+    - Approval view for IPCA flow
+    
+    Returns:
+        A fully configured DeepiriBot instance ready to start()
+    """
+    new_bot = DeepiriBot()
+    
+    # Register event handlers
+    @new_bot.event
+    async def on_ready() -> None:
+        print(f"Logged in as {new_bot.user} (id={new_bot.user.id if new_bot.user else 'unknown'})")
+        if new_bot.meeting_service:
+            new_bot.meeting_service.start_loop()
+
+    @new_bot.event
+    async def on_member_join(member: discord.Member) -> None:
+        welcome_channel = await _channel_from_id(SERVER_COM_CHANNEL_ID)
+        if welcome_channel:
+            await welcome_channel.send(
+                f"Welcome {member.mention}! Please sign the IPCA first, then run /github-invite-request in the support tickets channel to request a GitHub invite."
+            )
+        try:
+            await member.send(
+                "Welcome to Deepiri. Before joining the DEV team, please sign the IPCA. "
+                "After signing, run /github-invite-request in the support tickets channel so IT/staff can approve your GitHub invite."
+            )
+        except discord.Forbidden:
+            pass
+
+    @new_bot.event
+    async def on_message(message: discord.Message) -> None:
+        if message.author.bot:
+            return
+        content = message.content or ""
+        await notify_support_team_for_message(message)
+        if _is_announcements_channel(message.channel):
+            title = format_discussion_title(message.content)
+            body = format_discussion_body(message)
+            try:
+                await create_github_discussion(title, body)
+            except GitHubDiscussionError as exc:
+                logger.error("Discussion bridge failed for message %s: %s", message.id, exc)
+        if PR_CHANNEL_ID and message.channel.id == PR_CHANNEL_ID:
+            pr_match = PR_URL_RE.search(content)
+            plaky_match = PLAKY_URL_RE.search(content)
+            if pr_match:
+                pr_number = pr_match.group(1)
+                try:
+                    await create_github_discussion(f"PR #{pr_number}", f"Discussed in: {message.jump_url}")
+                except GitHubDiscussionError as exc:
+                    logger.error("PR bridge failed: %s", exc)
+            if plaky_match:
+                url = plaky_match.group(0)
+                embed = discord.Embed(title="📋 Plaky Link", url=url, color=discord.Color.green())
+                await message.reply(embed=embed, mention_author=False)
+
+    # Register slash commands
+    @new_bot.tree.command(name="github-invite-request", description="Request a GitHub invite after signing ICPA")
+    @app_commands.describe(github_username="Your GitHub profile username", team="Optional team to add the user to (support or it)")
+    @app_commands.choices(
+        team=[
+            app_commands.Choice(name="support", value="support"),
+            app_commands.Choice(name="it", value="it"),
+        ]
+    )
+    async def github_invite_request(interaction: discord.Interaction, github_username: str, team: app_commands.Choice[str] | None = None) -> None:
+        await handle_github_invite_request(interaction, github_username, team=team.value if team else None)
+
+    @new_bot.tree.command(name="ipca-signed", description="Request DEV team and Available roles after signing ICPA")
+    @app_commands.describe(github_username="Your GitHub profile username")
+    async def ipca_signed(interaction: discord.Interaction, github_username: str) -> None:
+        await handle_ipca_signed(interaction, github_username)
+
+    @new_bot.tree.command(name="offboard-user", description="Offboard a user from Discord roles and GitHub membership")
+    @app_commands.describe(member="The Discord member to offboard", github_username="Their GitHub profile username", team="Optional team to remove them from (support or it)")
+    @app_commands.choices(
+        team=[
+            app_commands.Choice(name="support", value="support"),
+            app_commands.Choice(name="it", value="it"),
+        ]
+    )
+    async def offboard_user(
+        interaction: discord.Interaction,
+        member: discord.Member,
+        github_username: str,
+        team: app_commands.Choice[str] | None = None,
+    ) -> None:
+        team_value = team.value if hasattr(team, "value") else team
+        await handle_offboard_user(interaction, member, github_username, team=team_value)
+
+    @new_bot.tree.command(name="plaky-request", description="Create a Plaky task")
+    @app_commands.describe(title="Task title", description="Task description", priority="Task priority")
+    @app_commands.choices(
+        priority=[
+            app_commands.Choice(name="low", value="low"),
+            app_commands.Choice(name="medium", value="medium"),
+            app_commands.Choice(name="high", value="high"),
+        ]
+    )
+    async def plaky_request(
+        interaction: discord.Interaction,
+        title: str,
+        description: str,
+        priority: app_commands.Choice[str],
+    ) -> None:
+        result = create_task(
+            title=title,
+            description=description,
+            priority=priority.value,
+            api_key=PLAKY_API_KEY or "",
+        )
+        if result.get("ok"):
+            task_url = result.get("task_url") or "(no URL returned)"
+            await interaction.response.send_message(f"Plaky task created: {task_url}")
+            return
+        await interaction.response.send_message(result.get("message", "Failed to create Plaky task."), ephemeral=True)
+
+    @new_bot.tree.command(name="plaky-status", description="Post open Plaky tasks summary to QA channel")
+    async def plaky_status(interaction: discord.Interaction) -> None:
+        if QA_CHANNEL_ID is None:
+            await interaction.response.send_message("QA_CHANNEL_ID is not configured.", ephemeral=True)
+            return
+        qa_channel = await _channel_from_id(QA_CHANNEL_ID)
+        if not qa_channel:
+            await interaction.response.send_message("Could not find the configured QA channel.", ephemeral=True)
+            return
+        result = get_tasks(api_key=PLAKY_API_KEY or "", status="open")
+        if not result.get("ok"):
+            await interaction.response.send_message(result.get("message", "Failed to fetch tasks."), ephemeral=True)
+            return
+        tasks = result.get("tasks", [])
+        if not tasks:
+            await qa_channel.send("No open Plaky tasks found.")
+            await interaction.response.send_message("Posted status to QA channel.", ephemeral=True)
+            return
+        lines = ["Open Plaky tasks:"]
+        for task in tasks[:20]:
+            task_title = task.get("title", "Untitled")
+            task_status = task.get("status", "unknown")
+            task_url = task.get("url") or task.get("taskUrl") or ""
+            if task_url:
+                lines.append(f"- [{task_title}]({task_url}) - status: {task_status}")
+            else:
+                lines.append(f"- {task_title} - status: {task_status}")
+        await qa_channel.send("\n".join(lines))
+        await interaction.response.send_message("Posted status to QA channel.", ephemeral=True)
+
+    @new_bot.tree.command(name="poll", description="Create a poll (staff only)")
+    @app_commands.describe(question="The poll question", options="Comma-separated options (e.g., Yes, No, Maybe)")
+    async def poll(interaction: discord.Interaction, question: str, options: str) -> None:
+        if not interaction.guild or not interaction.user:
+            await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+            return
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Could not verify your permissions.", ephemeral=True)
+            return
+        if not _is_staff(interaction.user):
+            await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
+            return
+        option_list = [opt.strip() for opt in options.split(",") if opt.strip()]
+        if len(option_list) < 2:
+            await interaction.response.send_message("Please provide at least 2 options separated by commas.", ephemeral=True)
+            return
+        if len(option_list) > 9:
+            await interaction.response.send_message("Maximum 9 options allowed.", ephemeral=True)
+            return
+        embed = discord.Embed(
+            title=f"📊 {question}",
+            color=discord.Color.blue(),
+        )
+        embed.set_footer(text=f"Poll created by {interaction.user.display_name}")
+        for i, option in enumerate(option_list):
+            embed.add_field(name=f"{_poll_option_emoji(i)} {option}", value="\u200b", inline=True)
+        channel = interaction.channel
+        if not channel or not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message("This command can only be used in a text channel.", ephemeral=True)
+            return
+        await interaction.response.send_message("Poll created!", ephemeral=True)
+        poll_message = await channel.send(embed=embed)
+        for i in range(len(option_list)):
+            await poll_message.add_reaction(_poll_option_emoji(i))
+
+    # Set up meeting service
+    new_bot.meeting_service = setup_meeting_features(new_bot)
+    
+    return new_bot
 
 
 def _extract_github_profile_username(message_content: str) -> Optional[str]:
@@ -274,67 +462,13 @@ async def notify_support_team_for_message(message: discord.Message) -> None:
         logger.warning("Support DM sent with %s failures out of %s recipients", failures, len(support_members))
 
 
-@bot.event
-async def on_ready() -> None:
-    print(f"Logged in as {bot.user} (id={bot.user.id if bot.user else 'unknown'})")
-    meeting_service.start_loop()
 
+# Event handlers and slash commands are now registered dynamically in _create_and_register_bot()
+# to support bot factory pattern for retry and lifecycle management.
 
-@bot.event
-async def on_member_join(member: discord.Member) -> None:
-    welcome_channel = await _channel_from_id(SERVER_COM_CHANNEL_ID)
-    if welcome_channel:
-        await welcome_channel.send(
-            f"Welcome {member.mention}! Please sign the IPCA first, then run /github-invite-request in the support tickets channel to request a GitHub invite."
-        )
-
-    try:
-        await member.send(
-            "Welcome to Deepiri. Before joining the DEV team, please sign the IPCA. "
-            "After signing, run /github-invite-request in the support tickets channel so IT/staff can approve your GitHub invite."
-        )
-    except discord.Forbidden:
-        pass
-
-
-@bot.event
-async def on_message(message: discord.Message) -> None:
-    if message.author.bot:
-        return
-
-    content = message.content or ""
-
-    await notify_support_team_for_message(message)
-
-    if _is_announcements_channel(message.channel):
-        title = format_discussion_title(message.content)
-        body = format_discussion_body(message)
-        try:
-            await create_github_discussion(title, body)
-        except GitHubDiscussionError as exc:
-            logger.error("Discussion bridge failed for message %s: %s", message.id, exc)
-
-    if PR_CHANNEL_ID and message.channel.id == PR_CHANNEL_ID:
-        pr_match = PR_URL_RE.search(content)
-        plaky_match = PLAKY_URL_RE.search(content)
-
-        if pr_match and plaky_match:
-            pr_number = pr_match.group(1)
-            pr_url = pr_match.group(0)
-            plaky_url = plaky_match.group(0)
-            embed = discord.Embed(
-                title=f"PR #{pr_number} linked to Plaky task",
-                description=f"[Pull Request]({pr_url})\\n[Plaky Task]({plaky_url})",
-                color=discord.Color.blue(),
-            )
-            embed.set_footer(text=f"Linked by {message.author.display_name}")
-            await message.channel.send(embed=embed)
-        elif pr_match and not plaky_match:
-            await message.channel.send(
-                f"{message.author.mention} please include the Plaky task URL (app.plaky.com/...) with your PR link."
-            )
-
-    await bot.process_commands(message)
+# Initialize bot on module load (for backwards compatibility with decorators at module level)
+bot = _create_and_register_bot()
+meeting_service = bot.meeting_service
 
 
 async def handle_github_invite_request(interaction: discord.Interaction, github_username: str, team: str | None = None) -> None:
@@ -549,188 +683,8 @@ async def handle_ipca_signed(interaction: discord.Interaction, github_username: 
     await interaction.edit_original_response(content="Your approval request was sent to staff for review.")
 
 
-@bot.tree.command(name="github-invite-request", description="Request a GitHub invite after signing ICPA")
-@app_commands.describe(github_username="Your GitHub profile username", team="Optional team to add the user to (support or it)")
-@app_commands.choices(
-    team=[
-        app_commands.Choice(name="support", value="support"),
-        app_commands.Choice(name="it", value="it"),
-    ]
-)
-async def github_invite_request(interaction: discord.Interaction, github_username: str, team: app_commands.Choice[str] | None = None) -> None:
-    await handle_github_invite_request(interaction, github_username, team=team.value if team else None)
 
-
-@bot.tree.command(name="ipca-signed", description="Request DEV team and Available roles after signing ICPA")
-@app_commands.describe(github_username="Your GitHub profile username")
-async def ipca_signed(interaction: discord.Interaction, github_username: str) -> None:
-    await handle_ipca_signed(interaction, github_username)
-
-
-@bot.tree.command(name="offboard-user", description="Offboard a user from Discord roles and GitHub membership")
-@app_commands.describe(member="The Discord member to offboard", github_username="Their GitHub profile username", team="Optional team to remove them from (support or it)")
-@app_commands.choices(
-    team=[
-        app_commands.Choice(name="support", value="support"),
-        app_commands.Choice(name="it", value="it"),
-    ]
-)
-async def offboard_user(
-    interaction: discord.Interaction,
-    member: discord.Member,
-    github_username: str,
-    team: app_commands.Choice[str] | None = None,
-) -> None:
-    team_value = team.value if hasattr(team, "value") else team
-    await handle_offboard_user(interaction, member, github_username, team=team_value)
-
-
-@bot.tree.command(name="plaky-request", description="Create a Plaky task")
-@app_commands.describe(title="Task title", description="Task description", priority="Task priority")
-@app_commands.choices(
-    priority=[
-        app_commands.Choice(name="low", value="low"),
-        app_commands.Choice(name="medium", value="medium"),
-        app_commands.Choice(name="high", value="high"),
-    ]
-)
-async def plaky_request(
-    interaction: discord.Interaction,
-    title: str,
-    description: str,
-    priority: app_commands.Choice[str],
-) -> None:
-    result = create_task(
-        title=title,
-        description=description,
-        priority=priority.value,
-        api_key=PLAKY_API_KEY or "",
-    )
-
-    if result.get("ok"):
-        task_url = result.get("task_url") or "(no URL returned)"
-        await interaction.response.send_message(f"Plaky task created: {task_url}")
-        return
-
-    await interaction.response.send_message(result.get("message", "Failed to create Plaky task."), ephemeral=True)
-
-
-@bot.tree.command(name="plaky-status", description="Post open Plaky tasks summary to QA channel")
-async def plaky_status(interaction: discord.Interaction) -> None:
-    if QA_CHANNEL_ID is None:
-        await interaction.response.send_message("QA_CHANNEL_ID is not configured.", ephemeral=True)
-        return
-
-    qa_channel = await _channel_from_id(QA_CHANNEL_ID)
-    if not qa_channel:
-        await interaction.response.send_message("Could not find the configured QA channel.", ephemeral=True)
-        return
-
-    result = get_tasks(api_key=PLAKY_API_KEY or "", status="open")
-    if not result.get("ok"):
-        await interaction.response.send_message(result.get("message", "Failed to fetch tasks."), ephemeral=True)
-        return
-
-    tasks = result.get("tasks", [])
-    if not tasks:
-        await qa_channel.send("No open Plaky tasks found.")
-        await interaction.response.send_message("Posted status to QA channel.", ephemeral=True)
-        return
-
-    lines = ["Open Plaky tasks:"]
-    for task in tasks[:20]:
-        task_title = task.get("title", "Untitled")
-        task_status = task.get("status", "unknown")
-        task_url = task.get("url") or task.get("taskUrl") or ""
-        if task_url:
-            lines.append(f"- [{task_title}]({task_url}) - status: {task_status}")
-        else:
-            lines.append(f"- {task_title} - status: {task_status}")
-
-    await qa_channel.send("\n".join(lines))
-    await interaction.response.send_message("Posted status to QA channel.", ephemeral=True)
-
-
-@bot.tree.command(name="poll", description="Create a poll (staff only)")
-@app_commands.describe(question="The poll question", options="Comma-separated options (e.g., Yes, No, Maybe)")
-async def poll(interaction: discord.Interaction, question: str, options: str) -> None:
-    if not interaction.guild or not interaction.user:
-        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
-        return
-
-    if not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message("Could not verify your permissions.", ephemeral=True)
-        return
-
-    if not _is_staff(interaction.user):
-        await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
-        return
-
-    option_list = [opt.strip() for opt in options.split(",") if opt.strip()]
-    if len(option_list) < 2:
-        await interaction.response.send_message("Please provide at least 2 options separated by commas.", ephemeral=True)
-        return
-
-    if len(option_list) > 9:
-        await interaction.response.send_message("Maximum 9 options allowed.", ephemeral=True)
-        return
-
-    embed = discord.Embed(
-        title=f"📊 {question}",
-        color=discord.Color.blue(),
-    )
-    embed.set_footer(text=f"Poll created by {interaction.user.display_name}")
-
-    for i, option in enumerate(option_list):
-        embed.add_field(name=f"{_poll_option_emoji(i)} {option}", value="\u200b", inline=True)
-
-    channel = interaction.channel
-    if not channel or not isinstance(channel, discord.TextChannel):
-        await interaction.response.send_message("This command can only be used in a text channel.", ephemeral=True)
-        return
-
-    await interaction.response.send_message("Poll created!", ephemeral=True)
-    poll_message = await channel.send(embed=embed)
-
-    for i in range(len(option_list)):
-        await poll_message.add_reaction(_poll_option_emoji(i))
-
-
-async def plaky_webhook_handler(request: web.Request) -> web.Response:
-    raw_body = await request.read()
-
-    if PLAKY_WEBHOOK_SECRET:
-        signature_header = (
-            request.headers.get("X-Plaky-Signature")
-            or request.headers.get("x-plaky-signature")
-            or request.headers.get("X-Signature")
-        )
-        if not signature_header:
-            return web.json_response({"ok": False, "message": "Missing signature header"}, status=401)
-
-        if not _is_valid_plaky_signature(raw_body, signature_header, PLAKY_WEBHOOK_SECRET):
-            return web.json_response({"ok": False, "message": "Invalid signature"}, status=401)
-
-    try:
-        payload = json.loads(raw_body.decode("utf-8"))
-    except Exception:
-        return web.json_response({"ok": False, "message": "Invalid JSON"}, status=400)
-
-    status = str(payload.get("status", "")).strip().lower()
-    priority = str(payload.get("priority", "")).strip().lower()
-
-    should_alert = status == "blocked" or priority in {"high", "high priority"}
-    if should_alert and QA_CHANNEL_ID:
-        channel = await _channel_from_id(QA_CHANNEL_ID)
-        if channel:
-            title = payload.get("title", "Plaky task")
-            task_url = payload.get("url") or payload.get("taskUrl") or ""
-            description = f"Status update for **{title}**\\nStatus: **{status or 'unknown'}**\\nPriority: **{priority or 'unknown'}**"
-            if task_url:
-                description += f"\\n{task_url}"
-            await channel.send(f":warning: {description}")
-
-    return web.json_response({"ok": True})
+# Slash commands are registered in the bot factory _create_and_register_bot()
 
 
 async def health_handler(_: web.Request) -> web.Response:
@@ -762,31 +716,59 @@ def _is_discord_rate_limit_error(error: Exception) -> bool:
     return any(indicator in error_str for indicator in rate_limit_indicators)
 
 
-async def _connect_discord_with_retry(token: str, max_attempts: int = 5, max_backoff: int = 300) -> None:
+def _extract_retry_after(error: Exception) -> Optional[int]:
     """
-    Connect to Discord with exponential backoff retry on 429/1015 rate limits.
+    Extract Retry-After header value (in seconds) from error.
     
-    Does NOT re-raise rate-limit errors; keeps the process alive during rate-limiting.
-    Creates a fresh bot instance on each retry to avoid lifecycle issues.
+    If available, respects the server's rate-limit retry instruction.
+    """
+    # Check for ClientError with response info
+    error_str = str(error)
+    # Look for Retry-After value in error message
+    if "Retry-After" in error_str:
+        try:
+            # Simple extraction; may need refinement based on actual error format
+            parts = error_str.split("Retry-After")
+            if len(parts) > 1:
+                value_str = parts[1].split()[0].strip("=:,[]")
+                return int(value_str)
+        except (ValueError, IndexError):
+            pass
+    return None
+
+
+async def _connect_discord_with_retry(token: str, max_backoff: int = 300) -> None:
+    """
+    Connect to Discord with indefinite exponential backoff retry on 429/1015 rate limits.
+    
+    This function NEVER gives up:
+    - Retries indefinitely with exponential backoff capped at max_backoff seconds
+    - Respects Retry-After header when available
+    - Creates a fresh bot instance on each retry via factory
+    - Keeps the webhook server and process alive during retries
+    - Does NOT re-raise rate-limit errors
     
     Args:
         token: Discord bot token
-        max_attempts: Maximum number of startup attempts (default 5)
         max_backoff: Maximum backoff delay in seconds (default 300 / 5 minutes)
     """
     global bot
     
     attempt = 0
-    while attempt < max_attempts:
+    consecutive_failures = 0  # Track consecutive failures for backoff calculation
+    
+    while True:  # INDEFINITE RETRY LOOP
         attempt += 1
+        consecutive_failures += 1
         
-        # Get or create a fresh bot instance for this attempt
-        bot = _get_or_create_bot()
+        # Create a fresh bot instance for this attempt
+        bot = _create_and_register_bot()
         
         try:
-            logger.info(f"Discord startup attempt {attempt}/{max_attempts}")
+            logger.info(f"Discord startup attempt {attempt} (consecutive failures: {consecutive_failures})")
             await bot.start(token)
-            # If we reach here, bot connected successfully; exit the retry loop
+            # If we reach here, bot connected successfully; reset failure counter and exit
+            logger.info("Discord bot started successfully!")
             return
         except asyncio.CancelledError:
             # Handle graceful shutdown
@@ -795,7 +777,7 @@ async def _connect_discord_with_retry(token: str, max_attempts: int = 5, max_bac
                 await bot.close()
             raise
         except Exception as err:
-            logger.error(f"Discord startup failed (attempt {attempt}/{max_attempts}): {err}")
+            logger.error(f"Discord startup failed (attempt {attempt}): {err}", exc_info=True)
             
             # Close the failed bot instance to release resources
             if bot and not bot.is_closed():
@@ -804,29 +786,32 @@ async def _connect_discord_with_retry(token: str, max_attempts: int = 5, max_bac
                 except Exception as close_err:
                     logger.warning(f"Error closing failed bot instance: {close_err}")
             
-            # Check if this is a rate-limit error or retryable failure
-            if _is_discord_rate_limit_error(err):
+            # Check for rate-limit errors and Retry-After header
+            is_rate_limit = _is_discord_rate_limit_error(err)
+            retry_after = _extract_retry_after(err)
+            
+            if is_rate_limit:
                 logger.warning(
                     f"Discord rate limit (429/1015) detected on attempt {attempt}. "
                     f"This typically indicates IP-level rate limiting or Cloudflare blocking."
                 )
             
-            # Don't retry beyond max attempts
-            if attempt >= max_attempts:
-                logger.error(
-                    f"Max startup attempts ({max_attempts}) exhausted. "
-                    f"Keeping process alive; manual intervention may be required."
-                )
-                # Do NOT re-raise; keep the webhook server and process alive
-                # so Render doesn't restart loop
-                return
+            # Determine wait time
+            if retry_after:
+                # Respect server's Retry-After instruction
+                wait_seconds = retry_after
+                logger.info(f"Respecting Retry-After header: {wait_seconds} seconds")
+            else:
+                # Use exponential backoff with jitter
+                # 2^(consecutive_failures-1) capped at max_backoff
+                base_backoff = min(2 ** (consecutive_failures - 1), max_backoff)
+                jitter = random.uniform(0, base_backoff * 0.1)  # Up to 10% jitter
+                wait_seconds = base_backoff + jitter
             
-            # Calculate backoff with jitter: base^attempt with max cap
-            base_backoff = min(2 ** (attempt - 1), max_backoff)
-            jitter = random.uniform(0, base_backoff * 0.1)  # Up to 10% jitter
-            wait_seconds = base_backoff + jitter
-            
-            logger.info(f"Retrying Discord startup in {wait_seconds:.1f} seconds...")
+            logger.info(
+                f"Retrying Discord startup in {wait_seconds:.1f} seconds... "
+                f"(backoff strategy: exponential with max {max_backoff}s cap)"
+            )
             await asyncio.sleep(wait_seconds)
 
 
