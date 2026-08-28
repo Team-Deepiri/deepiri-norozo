@@ -1,5 +1,7 @@
 import logging
 import os
+import random
+import time
 from datetime import timezone
 from typing import Awaitable, Callable
 
@@ -36,6 +38,49 @@ def _bool_env(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_discord_rate_limited(exc: BaseException) -> bool:
+    status = getattr(exc, "status", None)
+    if status == 429:
+        return True
+
+    message = str(exc).lower()
+    return "429" in message or "too many requests" in message or "rate limited" in message
+
+
+def _run_discord_bot(
+    bot: commands.Bot,
+    token: str,
+    *,
+    max_attempts: int = 4,
+    base_delay: float = 5.0,
+) -> None:
+    for attempt in range(1, max_attempts + 1):
+        try:
+            bot.run(token)
+            return
+        except Exception as exc:  # pragma: no cover - exercised via rate-limit retry handling
+            if not _is_discord_rate_limited(exc):
+                raise
+
+            if attempt == max_attempts:
+                logger.warning(
+                    "Discord rate limited; exhausted retries after %s attempts.",
+                    max_attempts,
+                )
+                raise
+
+            delay = base_delay * (2 ** (attempt - 1))
+            jitter = random.uniform(0, delay * 0.25)
+            sleep_for = delay + jitter
+            logger.warning(
+                "Discord rate limited (HTTP 429); retrying in %.1f seconds (attempt %s/%s)",
+                sleep_for,
+                attempt,
+                max_attempts,
+            )
+            time.sleep(sleep_for)
 
 
 def format_discussion_title(message_content: str) -> str:
@@ -136,7 +181,7 @@ def main() -> None:
 
     bot = DiscussionsBridgeBot(enable_message_content_intent=enable_message_content)
     try:
-        bot.run(token)
+        _run_discord_bot(bot, token)
         return
     except discord.errors.PrivilegedIntentsRequired:
         if not enable_message_content:
@@ -149,7 +194,7 @@ def main() -> None:
         )
 
     fallback_bot = DiscussionsBridgeBot(enable_message_content_intent=False)
-    fallback_bot.run(token)
+    _run_discord_bot(fallback_bot, token)
 
 
 if __name__ == "__main__":

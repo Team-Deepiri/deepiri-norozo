@@ -4,6 +4,7 @@ import hmac
 import json
 import logging
 import os
+import random
 import re
 from urllib.parse import urlparse
 from typing import Optional
@@ -99,6 +100,67 @@ GITHUB_RESERVED_PATHS = {
     "topics",
     "trending",
 }
+
+DISCORD_START_RETRY_BASE = float(os.getenv("DISCORD_START_RETRY_BASE", "5"))
+DISCORD_START_RETRY_MAX = float(os.getenv("DISCORD_START_RETRY_MAX", "60"))
+_DISCORD_RETRY_TASK: Optional[asyncio.Task[None]] = None
+_DISCORD_RETRY_ATTEMPT = 0
+
+
+def _discord_status_code(exc: object) -> Optional[int]:
+    status = getattr(exc, "status", None)
+    if status is not None:
+        try:
+            return int(status)
+        except (TypeError, ValueError):
+            return None
+
+    response = getattr(exc, "response", None)
+    if response is not None:
+        status = getattr(response, "status", None)
+        if status is not None:
+            try:
+                return int(status)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _extract_cloudflare_ray_id(exc: object) -> Optional[str]:
+    response = getattr(exc, "response", None)
+    if response is not None:
+        headers = getattr(response, "headers", None) or {}
+        ray_id = headers.get("CF-Ray") or headers.get("cf-ray")
+        if ray_id:
+            return str(ray_id)
+
+    body = getattr(exc, "text", None)
+    if not body and response is not None:
+        body = getattr(response, "text", None)
+    if body:
+        match = re.search(r"Ray ID:\s*([A-Za-z0-9-]+)", str(body), re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _is_retryable_discord_error(exc: BaseException) -> bool:
+    status = _discord_status_code(exc)
+    if status == 429:
+        return True
+
+    message = str(exc).lower()
+    if "429" in message or "rate limited" in message or "too many requests" in message:
+        return True
+    if "cloudflare" in message and "1015" in message:
+        return True
+    return False
+
+
+def _discord_retry_delay(attempt: int) -> float:
+    exp = min(DISCORD_START_RETRY_BASE * (2 ** max(0, attempt - 1)), DISCORD_START_RETRY_MAX)
+    jitter = random.uniform(0, min(exp * 0.25, 5.0))
+    return min(exp + jitter, DISCORD_START_RETRY_MAX)
 
 
 class DeepiriBot(commands.Bot):
@@ -265,7 +327,10 @@ async def notify_support_team_for_message(message: discord.Message) -> None:
 
 @bot.event
 async def on_ready() -> None:
+    global _DISCORD_RETRY_ATTEMPT
+    _DISCORD_RETRY_ATTEMPT = 0
     print(f"Logged in as {bot.user} (id={bot.user.id if bot.user else 'unknown'})")
+    logger.info("Discord bot ready; resetting rate-limit backoff.")
     meeting_service.start_loop()
 
 
@@ -741,9 +806,56 @@ async def start_webhook_server() -> None:
     print(f"Plaky webhook server listening on http://{WEBHOOK_HOST}:{WEBHOOK_PORT}/plaky/webhook")
 
 
+async def _connect_discord_with_retry(token: str) -> None:
+    global _DISCORD_RETRY_ATTEMPT, _DISCORD_RETRY_TASK
+
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            logger.info("Starting Discord login attempt %s", attempt)
+            await bot.start(token)
+            _DISCORD_RETRY_ATTEMPT = 0
+            logger.info("Discord startup succeeded; backoff reset.")
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pragma: no cover - exercised via tests via helper logic
+            status = _discord_status_code(exc)
+            ray_id = _extract_cloudflare_ray_id(exc)
+            if _is_retryable_discord_error(exc):
+                _DISCORD_RETRY_ATTEMPT = attempt
+                delay = _discord_retry_delay(attempt)
+                logger.warning(
+                    "Discord login attempt %s failed with HTTP %s; retrying in %.1f seconds; Cloudflare Ray ID=%s",
+                    attempt,
+                    status or "unknown",
+                    delay,
+                    ray_id or "n/a",
+                )
+                if not bot.is_closed():
+                    await bot.close()
+                await asyncio.sleep(delay)
+                continue
+
+            logger.exception("Discord startup failed with non-retryable error; keeping webhook server alive.")
+            if not bot.is_closed():
+                await bot.close()
+            await asyncio.sleep(DISCORD_START_RETRY_BASE)
+
+
+async def _ensure_discord_retry_task(token: str) -> None:
+    global _DISCORD_RETRY_TASK
+    if _DISCORD_RETRY_TASK is not None and not _DISCORD_RETRY_TASK.done():
+        return
+
+    _DISCORD_RETRY_TASK = asyncio.create_task(_connect_discord_with_retry(token))
+
+
 async def main() -> None:
     await start_webhook_server()
-    await bot.start(DISCORD_TOKEN)
+    await _ensure_discord_retry_task(DISCORD_TOKEN)
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
