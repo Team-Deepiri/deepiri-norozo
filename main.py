@@ -4,12 +4,13 @@ import hmac
 import json
 import logging
 import os
+import random
 import re
 from urllib.parse import urlparse
 from typing import Optional
 
 import discord
-from aiohttp import web
+from aiohttp import web, ClientError
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -117,8 +118,18 @@ class DeepiriBot(commands.Bot):
         await self.tree.sync()
 
 
+# Create the initial bot instance; will be replaced during retries.
 bot = DeepiriBot()
 meeting_service = setup_meeting_features(bot)
+
+
+def _get_or_create_bot() -> DeepiriBot:
+    """Get the current bot instance, or create a fresh one if needed."""
+    global bot
+    if bot is None or bot.is_closed():
+        bot = DeepiriBot()
+        meeting_service = setup_meeting_features(bot)
+    return bot
 
 
 def _extract_github_profile_username(message_content: str) -> Optional[str]:
@@ -737,13 +748,91 @@ async def start_webhook_server() -> None:
     site = web.TCPSite(runner, host=WEBHOOK_HOST, port=WEBHOOK_PORT)
     await site.start()
 
-    bot.webhook_runner = runner
+    global bot
+    if bot:
+        bot.webhook_runner = runner
     print(f"Plaky webhook server listening on http://{WEBHOOK_HOST}:{WEBHOOK_PORT}/plaky/webhook")
+
+
+def _is_discord_rate_limit_error(error: Exception) -> bool:
+    """Check if an error is a Discord 429 or Cloudflare 1015 rate limit error."""
+    error_str = str(error).lower()
+    # Check for common rate limit indicators
+    rate_limit_indicators = ["429", "1015", "too many requests", "cloudflare", "rate limit"]
+    return any(indicator in error_str for indicator in rate_limit_indicators)
+
+
+async def _connect_discord_with_retry(token: str, max_attempts: int = 5, max_backoff: int = 300) -> None:
+    """
+    Connect to Discord with exponential backoff retry on 429/1015 rate limits.
+    
+    Does NOT re-raise rate-limit errors; keeps the process alive during rate-limiting.
+    Creates a fresh bot instance on each retry to avoid lifecycle issues.
+    
+    Args:
+        token: Discord bot token
+        max_attempts: Maximum number of startup attempts (default 5)
+        max_backoff: Maximum backoff delay in seconds (default 300 / 5 minutes)
+    """
+    global bot
+    
+    attempt = 0
+    while attempt < max_attempts:
+        attempt += 1
+        
+        # Get or create a fresh bot instance for this attempt
+        bot = _get_or_create_bot()
+        
+        try:
+            logger.info(f"Discord startup attempt {attempt}/{max_attempts}")
+            await bot.start(token)
+            # If we reach here, bot connected successfully; exit the retry loop
+            return
+        except asyncio.CancelledError:
+            # Handle graceful shutdown
+            logger.info("Discord startup cancelled")
+            if bot and not bot.is_closed():
+                await bot.close()
+            raise
+        except Exception as err:
+            logger.error(f"Discord startup failed (attempt {attempt}/{max_attempts}): {err}")
+            
+            # Close the failed bot instance to release resources
+            if bot and not bot.is_closed():
+                try:
+                    await bot.close()
+                except Exception as close_err:
+                    logger.warning(f"Error closing failed bot instance: {close_err}")
+            
+            # Check if this is a rate-limit error or retryable failure
+            if _is_discord_rate_limit_error(err):
+                logger.warning(
+                    f"Discord rate limit (429/1015) detected on attempt {attempt}. "
+                    f"This typically indicates IP-level rate limiting or Cloudflare blocking."
+                )
+            
+            # Don't retry beyond max attempts
+            if attempt >= max_attempts:
+                logger.error(
+                    f"Max startup attempts ({max_attempts}) exhausted. "
+                    f"Keeping process alive; manual intervention may be required."
+                )
+                # Do NOT re-raise; keep the webhook server and process alive
+                # so Render doesn't restart loop
+                return
+            
+            # Calculate backoff with jitter: base^attempt with max cap
+            base_backoff = min(2 ** (attempt - 1), max_backoff)
+            jitter = random.uniform(0, base_backoff * 0.1)  # Up to 10% jitter
+            wait_seconds = base_backoff + jitter
+            
+            logger.info(f"Retrying Discord startup in {wait_seconds:.1f} seconds...")
+            await asyncio.sleep(wait_seconds)
 
 
 async def main() -> None:
     await start_webhook_server()
-    await bot.start(DISCORD_TOKEN)
+    await _connect_discord_with_retry(DISCORD_TOKEN)
 
 
 if __name__ == "__main__":
