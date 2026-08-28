@@ -66,6 +66,14 @@ class FakeGuildWithMember:
         raise discord.NotFound(response=cast(Any, SimpleNamespace(status=404)), message="missing")
 
 
+@pytest.fixture(autouse=True)
+def run_to_thread_inline(monkeypatch):
+    async def fake_to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(main.asyncio, "to_thread", fake_to_thread)
+
+
 @pytest.mark.asyncio
 async def test_github_invite_request_requires_support_channel(monkeypatch):
     interaction = SimpleNamespace(

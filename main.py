@@ -7,21 +7,24 @@ import os
 import random
 import re
 from urllib.parse import urlparse
-from typing import Optional
 
 import discord
-from aiohttp import web, ClientError
+from aiohttp import web
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
 from bot import format_discussion_body, format_discussion_title
-from github import add_user_to_team, invite_user, remove_user_from_org, remove_user_from_team
+from github import (
+    add_user_to_team,
+    invite_user,
+    remove_user_from_org,
+    remove_user_from_team,
+)
 from github_discussion import GitHubDiscussionError, create_github_discussion
 from meetings import setup_meeting_features
 from onboarding import ApprovalView
 from plaky import create_task, get_tasks
-
 
 load_dotenv()
 
@@ -40,7 +43,7 @@ PLAKY_API_KEY = os.getenv("PLAKY_API_KEY")
 PLAKY_WEBHOOK_SECRET = os.getenv("PLAKY_WEBHOOK_SECRET", "")
 
 
-def _int_env(name: str) -> Optional[int]:
+def _int_env(name: str) -> int | None:
     value = os.getenv(name)
     if value is None or value == "":
         return None
@@ -110,7 +113,7 @@ class DeepiriBot(commands.Bot):
         intents.guilds = True
 
         super().__init__(command_prefix="!", intents=intents)
-        self.webhook_runner: Optional[web.AppRunner] = None
+        self.webhook_runner: web.AppRunner | None = None
         self.meeting_service = None  # Will be set by factory
 
     async def setup_hook(self) -> None:
@@ -120,7 +123,7 @@ class DeepiriBot(commands.Bot):
 
 
 # Global reference to current bot; will be replaced on each retry.
-bot: Optional[DeepiriBot] = None
+bot: DeepiriBot | None = None
 meeting_service = None
 
 
@@ -320,7 +323,7 @@ def _create_and_register_bot() -> DeepiriBot:
     return new_bot
 
 
-def _extract_github_profile_username(message_content: str) -> Optional[str]:
+def _extract_github_profile_username(message_content: str) -> str | None:
     content = (message_content or "").strip()
     if not content:
         return None
@@ -337,8 +340,7 @@ def _extract_github_profile_username(message_content: str) -> Optional[str]:
 
         parsed = urlparse(raw_url)
         host = parsed.netloc.lower()
-        if host.startswith("www."):
-            host = host[4:]
+        host = host.removeprefix("www.")
         if host != "github.com":
             continue
 
@@ -386,7 +388,7 @@ def _is_valid_plaky_signature(raw_body: bytes, signature_header: str, secret: st
     return hmac.compare_digest(provided, expected)
 
 
-async def _channel_from_id(channel_id: Optional[int]) -> Optional[discord.TextChannel]:
+async def _channel_from_id(channel_id: int | None) -> discord.TextChannel | None:
     if not channel_id:
         return None
 
@@ -552,7 +554,7 @@ async def handle_github_invite_request(interaction: discord.Interaction, github_
                 await staff_channel.send(
                     f"GitHub invite auto-sent for `{normalized_username}` requested by {interaction.user.mention}."
                 )
-            except Exception:
+            except discord.DiscordException:
                 logger.warning("Could not post GitHub invite log to staff channel %s", STAFF_CHANNEL_ID)
 
     team_display_name = "team"
@@ -575,7 +577,7 @@ async def handle_github_invite_request(interaction: discord.Interaction, github_
     )
 
 
-async def handle_offboard_user(interaction: discord.Interaction, member: discord.Member, github_username: str, *, team: Optional[str] = None) -> None:
+async def handle_offboard_user(interaction: discord.Interaction, member: discord.Member, github_username: str, *, team: str | None = None) -> None:
     await interaction.response.defer(ephemeral=True)
 
     normalized_username = (github_username or "").strip().lower()
@@ -687,6 +689,43 @@ async def handle_ipca_signed(interaction: discord.Interaction, github_username: 
 # Slash commands are registered in the bot factory _create_and_register_bot()
 
 
+async def plaky_webhook_handler(request: web.Request) -> web.Response:
+    raw_body = await request.read()
+
+    if PLAKY_WEBHOOK_SECRET:
+        signature_header = (
+            request.headers.get("X-Plaky-Signature")
+            or request.headers.get("x-plaky-signature")
+            or request.headers.get("X-Signature")
+        )
+        if not signature_header:
+            return web.json_response({"ok": False, "message": "Missing signature header"}, status=401)
+
+        if not _is_valid_plaky_signature(raw_body, signature_header, PLAKY_WEBHOOK_SECRET):
+            return web.json_response({"ok": False, "message": "Invalid signature"}, status=401)
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return web.json_response({"ok": False, "message": "Invalid JSON"}, status=400)
+
+    status = str(payload.get("status", "")).strip().lower()
+    priority = str(payload.get("priority", "")).strip().lower()
+
+    should_alert = status == "blocked" or priority in {"high", "high priority"}
+    if should_alert and QA_CHANNEL_ID:
+        channel = await _channel_from_id(QA_CHANNEL_ID)
+        if channel:
+            title = payload.get("title", "Plaky task")
+            task_url = payload.get("url") or payload.get("taskUrl") or ""
+            description = f"Status update for **{title}**\\nStatus: **{status or 'unknown'}**\\nPriority: **{priority or 'unknown'}**"
+            if task_url:
+                description += f"\\n{task_url}"
+            await channel.send(f":warning: {description}")
+
+    return web.json_response({"ok": True})
+
+
 async def health_handler(_: web.Request) -> web.Response:
     return web.json_response({"ok": True, "service": "deepiri-discord-bot"})
 
@@ -702,7 +741,6 @@ async def start_webhook_server() -> None:
     site = web.TCPSite(runner, host=WEBHOOK_HOST, port=WEBHOOK_PORT)
     await site.start()
 
-    global bot
     if bot:
         bot.webhook_runner = runner
     print(f"Plaky webhook server listening on http://{WEBHOOK_HOST}:{WEBHOOK_PORT}/plaky/webhook")
@@ -716,7 +754,7 @@ def _is_discord_rate_limit_error(error: Exception) -> bool:
     return any(indicator in error_str for indicator in rate_limit_indicators)
 
 
-def _extract_retry_after(error: Exception) -> Optional[int]:
+def _extract_retry_after(error: Exception) -> int | None:
     """
     Extract Retry-After header value (in seconds) from error.
     
@@ -753,7 +791,7 @@ async def _connect_discord_with_retry(token: str, max_backoff: int = 300) -> Non
         max_backoff: Maximum backoff delay in seconds (default 300 / 5 minutes)
     """
     global bot
-    
+
     attempt = 0
     consecutive_failures = 0  # Track consecutive failures for backoff calculation
     
@@ -777,14 +815,14 @@ async def _connect_discord_with_retry(token: str, max_backoff: int = 300) -> Non
                 await bot.close()
             raise
         except Exception as err:
-            logger.error(f"Discord startup failed (attempt {attempt}): {err}", exc_info=True)
-            
+            logger.exception("Discord startup failed (attempt %s)", attempt)
+
             # Close the failed bot instance to release resources
             if bot and not bot.is_closed():
                 try:
                     await bot.close()
-                except Exception as close_err:
-                    logger.warning(f"Error closing failed bot instance: {close_err}")
+                except discord.DiscordException as close_err:
+                    logger.warning("Error closing failed bot instance: %s", close_err)
             
             # Check for rate-limit errors and Retry-After header
             is_rate_limit = _is_discord_rate_limit_error(err)

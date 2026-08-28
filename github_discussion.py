@@ -1,10 +1,9 @@
 import asyncio
 import logging
 import os
-from typing import Any, Dict
+from typing import Any
 
 import httpx
-
 
 GRAPHQL_URL = "https://api.github.com/graphql"
 CREATE_DISCUSSION_MUTATION = """
@@ -61,11 +60,11 @@ def _resolve_category_id() -> str:
 
 async def _graphql_request(
     query: str,
-    variables: Dict[str, Any],
+    variables: dict[str, Any],
     pat: str,
     retries: int = 2,
     timeout_seconds: float = 20.0,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     headers = {
         "Authorization": f"Bearer {pat}",
         "Content-Type": "application/json",

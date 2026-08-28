@@ -1,16 +1,17 @@
 import asyncio
 import json
+import logging
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import discord
 import pytz
 from discord import app_commands
-from discord.ext import commands
-from discord.ext import tasks
+from discord.ext import commands, tasks
 
+logger = logging.getLogger(__name__)
 
 EST = pytz.timezone("US/Eastern")
 UTC = pytz.utc
@@ -32,7 +33,7 @@ class MeetingReminderService:
         self._ensure_storage_file()
 
     @staticmethod
-    def _int_env(name: str) -> Optional[int]:
+    def _int_env(name: str) -> int | None:
         value = os.getenv(name)
         if value is None or value == "":
             return None
@@ -46,7 +47,7 @@ class MeetingReminderService:
         if not self.storage_path.exists():
             self.storage_path.write_text("[]", encoding="utf-8")
 
-    async def _read_meetings(self) -> List[Dict[str, Any]]:
+    async def _read_meetings(self) -> list[dict[str, Any]]:
         async with self._lock:
             self._ensure_storage_file()
             try:
@@ -55,7 +56,7 @@ class MeetingReminderService:
                 if not isinstance(parsed, list):
                     return []
 
-                meetings: List[Dict[str, Any]] = []
+                meetings: list[dict[str, Any]] = []
                 for item in parsed:
                     if not isinstance(item, dict):
                         continue
@@ -67,7 +68,7 @@ class MeetingReminderService:
             except (json.JSONDecodeError, OSError):
                 return []
 
-    async def _write_meetings(self, meetings: List[Dict[str, Any]]) -> None:
+    async def _write_meetings(self, meetings: list[dict[str, Any]]) -> None:
         async with self._lock:
             self._ensure_storage_file()
             self.storage_path.write_text(json.dumps(meetings, indent=2), encoding="utf-8")
@@ -108,7 +109,7 @@ class MeetingReminderService:
     def _is_weekly_meeting(self, name: str) -> bool:
         return self._normalized_name(name) in WEEKLY_MEETING_RULES
 
-    async def _append_if_missing(self, meetings: List[Dict[str, Any]], name: str, utc_dt: datetime) -> List[Dict[str, Any]]:
+    async def _append_if_missing(self, meetings: list[dict[str, Any]], name: str, utc_dt: datetime) -> list[dict[str, Any]]:
         serialized = utc_dt.replace(tzinfo=None).isoformat(timespec="seconds")
         exists = any(
             str(m.get("name", "")).strip().lower() == name.strip().lower() and m.get("utc_time") == serialized
@@ -120,11 +121,11 @@ class MeetingReminderService:
         return meetings
 
     @staticmethod
-    def _meeting_sort_key(meeting: Dict[str, Any]) -> datetime:
+    def _meeting_sort_key(meeting: dict[str, Any]) -> datetime:
         try:
             return datetime.fromisoformat(str(meeting["utc_time"]))
-        except Exception:
-            return datetime.max
+        except (KeyError, TypeError, ValueError):
+            return datetime.max.replace(tzinfo=UTC)
 
     @tasks.loop(minutes=1)
     async def reminder_loop(self) -> None:
@@ -150,13 +151,13 @@ class MeetingReminderService:
         one_minute = timedelta(minutes=1)
         thirty_minutes = timedelta(minutes=30)
 
-        remaining_meetings: List[Dict[str, Any]] = []
+        remaining_meetings: list[dict[str, Any]] = []
         any_changed = False
 
         for meeting in meetings:
             try:
                 meeting_utc = datetime.fromisoformat(meeting["utc_time"]).replace(tzinfo=UTC)
-            except Exception:
+            except (KeyError, TypeError, ValueError):
                 any_changed = True
                 continue
 
@@ -210,7 +211,7 @@ class MeetingReminderService:
                 return
 
             try:
-                naive_est = datetime.strptime(f"{date} {time}", "%Y-%m-%d %H:%M")
+                naive_est = datetime.fromisoformat(f"{date}T{time}")
                 meeting_est = EST.localize(naive_est, is_dst=None)
             except (pytz.NonExistentTimeError, pytz.AmbiguousTimeError):
                 await interaction.response.send_message(
@@ -256,12 +257,13 @@ class MeetingReminderService:
         async def list_meetings(interaction: discord.Interaction) -> None:
             meetings = await self._read_meetings()
 
-            upcoming: List[Dict[str, Any]] = []
+            upcoming: list[dict[str, Any]] = []
             now_utc = datetime.now(UTC)
             for meeting in meetings:
                 try:
                     meeting_utc = datetime.fromisoformat(meeting["utc_time"]).replace(tzinfo=UTC)
-                except Exception:
+                except (KeyError, TypeError, ValueError):
+                    logger.warning("Skipping invalid stored meeting entry: %s", meeting)
                     continue
 
                 if meeting_utc >= now_utc:
@@ -273,7 +275,7 @@ class MeetingReminderService:
                 await interaction.response.send_message("No upcoming meetings.")
                 return
 
-            lines: List[str] = []
+            lines: list[str] = []
             for meeting in upcoming:
                 meeting_utc = datetime.fromisoformat(meeting["utc_time"]).replace(tzinfo=UTC)
                 lines.append(f"{meeting['name']} — {self._format_est(meeting_utc)}")
@@ -298,13 +300,14 @@ class MeetingReminderService:
             meetings = await self._read_meetings()
             now_utc = datetime.now(UTC)
 
-            indexed_matches: List[tuple[int, datetime]] = []
+            indexed_matches: list[tuple[int, datetime]] = []
             for i, meeting in enumerate(meetings):
                 if str(meeting.get("name", "")).strip().lower() != meeting_name.strip().lower():
                     continue
                 try:
                     meeting_utc = datetime.fromisoformat(meeting["utc_time"]).replace(tzinfo=UTC)
-                except Exception:
+                except (KeyError, TypeError, ValueError):
+                    logger.warning("Skipping invalid stored meeting entry: %s", meeting)
                     continue
                 if meeting_utc >= now_utc:
                     indexed_matches.append((i, meeting_utc))

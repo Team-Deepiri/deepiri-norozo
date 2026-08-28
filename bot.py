@@ -1,14 +1,13 @@
 import logging
 import os
+from collections.abc import Awaitable, Callable
 from datetime import timezone
-from typing import Awaitable, Callable
 
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
 from github_discussion import GitHubDiscussionError, create_github_discussion
-
 
 logger = logging.getLogger(__name__)
 
@@ -111,8 +110,8 @@ class DiscussionsBridgeBot(commands.Bot):
             await message.add_reaction("✅")
         except GitHubDiscussionError as exc:
             logger.error("Bridge failed for message %s: %s", message.id, exc)
-        except Exception as exc:  # pragma: no cover
-            logger.exception("Unexpected bridge error for message %s: %s", message.id, exc)
+        except Exception:  # pragma: no cover
+            logger.exception("Unexpected bridge error for message %s", message.id)
 
     async def on_ready(self) -> None:
         logger.info("Logged in as %s", self.user)

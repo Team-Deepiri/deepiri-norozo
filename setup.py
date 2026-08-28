@@ -1,12 +1,10 @@
 import argparse
 import asyncio
 from pathlib import Path
-from typing import Dict, List, Tuple
 
 from dotenv import load_dotenv
 
 from github_discussion import GRAPHQL_URL, GitHubDiscussionError, _graphql_request
-
 
 REPO_AND_CATEGORIES_QUERY = """
 query RepositoryDetails($owner: String!, $name: String!) {
@@ -24,13 +22,13 @@ query RepositoryDetails($owner: String!, $name: String!) {
 """
 
 
-def _upsert_env_file(env_path: Path, values: Dict[str, str]) -> None:
-    existing_lines: List[str] = []
+def _upsert_env_file(env_path: Path, values: dict[str, str]) -> None:
+    existing_lines: list[str] = []
     if env_path.exists():
         existing_lines = env_path.read_text(encoding="utf-8").splitlines()
 
     remaining = dict(values)
-    output: List[str] = []
+    output: list[str] = []
 
     for line in existing_lines:
         stripped = line.strip()
@@ -51,7 +49,7 @@ def _upsert_env_file(env_path: Path, values: Dict[str, str]) -> None:
     env_path.write_text("\n".join(output) + "\n", encoding="utf-8")
 
 
-async def fetch_repo_and_categories(owner: str, repo: str, pat: str) -> Tuple[str, List[Dict[str, str]], bool]:
+async def fetch_repo_and_categories(owner: str, repo: str, pat: str) -> tuple[str, list[dict[str, str]], bool]:
     variables = {"owner": owner, "name": repo}
     data = await _graphql_request(REPO_AND_CATEGORIES_QUERY, variables, pat)
 
@@ -68,7 +66,7 @@ async def fetch_repo_and_categories(owner: str, repo: str, pat: str) -> Tuple[st
     return repo_id, categories, has_discussions_enabled
 
 
-def pick_category_id(categories: List[Dict[str, str]], category_name: str) -> str:
+def pick_category_id(categories: list[dict[str, str]], category_name: str) -> str:
     for category in categories:
         name = (category.get("name") or "").strip().lower()
         if name == category_name.strip().lower():

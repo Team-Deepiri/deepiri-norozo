@@ -11,7 +11,8 @@ Verifies that:
 """
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
+
 import pytest
 
 
@@ -103,12 +104,14 @@ async def test_indefinite_retry_continues_beyond_five_attempts():
             raise KeyboardInterrupt("Test limit reached")
         raise ConnectionError(f"Simulated failure #{attempt_count}")
     
-    with patch.object(main, "_create_and_register_bot", side_effect=main._create_and_register_bot):
-        with patch.object(main.DeepiriBot, "start", new_callable=AsyncMock, side_effect=fake_start_always_fails):
-            with patch.object(main.DeepiriBot, "close", new_callable=AsyncMock):
-                with patch.object(main.DeepiriBot, "is_closed", return_value=False):
-                    with pytest.raises(KeyboardInterrupt):
-                        await main._connect_discord_with_retry("fake_token", max_backoff=1)
+    with (
+        patch.object(main, "_create_and_register_bot", side_effect=main._create_and_register_bot),
+        patch.object(main.DeepiriBot, "start", new_callable=AsyncMock, side_effect=fake_start_always_fails),
+        patch.object(main.DeepiriBot, "close", new_callable=AsyncMock),
+        patch.object(main.DeepiriBot, "is_closed", return_value=False),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        await main._connect_discord_with_retry("fake_token", max_backoff=1)
     
     # Verify we reached beyond the old 5-attempt limit
     assert attempt_count > 5, f"Should retry beyond 5 attempts; got {attempt_count}"
@@ -123,8 +126,9 @@ async def test_rate_limit_error_process_stays_alive():
     
     Process must stay alive and keep retrying indefinitely.
     """
-    import main
     from aiohttp import ClientError
+
+    import main
     
     attempt_count = 0
     test_limit = 3
@@ -136,13 +140,14 @@ async def test_rate_limit_error_process_stays_alive():
             raise KeyboardInterrupt("Test limit reached")
         raise ClientError("429: Too Many Requests (Cloudflare 1015)")
     
-    with patch.object(main, "_create_and_register_bot", side_effect=main._create_and_register_bot):
-        with patch.object(main.DeepiriBot, "start", new_callable=AsyncMock, side_effect=fake_start_with_rate_limit):
-            with patch.object(main.DeepiriBot, "close", new_callable=AsyncMock):
-                with patch.object(main.DeepiriBot, "is_closed", return_value=False):
-                    # Should NOT raise; should keep retrying
-                    with pytest.raises(KeyboardInterrupt):
-                        await main._connect_discord_with_retry("fake_token", max_backoff=1)
+    with (
+        patch.object(main, "_create_and_register_bot", side_effect=main._create_and_register_bot),
+        patch.object(main.DeepiriBot, "start", new_callable=AsyncMock, side_effect=fake_start_with_rate_limit),
+        patch.object(main.DeepiriBot, "close", new_callable=AsyncMock),
+        patch.object(main.DeepiriBot, "is_closed", return_value=False),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        await main._connect_discord_with_retry("fake_token", max_backoff=1)
     
     # Verify we continued retrying despite rate limits
     assert attempt_count >= test_limit, f"Should retry at least {test_limit} times; got {attempt_count}"
@@ -171,20 +176,22 @@ async def test_exponential_backoff_grows_and_caps():
     async def fake_sleep(delay):
         sleep_times.append(delay)
     
-    with patch.object(main, "_create_and_register_bot", side_effect=main._create_and_register_bot):
-        with patch.object(main.DeepiriBot, "start", new_callable=AsyncMock, side_effect=fake_start_always_fails):
-            with patch.object(main.DeepiriBot, "close", new_callable=AsyncMock):
-                with patch.object(main.DeepiriBot, "is_closed", return_value=False):
-                    with patch("asyncio.sleep", new_callable=AsyncMock, side_effect=fake_sleep):
-                        with pytest.raises(KeyboardInterrupt):
-                            await main._connect_discord_with_retry("fake_token", max_backoff=60)
+    with (
+        patch.object(main, "_create_and_register_bot", side_effect=main._create_and_register_bot),
+        patch.object(main.DeepiriBot, "start", new_callable=AsyncMock, side_effect=fake_start_always_fails),
+        patch.object(main.DeepiriBot, "close", new_callable=AsyncMock),
+        patch.object(main.DeepiriBot, "is_closed", return_value=False),
+        patch("asyncio.sleep", new_callable=AsyncMock, side_effect=fake_sleep),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        await main._connect_discord_with_retry("fake_token", max_backoff=60)
     
     # Should have sleep calls for retries
     assert len(sleep_times) > 0, "Should have sleep delays"
     
     # Backoff should be increasing (with jitter, allow 50% variance)
     for i in range(1, len(sleep_times)):
-        assert sleep_times[i] >= sleep_times[i-1] * 0.5, f"Backoff should generally increase"
+        assert sleep_times[i] >= sleep_times[i-1] * 0.5, "Backoff should generally increase"
     
     # Backoff should never exceed max_backoff (with jitter tolerance)
     assert all(t <= 60 * 1.15 for t in sleep_times), "Backoff should not exceed max_backoff * jitter"
@@ -213,12 +220,14 @@ async def test_failed_bot_closed_before_retry():
     async def track_close():
         close_calls.append("close")
     
-    with patch.object(main, "_create_and_register_bot", side_effect=main._create_and_register_bot):
-        with patch.object(main.DeepiriBot, "start", new_callable=AsyncMock, side_effect=fake_start_fails_once):
-            with patch.object(main.DeepiriBot, "close", new_callable=AsyncMock, side_effect=track_close):
-                with patch.object(main.DeepiriBot, "is_closed", return_value=False):
-                    with pytest.raises(KeyboardInterrupt):
-                        await main._connect_discord_with_retry("fake_token", max_backoff=1)
+    with (
+        patch.object(main, "_create_and_register_bot", side_effect=main._create_and_register_bot),
+        patch.object(main.DeepiriBot, "start", new_callable=AsyncMock, side_effect=fake_start_fails_once),
+        patch.object(main.DeepiriBot, "close", new_callable=AsyncMock, side_effect=track_close),
+        patch.object(main.DeepiriBot, "is_closed", return_value=False),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        await main._connect_discord_with_retry("fake_token", max_backoff=1)
     
     # Verify close was called for failed bot
     assert len(close_calls) >= 1, "Failed bot instances should be closed"
@@ -234,12 +243,14 @@ async def test_cancelled_error_propagates():
     async def fake_start_raises_cancelled(token):
         raise asyncio.CancelledError()
     
-    with patch.object(main, "_create_and_register_bot", side_effect=main._create_and_register_bot):
-        with patch.object(main.DeepiriBot, "start", new_callable=AsyncMock, side_effect=fake_start_raises_cancelled):
-            with patch.object(main.DeepiriBot, "close", new_callable=AsyncMock):
-                with patch.object(main.DeepiriBot, "is_closed", return_value=False):
-                    with pytest.raises(asyncio.CancelledError):
-                        await main._connect_discord_with_retry("fake_token")
+    with (
+        patch.object(main, "_create_and_register_bot", side_effect=main._create_and_register_bot),
+        patch.object(main.DeepiriBot, "start", new_callable=AsyncMock, side_effect=fake_start_raises_cancelled),
+        patch.object(main.DeepiriBot, "close", new_callable=AsyncMock),
+        patch.object(main.DeepiriBot, "is_closed", return_value=False),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await main._connect_discord_with_retry("fake_token")
 
 
 @pytest.mark.asyncio
@@ -247,8 +258,9 @@ async def test_is_discord_rate_limit_error():
     """
     Verify rate limit error detection.
     """
-    import main
     from aiohttp import ClientError
+
+    import main
     
     # Test cases that should be identified as rate limit errors
     rate_limit_errors = [
