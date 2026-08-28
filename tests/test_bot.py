@@ -115,7 +115,6 @@ def test_main_retry_helpers_handle_repeated_429s(monkeypatch):
         attempts["count"] += 1
         if attempts["count"] < 3:
             raise FakeRateLimit()
-        return None
 
     async def fake_close():
         closes["count"] += 1

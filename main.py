@@ -7,7 +7,6 @@ import os
 import random
 import re
 from urllib.parse import urlparse
-from typing import Optional
 
 import discord
 from aiohttp import web
@@ -16,12 +15,16 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 from bot import format_discussion_body, format_discussion_title
-from github import add_user_to_team, invite_user, remove_user_from_org, remove_user_from_team
+from github import (
+    add_user_to_team,
+    invite_user,
+    remove_user_from_org,
+    remove_user_from_team,
+)
 from github_discussion import GitHubDiscussionError, create_github_discussion
 from meetings import setup_meeting_features
 from onboarding import ApprovalView
 from plaky import create_task, get_tasks
-
 
 load_dotenv()
 
@@ -40,7 +43,7 @@ PLAKY_API_KEY = os.getenv("PLAKY_API_KEY")
 PLAKY_WEBHOOK_SECRET = os.getenv("PLAKY_WEBHOOK_SECRET", "")
 
 
-def _int_env(name: str) -> Optional[int]:
+def _int_env(name: str) -> int | None:
     value = os.getenv(name)
     if value is None or value == "":
         return None
@@ -103,11 +106,11 @@ GITHUB_RESERVED_PATHS = {
 
 DISCORD_START_RETRY_BASE = float(os.getenv("DISCORD_START_RETRY_BASE", "5"))
 DISCORD_START_RETRY_MAX = float(os.getenv("DISCORD_START_RETRY_MAX", "60"))
-_DISCORD_RETRY_TASK: Optional[asyncio.Task[None]] = None
+_DISCORD_RETRY_TASK: asyncio.Task[None] | None = None
 _DISCORD_RETRY_ATTEMPT = 0
 
 
-def _discord_status_code(exc: object) -> Optional[int]:
+def _discord_status_code(exc: object) -> int | None:
     status = getattr(exc, "status", None)
     if status is not None:
         try:
@@ -126,7 +129,7 @@ def _discord_status_code(exc: object) -> Optional[int]:
     return None
 
 
-def _extract_cloudflare_ray_id(exc: object) -> Optional[str]:
+def _extract_cloudflare_ray_id(exc: object) -> str | None:
     response = getattr(exc, "response", None)
     if response is not None:
         headers = getattr(response, "headers", None) or {}
@@ -152,9 +155,7 @@ def _is_retryable_discord_error(exc: BaseException) -> bool:
     message = str(exc).lower()
     if "429" in message or "rate limited" in message or "too many requests" in message:
         return True
-    if "cloudflare" in message and "1015" in message:
-        return True
-    return False
+    return "cloudflare" in message and "1015" in message
 
 
 def _discord_retry_delay(attempt: int) -> float:
@@ -171,7 +172,7 @@ class DeepiriBot(commands.Bot):
         intents.guilds = True
 
         super().__init__(command_prefix="!", intents=intents)
-        self.webhook_runner: Optional[web.AppRunner] = None
+        self.webhook_runner: web.AppRunner | None = None
 
     async def setup_hook(self) -> None:
         if DEV_TEAM_ROLE_ID is not None and AVAILABLE_ROLE_ID is not None:
@@ -183,7 +184,7 @@ bot = DeepiriBot()
 meeting_service = setup_meeting_features(bot)
 
 
-def _extract_github_profile_username(message_content: str) -> Optional[str]:
+def _extract_github_profile_username(message_content: str) -> str | None:
     content = (message_content or "").strip()
     if not content:
         return None
@@ -200,8 +201,7 @@ def _extract_github_profile_username(message_content: str) -> Optional[str]:
 
         parsed = urlparse(raw_url)
         host = parsed.netloc.lower()
-        if host.startswith("www."):
-            host = host[4:]
+        host = host.removeprefix("www.")
         if host != "github.com":
             continue
 
@@ -249,7 +249,7 @@ def _is_valid_plaky_signature(raw_body: bytes, signature_header: str, secret: st
     return hmac.compare_digest(provided, expected)
 
 
-async def _channel_from_id(channel_id: Optional[int]) -> Optional[discord.TextChannel]:
+async def _channel_from_id(channel_id: int | None) -> discord.TextChannel | None:
     if not channel_id:
         return None
 
@@ -472,7 +472,7 @@ async def handle_github_invite_request(interaction: discord.Interaction, github_
                 await staff_channel.send(
                     f"GitHub invite auto-sent for `{normalized_username}` requested by {interaction.user.mention}."
                 )
-            except Exception:
+            except discord.DiscordException:
                 logger.warning("Could not post GitHub invite log to staff channel %s", STAFF_CHANNEL_ID)
 
     team_display_name = "team"
@@ -495,7 +495,7 @@ async def handle_github_invite_request(interaction: discord.Interaction, github_
     )
 
 
-async def handle_offboard_user(interaction: discord.Interaction, member: discord.Member, github_username: str, *, team: Optional[str] = None) -> None:
+async def handle_offboard_user(interaction: discord.Interaction, member: discord.Member, github_username: str, *, team: str | None = None) -> None:
     await interaction.response.defer(ephemeral=True)
 
     normalized_username = (github_username or "").strip().lower()
@@ -767,7 +767,7 @@ async def plaky_webhook_handler(request: web.Request) -> web.Response:
 
     try:
         payload = json.loads(raw_body.decode("utf-8"))
-    except Exception:
+    except (UnicodeDecodeError, json.JSONDecodeError):
         return web.json_response({"ok": False, "message": "Invalid JSON"}, status=400)
 
     status = str(payload.get("status", "")).strip().lower()
@@ -807,7 +807,7 @@ async def start_webhook_server() -> None:
 
 
 async def _connect_discord_with_retry(token: str) -> None:
-    global _DISCORD_RETRY_ATTEMPT, _DISCORD_RETRY_TASK
+    global _DISCORD_RETRY_ATTEMPT
 
     attempt = 0
     while True:

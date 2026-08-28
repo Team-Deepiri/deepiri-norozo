@@ -1,7 +1,7 @@
 import logging
 import time
+from typing import Any
 from urllib.parse import urlparse
-from typing import Any, Dict, Optional
 
 import requests
 
@@ -15,13 +15,13 @@ def _normalize_org_name(github_org: str) -> str:
     org = (github_org or "").strip()
     if not org:
         return ""
-    if org.startswith("http://") or org.startswith("https://"):
+    if org.startswith(("http://", "https://")):
         parsed = urlparse(org)
         return parsed.path.strip("/").split("/")[0] if parsed.path else ""
     return org.strip("/")
 
 
-def _request_with_rate_limit_retry(method: str, url: str, headers: Dict[str, str], json: Optional[Dict[str, Any]] = None, retries: int = 2) -> requests.Response:
+def _request_with_rate_limit_retry(method: str, url: str, headers: dict[str, str], json: dict[str, Any] | None = None, retries: int = 2) -> requests.Response:
     """Perform an HTTP request and retry on 429 using Retry-After when available."""
     for attempt in range(retries + 1):
         response = requests.request(method=method, url=url, headers=headers, json=json, timeout=20)
@@ -39,7 +39,7 @@ def _request_with_rate_limit_retry(method: str, url: str, headers: Dict[str, str
     return response
 
 
-def _get_user_id(username: str, github_pat: str) -> Dict[str, Any]:
+def _get_user_id(username: str, github_pat: str) -> dict[str, Any]:
     headers = {
         "Authorization": f"Bearer {github_pat}",
         "Accept": "application/vnd.github+json",
@@ -69,7 +69,7 @@ def _get_user_id(username: str, github_pat: str) -> Dict[str, Any]:
     return {"ok": True, "user_id": payload.get("id")}
 
 
-def add_user_to_team(username: str, github_org: str, github_pat: str, team_slug: str) -> Dict[str, Any]:
+def add_user_to_team(username: str, github_org: str, github_pat: str, team_slug: str) -> dict[str, Any]:
     """Add a GitHub user to a team in the configured org by username."""
     normalized_org = _normalize_org_name(github_org)
     normalized_team = (team_slug or "").strip()
@@ -131,7 +131,7 @@ def add_user_to_team(username: str, github_org: str, github_pat: str, team_slug:
     }
 
 
-def remove_user_from_org(username: str, github_org: str, github_pat: str) -> Dict[str, Any]:
+def remove_user_from_org(username: str, github_org: str, github_pat: str) -> dict[str, Any]:
     """Remove a GitHub user from the configured org by username."""
     normalized_org = _normalize_org_name(github_org)
     if not github_pat or not normalized_org:
@@ -184,7 +184,7 @@ def remove_user_from_org(username: str, github_org: str, github_pat: str) -> Dic
     }
 
 
-def remove_user_from_team(username: str, github_org: str, github_pat: str, team_slug: str) -> Dict[str, Any]:
+def remove_user_from_team(username: str, github_org: str, github_pat: str, team_slug: str) -> dict[str, Any]:
     """Remove a GitHub user from a team in the configured org by username."""
     normalized_org = _normalize_org_name(github_org)
     normalized_team = (team_slug or "").strip()
@@ -234,7 +234,7 @@ def remove_user_from_team(username: str, github_org: str, github_pat: str, team_
     }
 
 
-def invite_user(username: str, github_org: str, github_pat: str) -> Dict[str, Any]:
+def invite_user(username: str, github_org: str, github_pat: str) -> dict[str, Any]:
     """Invite a GitHub user to the configured org by username."""
     normalized_org = _normalize_org_name(github_org)
     if not github_pat or not normalized_org:

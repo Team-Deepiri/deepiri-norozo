@@ -1,14 +1,13 @@
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import requests
-
 
 PLAKY_API_BASE = os.getenv("PLAKY_API_BASE", "https://api.plaky.com/v2")
 
 
-def _request_with_rate_limit_retry(method: str, url: str, headers: Dict[str, str], json: Optional[Dict[str, Any]] = None, params: Optional[Dict[str, Any]] = None, retries: int = 2) -> requests.Response:
+def _request_with_rate_limit_retry(method: str, url: str, headers: dict[str, str], json: dict[str, Any] | None = None, params: dict[str, Any] | None = None, retries: int = 2) -> requests.Response:
     """Perform an HTTP request and retry on 429 using Retry-After when available."""
     for attempt in range(retries + 1):
         response = requests.request(method=method, url=url, headers=headers, json=json, params=params, timeout=20)
@@ -26,7 +25,7 @@ def _request_with_rate_limit_retry(method: str, url: str, headers: Dict[str, str
     return response
 
 
-def _headers(api_key: str) -> Dict[str, str]:
+def _headers(api_key: str) -> dict[str, str]:
     return {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -34,7 +33,7 @@ def _headers(api_key: str) -> Dict[str, str]:
     }
 
 
-def create_task(title: str, description: str, priority: str, api_key: str) -> Dict[str, Any]:
+def create_task(title: str, description: str, priority: str, api_key: str) -> dict[str, Any]:
     """Create a Plaky task using the configured API key."""
     if not api_key:
         return {
@@ -78,7 +77,7 @@ def create_task(title: str, description: str, priority: str, api_key: str) -> Di
     }
 
 
-def get_tasks(api_key: str, status: str = "open") -> Dict[str, Any]:
+def get_tasks(api_key: str, status: str = "open") -> dict[str, Any]:
     """Fetch Plaky tasks by status."""
     if not api_key:
         return {
@@ -94,7 +93,7 @@ def get_tasks(api_key: str, status: str = "open") -> Dict[str, Any]:
 
     if response.status_code == 200:
         payload = response.json()
-        tasks: List[Dict[str, Any]]
+        tasks: list[dict[str, Any]]
 
         if isinstance(payload, list):
             tasks = payload
