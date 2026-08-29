@@ -240,24 +240,49 @@ class MeetingReminderService:
         # Try to resolve by role name fallback if guild available
         if guild is not None:
             name_map = {
+                "ai/ml": ["AI Team", "ML Team", "MLOps Engineer", "Data Engineer"],
+                "qa": ["QA Engineer", "DevOps Engineer"],
+                "frontend & backend & infrastructure": [
+                    "Full Stack Engineer",
+                    "Frontend Engineer",
+                    "Backend Engineer",
+                    "Platform Engineer",
+                    "Systems Engineer",
+                ],
+            }
+            # Fallback display names for text if no guild role matches (keep original spec text)
+            fallback_display = {
                 "ai/ml": ["AI", "ML", "MLOps", "Data Engineer"],
                 "qa": ["QA", "DevOps"],
                 "frontend & backend & infrastructure": ["Fullstack", "Frontend", "Backend", "Platform", "Systems"],
             }
             if normalized in name_map:
-                mentions = []
-                for role_name in name_map[normalized]:
-                    # case-insensitive search
+                mentions: List[str] = []
+                for idx, role_name in enumerate(name_map[normalized]):
                     found = None
+                    # exact match first
                     for r in guild.roles:
                         if r.name.lower() == role_name.lower():
                             found = r
                             break
+                    # substring fallback (handles Fullstack vs Full Stack etc)
+                    if found is None:
+                        needle = role_name.lower().replace(" ", "")
+                        for r in guild.roles:
+                            if needle in r.name.lower().replace(" ", "").replace("/", "").replace("-", ""):
+                                found = r
+                                break
+                    # last resort: contains word part (AI -> AI Team)
+                    if found is None:
+                        base = fallback_display[normalized][idx].lower()
+                        for r in guild.roles:
+                            if base in r.name.lower():
+                                found = r
+                                break
                     if found is not None:
                         mentions.append(found.mention)
                     else:
-                        # Fallback to text; don't use @everyone bare
-                        mentions.append(f"@{role_name}")
+                        mentions.append(f"@{fallback_display[normalized][idx]}")
                 if mentions:
                     return " ".join(mentions)
 
