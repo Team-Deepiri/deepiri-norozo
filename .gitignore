@@ -74,6 +74,9 @@ htmlcov/
 # Logging
 *.log
 logs/
+# norozo runtime maps
+github_username_map.json
+meetings.json
 
 # Runtime
 *.pid

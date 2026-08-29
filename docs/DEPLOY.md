@@ -40,6 +40,22 @@ If auto-deploy stays **On**, every merge to `main` deploys immediately (what hap
 
 Plaky webhooks: `https://<your-service>.onrender.com/plaky/webhook`
 
+### Announcement bridge deployment contract
+
+Deploy the platform/gateway endpoint before enabling outbound forwarding from Norozo.
+Configure these values on both sides with the same randomly generated secret:
+
+| Norozo variable | Requirement |
+|-----------------|-------------|
+| `ANNOUNCEMENTS_INBOUND_SECRET` | Required. Incoming platform announcements return `503` when unset and `401` for missing or invalid signatures. |
+| `PLATFORM_ANNOUNCEMENTS_WEBHOOK_URL` | Platform/gateway endpoint that accepts Discord announcements. Leave unset until that endpoint is deployed. |
+| `PLATFORM_ANNOUNCEMENTS_WEBHOOK_SECRET` | Required whenever the outbound URL is set; must match the gateway's verification secret. |
+
+The gateway should send a stable `Idempotency-Key`, `X-Idempotency-Key`, `event_id`,
+or `announcement_id` with retries. Norozo falls back to hashing the signed request
+body when none is provided. Verify `/health` reports
+`"announcement_webhook_ready": true` before directing gateway traffic to Norozo.
+
 ### GitHub secrets
 
 | Secret | Purpose |
