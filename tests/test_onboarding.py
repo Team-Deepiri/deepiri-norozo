@@ -414,7 +414,10 @@ async def test_offboard_user_command_uses_handler(monkeypatch):
     )
 
     member = SimpleNamespace(id=10, mention="@test-user")
-    await main.offboard_user.callback(
+    fresh_bot = main.DeepiriBot()
+    main._register_slash_commands(fresh_bot)
+    offboard_user = fresh_bot.tree.get_command("offboard-user")
+    await offboard_user.callback(
         cast(discord.Interaction, interaction),
         member,
         "SomeUser",
