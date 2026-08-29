@@ -266,7 +266,12 @@ async def _maybe_auto_assign_ipca_roles(message: discord.Message) -> bool:
     except Exception:
         pass
     try:
-        await message.reply(f"{message.author.mention} We gave you access to the rest of the Discord.")
+        # support-tickets uses Discord's auto-thread feature: the triggering
+        # message lives in the parent channel and spawns a same-id companion
+        # thread. message.reply() posts back into the parent channel, not the
+        # thread — so post into message.thread when this message started one.
+        target_channel = message.thread or message.channel
+        await target_channel.send(f"{message.author.mention} We gave you access to the rest of the Discord.")
     except Exception:
         logger.exception("Failed to post IPCA access confirmation reply for %s", message.author.id)
     return True
