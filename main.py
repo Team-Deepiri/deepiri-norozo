@@ -265,6 +265,10 @@ async def _maybe_auto_assign_ipca_roles(message: discord.Message) -> bool:
         await message.add_reaction("✅")
     except Exception:
         pass
+    try:
+        await message.reply(f"{message.author.mention} We gave you access to the rest of the Discord.")
+    except Exception:
+        logger.exception("Failed to post IPCA access confirmation reply for %s", message.author.id)
     return True
 
 
