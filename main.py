@@ -1071,11 +1071,52 @@ async def start_webhook_server() -> None:
 
 async def main() -> None:
     await start_webhook_server()
-    await bot.start(DISCORD_TOKEN)
+    # Keep webhook alive even if Discord is rate-limited (Cloudflare 1015 on Render IP 74.220.48.29)
+    # Render's shared egress IP is currently banned by discord.com Cloudflare — need backoff, not tight crash loop.
+    attempt = 0
+    while True:
+        try:
+            logger.info("Starting Discord bot (attempt %s)", attempt + 1)
+            await bot.start(DISCORD_TOKEN)  # type: ignore[arg-type]
+            # clean exit
+            break
+        except discord.errors.HTTPException as exc:  # type: ignore[attr-defined]
+            # discord.com via Cloudflare 1015 returns HTTP 429 with HTML body
+            is_rate_limited = getattr(exc, "status", None) == 429 or "1015" in str(exc) or "rate limited" in str(exc).lower()
+            if is_rate_limited:
+                # Render IP 74.220.48.29 is banned by Cloudflare — local token is fine (remaining 999). Back off, don't spam.
+                wait = min(600, int(os.getenv("DISCORD_RETRY_WAIT", "30")) * (2 ** min(attempt, 4)) + 5)
+                logger.warning(
+                    "Discord login 429/1015 (Cloudflare) on Render IP — token is healthy (local remaining 999) but egress IP 74.220.48.29 is banned. "
+                    "Backing off %ss (attempt %s). Fix: Render → unsuspend service or move to dedicated egress / proxy, or wait for CF ban to expire. "
+                    "Body: %s",
+                    wait,
+                    attempt + 1,
+                    str(exc)[:400],
+                )
+                await asyncio.sleep(wait)
+                attempt += 1
+                # need fresh bot instance after failed login
+                try:
+                    await bot.close()
+                except Exception:
+                    pass
+                continue
+            raise
+        except Exception:
+            logger.exception("Bot crashed unexpectedly")
+            wait = min(600, 10 * (2 ** min(attempt, 5)))
+            await asyncio.sleep(wait)
+            attempt += 1
+            try:
+                await bot.close()
+            except Exception:
+                pass
+            continue
 
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
-        raise RuntimeError("DISCORD_TOKEN is required in .env")
+        raise RuntimeError("DISCORD_TOKEN is required in .env (or DISCORD_BOT_TOKEN)")
 
     asyncio.run(main())
