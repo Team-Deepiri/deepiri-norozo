@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 
 import discord
 import httpx
-from aiohttp import web
+from aiohttp import BasicAuth, web
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -41,6 +41,7 @@ GITHUB_SUPPORT_TEAM_SLUG = os.getenv("GITHUB_SUPPORT_TEAM_SLUG", "support-team")
 GITHUB_IT_TEAM_SLUG = os.getenv("GITHUB_IT_TEAM_SLUG", "it-management-team")
 PLAKY_API_KEY = os.getenv("PLAKY_API_KEY")
 PLAKY_WEBHOOK_SECRET = os.getenv("PLAKY_WEBHOOK_SECRET", "")
+DISCORD_PROXY_URL = (os.getenv("DISCORD_PROXY_URL") or "").strip() or None
 
 
 def _int_env(name: str) -> Optional[int]:
@@ -129,6 +130,25 @@ GITHUB_RESERVED_PATHS = {
 }
 
 
+def _discord_proxy_kwargs() -> dict:
+    """Route Discord traffic (REST + gateway) through DISCORD_PROXY_URL if set.
+
+    Render's shared egress IP can pick up a Cloudflare 1015 ban from
+    unrelated tenants; routing through deepiri-proxy sidesteps that since
+    it isn't fixable from retry/session logic alone. DISCORD_PROXY_URL must
+    be an http:// proxy URL (e.g. http://user:pass@vps-ip:8888) — aiohttp's
+    proxy=/proxy_auth= support (what discord.py passes this straight into)
+    is HTTP-only, not SOCKS5.
+    """
+    if not DISCORD_PROXY_URL:
+        return {}
+    parsed = urlparse(DISCORD_PROXY_URL)
+    kwargs: dict = {"proxy": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
+    if parsed.username and parsed.password:
+        kwargs["proxy_auth"] = BasicAuth(parsed.username, parsed.password)
+    return kwargs
+
+
 class DeepiriBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
@@ -136,7 +156,7 @@ class DeepiriBot(commands.Bot):
         intents.message_content = True
         intents.guilds = True
 
-        super().__init__(command_prefix="!", intents=intents)
+        super().__init__(command_prefix="!", intents=intents, **_discord_proxy_kwargs())
         self.webhook_runner: Optional[web.AppRunner] = None
 
     async def setup_hook(self) -> None:

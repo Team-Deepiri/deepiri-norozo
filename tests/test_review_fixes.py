@@ -35,6 +35,19 @@ def test_announcement_signature_fails_closed_without_secret():
     assert not main._is_valid_announcement_signature(b"body", "invalid", "")
 
 
+def test_discord_proxy_kwargs_empty_when_unset(monkeypatch):
+    monkeypatch.setattr(main, "DISCORD_PROXY_URL", None)
+    assert main._discord_proxy_kwargs() == {}
+
+
+def test_discord_proxy_kwargs_parses_url_and_auth(monkeypatch):
+    monkeypatch.setattr(main, "DISCORD_PROXY_URL", "http://user:pass@1.2.3.4:8888")
+    kwargs = main._discord_proxy_kwargs()
+    assert kwargs["proxy"] == "http://1.2.3.4:8888"
+    assert kwargs["proxy_auth"].login == "user"
+    assert kwargs["proxy_auth"].password == "pass"
+
+
 def test_github_username_map_load_failure_is_logged(monkeypatch, tmp_path, caplog):
     invalid_map = tmp_path / "github-usernames.json"
     invalid_map.write_text("not-json", encoding="utf-8")
