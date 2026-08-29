@@ -5,12 +5,13 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
 import discord
-import requests
+import httpx
 from aiohttp import web
 from discord import app_commands
 from discord.ext import commands
@@ -84,7 +85,16 @@ ANNOUNCEMENTS_INBOUND_SECRET = (
     os.getenv("ANNOUNCEMENTS_INBOUND_SECRET") or PLATFORM_ANNOUNCEMENTS_SECRET or ""
 ).strip()
 
-GITHUB_USERNAME_MAP_PATH = Path(os.getenv("GITHUB_USERNAME_MAP_FILE", "github_username_map.json"))
+PERSISTENT_DATA_DIR = Path(os.getenv("PERSISTENT_DATA_DIR", "."))
+GITHUB_USERNAME_MAP_PATH = Path(
+    os.getenv("GITHUB_USERNAME_MAP_FILE", str(PERSISTENT_DATA_DIR / "github_username_map.json"))
+)
+ANNOUNCEMENT_DEDUP_PATH = Path(
+    os.getenv("ANNOUNCEMENT_DEDUP_FILE", str(PERSISTENT_DATA_DIR / "announcement_webhook_events.json"))
+)
+ANNOUNCEMENT_DEDUP_TTL_SECONDS = 7 * 24 * 60 * 60
+ANNOUNCEMENT_DEDUP_MAX_EVENTS = 1000
+_announcement_dedup_lock = asyncio.Lock()
 
 URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 PR_URL_RE = re.compile(r"https?://(?:www\.)?github\.com/[^\s]+/[^\s]+/pull/(\d+)", re.IGNORECASE)
@@ -201,23 +211,28 @@ def _is_support_sessions_channel(channel: object) -> bool:
     return channel_id in valid_ids or parent_channel_id in valid_ids
 
 
-def _is_valid_plaky_signature(raw_body: bytes, signature_header: str, secret: str) -> bool:
+def _validate_hmac_signature(
+    raw_body: bytes,
+    signature_header: str,
+    secret: str,
+    expected_prefix: Optional[str] = None,
+) -> bool:
     expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
     provided = signature_header.strip()
-    if provided.startswith("sha256="):
-        provided = provided.split("=", 1)[1]
+    if expected_prefix and provided.startswith(expected_prefix):
+        provided = provided[len(expected_prefix) :]
 
     return hmac.compare_digest(provided, expected)
+
+
+def _is_valid_plaky_signature(raw_body: bytes, signature_header: str, secret: str) -> bool:
+    return _validate_hmac_signature(raw_body, signature_header, secret, expected_prefix="sha256=")
 
 
 def _is_valid_announcement_signature(raw_body: bytes, signature_header: str, secret: str) -> bool:
     if not secret:
-        return True
-    expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
-    provided = signature_header.strip()
-    if provided.startswith("sha256="):
-        provided = provided.split("=", 1)[1]
-    return hmac.compare_digest(provided, expected)
+        return False
+    return _validate_hmac_signature(raw_body, signature_header, secret, expected_prefix="sha256=")
 
 
 def _load_github_username_map() -> dict:
@@ -230,13 +245,16 @@ def _load_github_username_map() -> dict:
             return {str(k): str(v).lower() for k, v in data.items() if isinstance(v, str)}
         return {}
     except Exception:
+        logger.exception("Failed to load GitHub username map from %s", GITHUB_USERNAME_MAP_PATH)
         return {}
 
 
 def _save_github_username_map(mapping: dict) -> None:
     try:
         GITHUB_USERNAME_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
-        GITHUB_USERNAME_MAP_PATH.write_text(json.dumps(mapping, indent=2), encoding="utf-8")
+        temporary_path = GITHUB_USERNAME_MAP_PATH.with_suffix(f"{GITHUB_USERNAME_MAP_PATH.suffix}.tmp")
+        temporary_path.write_text(json.dumps(mapping, indent=2), encoding="utf-8")
+        temporary_path.replace(GITHUB_USERNAME_MAP_PATH)
     except Exception:
         logger.exception("Failed to persist github username map")
 
@@ -250,6 +268,11 @@ def _remember_github_username(discord_id: int, github_username: str) -> None:
 
 
 def _get_github_username_for_member(member: discord.Member) -> Optional[str]:
+    """Return an explicitly mapped username, or a best-effort name-based guess.
+
+    The name fallback is not authoritative. Critical operations should first collect
+    an explicit mapping through ``/github-invite-request``.
+    """
     mapping = _load_github_username_map()
     gh = mapping.get(str(member.id))
     if gh:
@@ -263,58 +286,11 @@ def _get_github_username_for_member(member: discord.Member) -> Optional[str]:
     return None
 
 
-def _is_ipca_sign_message(content: str) -> bool:
-    text = (content or "").lower()
-    if "ipca" not in text:
-        return False
-    # Check for "signed" or "sign" as whole words
-    if re.search(r"\bsigned\b", text) or re.search(r"\bsign\b", text):
-        return True
-    return False
-
-
-async def _auto_assign_ipca_roles(message: discord.Message) -> None:
-    if not _is_support_sessions_channel(message.channel):
-        return
-    if not _is_ipca_sign_message(message.content or ""):
-        return
-    if not isinstance(message.author, discord.Member):
-        return
-    if DEV_TEAM_ROLE_ID is None or AVAILABLE_ROLE_ID is None:
-        return
-    guild = message.guild
-    if guild is None:
-        return
-    dev_role = guild.get_role(DEV_TEAM_ROLE_ID)
-    available_role = guild.get_role(AVAILABLE_ROLE_ID)
-    if dev_role is None or available_role is None:
-        logger.warning("IPCA auto-assign skipped: dev/available roles not found")
-        return
-    # Already has roles?
-    if message.author.get_role(DEV_TEAM_ROLE_ID) and message.author.get_role(AVAILABLE_ROLE_ID):
-        return
-    try:
-        await message.author.add_roles(available_role, dev_role, reason="IPCA signed auto-assign")
-        logger.info("Auto-assigned IPCA roles to %s (%s)", message.author, message.author.id)
-        try:
-            await message.add_reaction("✅")
-        except Exception:
-            pass
-        try:
-            await message.channel.send(
-                f"{message.author.mention} Thanks for signing the IPCA! You've been granted {available_role.mention} and {dev_role.mention}. "
-                "You can now run `/github-invite-request` in this channel if you need a GitHub invite."
-            )
-        except Exception:
-            pass
-    except discord.Forbidden:
-        logger.warning("No permission to auto-assign IPCA roles to %s", message.author)
-    except Exception:
-        logger.exception("Failed to auto-assign IPCA roles")
-
-
 async def _forward_announcement_to_platform(message: discord.Message) -> None:
     if not PLATFORM_ANNOUNCEMENTS_WEBHOOK_URL:
+        return
+    if not PLATFORM_ANNOUNCEMENTS_SECRET:
+        logger.error("Announcement forward disabled: PLATFORM_ANNOUNCEMENTS_WEBHOOK_SECRET is not configured")
         return
     title = format_discussion_title(message.content)
     body = format_discussion_body(message)
@@ -332,20 +308,19 @@ async def _forward_announcement_to_platform(message: discord.Message) -> None:
     }
     raw = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json"}
-    if PLATFORM_ANNOUNCEMENTS_SECRET:
-        sig = hmac.new(PLATFORM_ANNOUNCEMENTS_SECRET.encode("utf-8"), raw, hashlib.sha256).hexdigest()
-        headers["X-Norozo-Signature"] = f"sha256={sig}"
-        headers["X-Platform-Signature"] = f"sha256={sig}"
+    sig = hmac.new(PLATFORM_ANNOUNCEMENTS_SECRET.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+    headers["X-Norozo-Signature"] = f"sha256={sig}"
+    headers["X-Platform-Signature"] = f"sha256={sig}"
     try:
-        await asyncio.to_thread(
-            requests.post,
-            PLATFORM_ANNOUNCEMENTS_WEBHOOK_URL,
-            data=raw,
-            headers=headers,
-            timeout=10,
-        )
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.post(
+                PLATFORM_ANNOUNCEMENTS_WEBHOOK_URL,
+                content=raw,
+                headers=headers,
+            )
+            response.raise_for_status()
         logger.info("Forwarded Discord announcement %s to platform", message.id)
-    except Exception:
+    except httpx.HTTPError:
         logger.exception("Failed to forward announcement %s to platform", message.id)
 
 
@@ -526,8 +501,6 @@ async def on_message(message: discord.Message) -> None:
     content = message.content or ""
 
     await notify_support_team_for_message(message)
-    await _auto_assign_ipca_roles(message)
-
     if _is_announcements_channel(message.channel):
         title = format_discussion_title(message.content)
         body = format_discussion_body(message)
@@ -591,7 +564,11 @@ async def handle_github_invite_request(interaction: discord.Interaction, github_
     try:
         _remember_github_username(interaction.user.id, normalized_username)
     except Exception:
-        pass
+        logger.exception(
+            "Failed to remember GitHub username %s for Discord user %s",
+            normalized_username,
+            interaction.user.id,
+        )
 
     await interaction.response.defer(ephemeral=True)
 
@@ -757,7 +734,11 @@ async def handle_ipca_signed(interaction: discord.Interaction, github_username: 
         try:
             _remember_github_username(interaction.user.id, normalized)
         except Exception:
-            pass
+            logger.exception(
+                "Failed to remember GitHub username %s for Discord user %s",
+                normalized,
+                interaction.user.id,
+            )
 
     approval_channel = await _channel_from_id(STAFF_CHANNEL_ID)
     if not approval_channel:
@@ -783,19 +764,6 @@ async def handle_ipca_signed(interaction: discord.Interaction, github_username: 
             content="I could not send your approval request to the staff channel."
         )
         return
-
-    # Auto-grant roles immediately when the user says they signed IPCA.
-    user = interaction.user
-    if hasattr(user, "guild") and hasattr(user, "add_roles"):
-        guild = getattr(user, "guild", None)
-        if guild is not None and hasattr(guild, "get_role"):
-            dev_role = guild.get_role(DEV_TEAM_ROLE_ID)
-            available_role = guild.get_role(AVAILABLE_ROLE_ID)
-            if dev_role is not None and available_role is not None:
-                try:
-                    await user.add_roles(dev_role, available_role, reason="IPCA signed")
-                except discord.Forbidden:
-                    logger.warning("Could not assign roles to %s after IPCA sign-off", user)
 
     await interaction.edit_original_response(content="Your approval request was sent to staff for review.")
 
@@ -984,26 +952,82 @@ async def plaky_webhook_handler(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+def _announcement_event_key(request: web.Request, payload: dict, raw_body: bytes) -> str:
+    explicit_key = request.headers.get("Idempotency-Key") or request.headers.get("X-Idempotency-Key")
+    if explicit_key:
+        return f"header:{explicit_key.strip()}"
+
+    for field in ("event_id", "eventId", "announcement_id", "announcementId", "id"):
+        value = payload.get(field)
+        if value is not None and str(value).strip():
+            return f"payload:{field}:{str(value).strip()}"
+
+    return f"body:{hashlib.sha256(raw_body).hexdigest()}"
+
+
+def _load_announcement_events(now: float) -> dict[str, float]:
+    try:
+        if not ANNOUNCEMENT_DEDUP_PATH.exists():
+            return {}
+        data = json.loads(ANNOUNCEMENT_DEDUP_PATH.read_text(encoding="utf-8") or "{}")
+        if not isinstance(data, dict):
+            return {}
+        cutoff = now - ANNOUNCEMENT_DEDUP_TTL_SECONDS
+        return {
+            str(key): float(timestamp)
+            for key, timestamp in data.items()
+            if isinstance(timestamp, (int, float)) and float(timestamp) >= cutoff
+        }
+    except Exception:
+        logger.exception("Failed to load announcement idempotency state from %s", ANNOUNCEMENT_DEDUP_PATH)
+        return {}
+
+
+def _save_announcement_events(events: dict[str, float]) -> None:
+    ANNOUNCEMENT_DEDUP_PATH.parent.mkdir(parents=True, exist_ok=True)
+    newest_events = dict(sorted(events.items(), key=lambda item: item[1], reverse=True)[:ANNOUNCEMENT_DEDUP_MAX_EVENTS])
+    temporary_path = ANNOUNCEMENT_DEDUP_PATH.with_suffix(f"{ANNOUNCEMENT_DEDUP_PATH.suffix}.tmp")
+    temporary_path.write_text(json.dumps(newest_events, indent=2), encoding="utf-8")
+    temporary_path.replace(ANNOUNCEMENT_DEDUP_PATH)
+
+
+async def _reserve_announcement_event(event_key: str) -> bool:
+    async with _announcement_dedup_lock:
+        now = time.time()
+        events = _load_announcement_events(now)
+        if event_key in events:
+            return False
+        events[event_key] = now
+        _save_announcement_events(events)
+        return True
+
+
+async def _release_announcement_event(event_key: str) -> None:
+    async with _announcement_dedup_lock:
+        events = _load_announcement_events(time.time())
+        if events.pop(event_key, None) is not None:
+            _save_announcement_events(events)
+
+
 async def platform_announcement_handler(request: web.Request) -> web.Response:
     """Inbound webhook for platform.deepiri.com -> Discord announcements.
     Expects JSON with {title, body, content, author} and optional signature header.
     """
     raw_body = await request.read()
 
-    if ANNOUNCEMENTS_INBOUND_SECRET:
-        sig_header = (
-            request.headers.get("X-Norozo-Signature")
-            or request.headers.get("X-Platform-Signature")
-            or request.headers.get("X-Signature")
-            or request.headers.get("X-Webhook-Signature")
-            or ""
-        )
-        if sig_header and not _is_valid_announcement_signature(raw_body, sig_header, ANNOUNCEMENTS_INBOUND_SECRET):
-            return web.json_response({"ok": False, "message": "Invalid signature"}, status=401)
-        # If secret is configured but no signature provided, allow if trusted internal network header missing?
-        # For now, require signature if secret is set and header present; if header missing, still allow but log.
-        if not sig_header:
-            logger.warning("Platform announcement webhook missing signature header")
+    if not ANNOUNCEMENTS_INBOUND_SECRET:
+        logger.error("Platform announcement webhook disabled: ANNOUNCEMENTS_INBOUND_SECRET is not configured")
+        return web.json_response({"ok": False, "message": "Webhook authentication is not configured"}, status=503)
+
+    sig_header = (
+        request.headers.get("X-Norozo-Signature")
+        or request.headers.get("X-Platform-Signature")
+        or request.headers.get("X-Signature")
+        or request.headers.get("X-Webhook-Signature")
+        or ""
+    )
+    if not sig_header or not _is_valid_announcement_signature(raw_body, sig_header, ANNOUNCEMENTS_INBOUND_SECRET):
+        return web.json_response({"ok": False, "message": "Missing or invalid signature"}, status=401)
 
     try:
         payload = json.loads(raw_body.decode("utf-8"))
@@ -1025,6 +1049,16 @@ async def platform_announcement_handler(request: web.Request) -> web.Response:
     if not channel:
         return web.json_response({"ok": False, "message": "Announcements channel not found"}, status=500)
 
+    event_key = _announcement_event_key(request, payload, raw_body)
+    try:
+        reserved = await _reserve_announcement_event(event_key)
+    except OSError:
+        logger.exception("Failed to persist announcement idempotency key %s", event_key)
+        return web.json_response({"ok": False, "message": "Could not persist webhook state"}, status=503)
+    if not reserved:
+        logger.info("Ignoring duplicate platform announcement %s", event_key)
+        return web.json_response({"ok": True, "duplicate": True})
+
     # Build embed for platform announcement
     embed = discord.Embed(
         title=title or "Platform Announcement",
@@ -1040,6 +1074,10 @@ async def platform_announcement_handler(request: web.Request) -> web.Response:
     try:
         await channel.send(content=content[:1900] if content else None, embed=embed)
     except Exception:
+        try:
+            await _release_announcement_event(event_key)
+        except OSError:
+            logger.exception("Failed to release announcement idempotency key %s", event_key)
         logger.exception("Failed to post platform announcement to Discord")
         return web.json_response({"ok": False, "message": "Failed to post to Discord"}, status=500)
 
@@ -1047,7 +1085,14 @@ async def platform_announcement_handler(request: web.Request) -> web.Response:
 
 
 async def health_handler(_: web.Request) -> web.Response:
-    return web.json_response({"ok": True, "service": "deepiri-discord-bot"})
+    announcement_webhook_ready = bool(ANNOUNCEMENTS_INBOUND_SECRET)
+    return web.json_response(
+        {
+            "ok": True,
+            "service": "deepiri-discord-bot",
+            "announcement_webhook_ready": announcement_webhook_ready,
+        }
+    )
 
 
 async def start_webhook_server() -> None:
