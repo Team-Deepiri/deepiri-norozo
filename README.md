@@ -33,6 +33,23 @@ Copy .env.example to .env and fill values:
 - DISCORD_CHANNEL_ID (optional but recommended)
 - DISCORD_CHANNEL_NAME (fallback if channel id not set, default announcements)
 
+For precise weekly-meeting mentions, configure comma-separated Discord role IDs:
+
+- `MEETING_AI_ML_ROLE_IDS`
+- `MEETING_QA_ROLE_IDS`
+- `MEETING_INFRA_ROLE_IDS`
+
+If these variables are omitted, the bot falls back to role-name matching, which is
+best-effort and can be ambiguous when roles are renamed.
+
+GitHub usernames collected by `/github-invite-request` are stored as explicit
+Discord-to-GitHub mappings. When no mapping exists, the bot may infer a username
+from the member's Discord name, but this is best-effort; explicit mapping is the
+reliable option for team synchronization and offboarding.
+
+The announcement webhook requires `ANNOUNCEMENTS_INBOUND_SECRET`; requests fail
+closed when it is unset.
+
 You can also let setup.py populate IDs:
 
 - REPO_ID
