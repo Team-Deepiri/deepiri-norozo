@@ -1,7 +1,7 @@
 import asyncio
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -12,10 +12,7 @@ from discord.ext import commands
 from discord.ext import tasks
 
 
-try:
-    EST = pytz.timezone("US/Eastern")
-except Exception:
-    EST = pytz.timezone("America/New_York")
+EST = pytz.timezone("America/New_York")
 UTC = pytz.utc
 DEFAULT_STORAGE_PATH = Path(__file__).with_name("meetings.json")
 WEEKLY_MEETING_RULES = {
@@ -160,19 +157,23 @@ class MeetingReminderService:
             return datetime.max
 
     def _next_occurrence_for_rule(self, rule: Dict[str, int], now_est: datetime) -> datetime:
-        """Compute next occurrence in EST for a weekly rule, returned as UTC."""
+        """Compute the next occurrence at the configured Eastern wall-clock time."""
         weekday = rule["weekday"]
-        hour = rule["hour"]
-        minute = rule["minute"]
-        # Start from today at the target time
-        target_est = now_est.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        # If target is not strictly in the future, move forward until weekday matches and time is future
-        days_ahead = (weekday - target_est.weekday()) % 7
+        days_ahead = (weekday - now_est.weekday()) % 7
+        target_date = now_est.date() + timedelta(days=days_ahead)
+        target_naive = datetime.combine(target_date, time(rule["hour"], rule["minute"]))
+        target_est = EST.localize(target_naive)
         if days_ahead == 0 and target_est <= now_est:
-            days_ahead = 7
-        target_est = target_est + timedelta(days=days_ahead)
-        # Localize handled: now_est is already localized; target_est retains tzinfo
+            target_est = EST.localize(datetime.combine(target_date + timedelta(days=7), target_naive.time()))
         return target_est.astimezone(UTC)
+
+    def _next_weekly_occurrence(self, meeting_name: str, meeting_utc: datetime) -> datetime:
+        normalized = self._normalized_name(meeting_name)
+        rule = WEEKLY_MEETING_RULES[normalized]
+        current_est = meeting_utc.astimezone(EST)
+        next_date = current_est.date() + timedelta(days=7)
+        next_est = EST.localize(datetime.combine(next_date, time(rule["hour"], rule["minute"])))
+        return next_est.astimezone(UTC)
 
     async def ensure_weekly_meetings_seeded(self) -> None:
         """Ensure each weekly meeting has an upcoming occurrence in storage."""
@@ -206,6 +207,8 @@ class MeetingReminderService:
 
     def _get_mentions_for_meeting(self, meeting_name: str, guild: Optional[discord.Guild]) -> str:
         normalized = self._normalized_name(meeting_name)
+        # Configured role IDs are authoritative and avoid ambiguous name matching.
+        # Name and text fallbacks keep reminders usable when IDs are not configured.
         # Env override: comma-separated role IDs
         # Map normalized -> env var name
         env_map = {
@@ -338,7 +341,7 @@ class MeetingReminderService:
                 mentions = self._get_mentions_for_meeting(meeting["name"], getattr(channel, "guild", None))
                 await channel.send(f"{mentions} 🚨 {meeting['name']} is starting now!")
                 if self._is_weekly_meeting(meeting["name"]):
-                    next_week = meeting_utc + timedelta(days=7)
+                    next_week = self._next_weekly_occurrence(meeting["name"], meeting_utc)
                     # Preserve display name capitalization for weekly meetings
                     display = WEEKLY_MEETING_DISPLAY_NAMES.get(self._normalized_name(meeting["name"]), meeting["name"])
                     remaining_meetings = await self._append_if_missing(remaining_meetings, display, next_week)
