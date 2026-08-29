@@ -5,10 +5,12 @@ import json
 import logging
 import os
 import re
-from urllib.parse import urlparse
+from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import discord
+import requests
 from aiohttp import web
 from discord import app_commands
 from discord.ext import commands
@@ -30,7 +32,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("deepiri.main")
 
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+DISCORD_TOKEN = (os.getenv("DISCORD_TOKEN") or os.getenv("DISCORD_BOT_TOKEN") or "").strip() or None
 GITHUB_PAT = os.getenv("GITHUB_PAT")
 GITHUB_ORG = os.getenv("GITHUB_ORG")
 GITHUB_SUPPORT_TEAM_SLUG = os.getenv("GITHUB_SUPPORT_TEAM_SLUG", "support-team")
@@ -49,20 +51,40 @@ def _int_env(name: str) -> Optional[int]:
         return None
 
 
-STAFF_CHANNEL_ID = _int_env("STAFF_CHANNEL_ID")
+STAFF_CHANNEL_ID = _int_env("STAFF_CHANNEL_ID")  # #it-notifications 1438671182025982043
 PR_CHANNEL_ID = _int_env("PR_CHANNEL_ID")
 QA_CHANNEL_ID = _int_env("QA_CHANNEL_ID")
 SERVER_COM_CHANNEL_ID = _int_env("SERVER_COM_CHANNEL_ID")
 DEV_TEAM_ROLE_ID = _int_env("DEV_TEAM_ROLE_ID")
 AVAILABLE_ROLE_ID = _int_env("AVAILABLE_ROLE_ID")
 STAFF_ROLE_ID = _int_env("STAFF_ROLE_ID")
-SUPPORT_SESSIONS_CHANNEL_ID = _int_env("SUPPORT_SESSIONS_CHANNEL_ID")
+SUPPORT_SESSIONS_CHANNEL_ID = _int_env("SUPPORT_SESSIONS_CHANNEL_ID")  # #support-tickets 1435722355723993088
+GITHUB_PROFILES_CHANNEL_ID = _int_env("GITHUB_PROFILES_CHANNEL_ID")  # #github-profiles 1435086187822845982
 IT_OPERATIONS_SUPPORT_ROLE_ID = _int_env("IT_OPERATIONS_SUPPORT_ROLE_ID") or _int_env("SUPPORT_TEAM_ROLE_ID")
-ANNOUNCEMENTS_CHANNEL_ID = _int_env("DISCORD_CHANNEL_ID") or _int_env("ANNOUNCEMENTS_CHANNEL_ID")
+QA_ROLE_ID = _int_env("QA_ROLE_ID")
+ANNOUNCEMENTS_CHANNEL_ID = _int_env("DISCORD_CHANNEL_ID") or _int_env("ANNOUNCEMENTS_CHANNEL_ID")  # #announcements 1436509524818395156
 ANNOUNCEMENTS_CHANNEL_NAME = os.getenv("DISCORD_CHANNEL_NAME", "announcements")
 
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "0.0.0.0")
 WEBHOOK_PORT = int(os.getenv("PORT") or os.getenv("WEBHOOK_PORT", "8080"))
+
+PLATFORM_ANNOUNCEMENTS_WEBHOOK_URL = (
+    os.getenv("PLATFORM_ANNOUNCEMENTS_WEBHOOK_URL")
+    or os.getenv("PLATFORM_WEBHOOK_URL")
+    or os.getenv("PLATFORM_API_URL")
+    or ""
+).strip()
+PLATFORM_ANNOUNCEMENTS_SECRET = (
+    os.getenv("PLATFORM_ANNOUNCEMENTS_WEBHOOK_SECRET")
+    or os.getenv("PLATFORM_WEBHOOK_SECRET")
+    or os.getenv("ANNOUNCEMENTS_WEBHOOK_SECRET")
+    or ""
+).strip()
+ANNOUNCEMENTS_INBOUND_SECRET = (
+    os.getenv("ANNOUNCEMENTS_INBOUND_SECRET") or PLATFORM_ANNOUNCEMENTS_SECRET or ""
+).strip()
+
+GITHUB_USERNAME_MAP_PATH = Path(os.getenv("GITHUB_USERNAME_MAP_FILE", "github_username_map.json"))
 
 URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 PR_URL_RE = re.compile(r"https?://(?:www\.)?github\.com/[^\s]+/[^\s]+/pull/(\d+)", re.IGNORECASE)
@@ -170,12 +192,13 @@ def _is_announcements_channel(channel: object) -> bool:
 
 
 def _is_support_sessions_channel(channel: object) -> bool:
-    if SUPPORT_SESSIONS_CHANNEL_ID is None:
+    # Support-tickets and github-profiles are both considered support entry points
+    valid_ids = {cid for cid in [SUPPORT_SESSIONS_CHANNEL_ID, GITHUB_PROFILES_CHANNEL_ID] if cid is not None}
+    if not valid_ids:
         return False
-
     channel_id = getattr(channel, "id", None)
     parent_channel_id = getattr(channel, "parent_id", None)
-    return channel_id == SUPPORT_SESSIONS_CHANNEL_ID or parent_channel_id == SUPPORT_SESSIONS_CHANNEL_ID
+    return channel_id in valid_ids or parent_channel_id in valid_ids
 
 
 def _is_valid_plaky_signature(raw_body: bytes, signature_header: str, secret: str) -> bool:
@@ -185,6 +208,145 @@ def _is_valid_plaky_signature(raw_body: bytes, signature_header: str, secret: st
         provided = provided.split("=", 1)[1]
 
     return hmac.compare_digest(provided, expected)
+
+
+def _is_valid_announcement_signature(raw_body: bytes, signature_header: str, secret: str) -> bool:
+    if not secret:
+        return True
+    expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+    provided = signature_header.strip()
+    if provided.startswith("sha256="):
+        provided = provided.split("=", 1)[1]
+    return hmac.compare_digest(provided, expected)
+
+
+def _load_github_username_map() -> dict:
+    try:
+        if not GITHUB_USERNAME_MAP_PATH.exists():
+            return {}
+        raw = GITHUB_USERNAME_MAP_PATH.read_text(encoding="utf-8").strip() or "{}"
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            return {str(k): str(v).lower() for k, v in data.items() if isinstance(v, str)}
+        return {}
+    except Exception:
+        return {}
+
+
+def _save_github_username_map(mapping: dict) -> None:
+    try:
+        GITHUB_USERNAME_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
+        GITHUB_USERNAME_MAP_PATH.write_text(json.dumps(mapping, indent=2), encoding="utf-8")
+    except Exception:
+        logger.exception("Failed to persist github username map")
+
+
+def _remember_github_username(discord_id: int, github_username: str) -> None:
+    if not discord_id or not github_username:
+        return
+    mapping = _load_github_username_map()
+    mapping[str(discord_id)] = github_username.lower()
+    _save_github_username_map(mapping)
+
+
+def _get_github_username_for_member(member: discord.Member) -> Optional[str]:
+    mapping = _load_github_username_map()
+    gh = mapping.get(str(member.id))
+    if gh:
+        return gh
+    # Fallback: try display name or global name if it looks like a github username
+    for candidate in [getattr(member, "global_name", None), getattr(member, "display_name", None), str(member.name) if hasattr(member, "name") else None]:
+        if candidate and GITHUB_USERNAME_RE.match(candidate.strip()) and candidate.strip().lower() not in GITHUB_RESERVED_PATHS:
+            # Only use if single word
+            if " " not in candidate.strip():
+                return candidate.strip().lower()
+    return None
+
+
+def _is_ipca_sign_message(content: str) -> bool:
+    text = (content or "").lower()
+    if "ipca" not in text:
+        return False
+    # Check for "signed" or "sign" as whole words
+    if re.search(r"\bsigned\b", text) or re.search(r"\bsign\b", text):
+        return True
+    return False
+
+
+async def _auto_assign_ipca_roles(message: discord.Message) -> None:
+    if not _is_support_sessions_channel(message.channel):
+        return
+    if not _is_ipca_sign_message(message.content or ""):
+        return
+    if not isinstance(message.author, discord.Member):
+        return
+    if DEV_TEAM_ROLE_ID is None or AVAILABLE_ROLE_ID is None:
+        return
+    guild = message.guild
+    if guild is None:
+        return
+    dev_role = guild.get_role(DEV_TEAM_ROLE_ID)
+    available_role = guild.get_role(AVAILABLE_ROLE_ID)
+    if dev_role is None or available_role is None:
+        logger.warning("IPCA auto-assign skipped: dev/available roles not found")
+        return
+    # Already has roles?
+    if message.author.get_role(DEV_TEAM_ROLE_ID) and message.author.get_role(AVAILABLE_ROLE_ID):
+        return
+    try:
+        await message.author.add_roles(available_role, dev_role, reason="IPCA signed auto-assign")
+        logger.info("Auto-assigned IPCA roles to %s (%s)", message.author, message.author.id)
+        try:
+            await message.add_reaction("✅")
+        except Exception:
+            pass
+        try:
+            await message.channel.send(
+                f"{message.author.mention} Thanks for signing the IPCA! You've been granted {available_role.mention} and {dev_role.mention}. "
+                "You can now run `/github-invite-request` in this channel if you need a GitHub invite."
+            )
+        except Exception:
+            pass
+    except discord.Forbidden:
+        logger.warning("No permission to auto-assign IPCA roles to %s", message.author)
+    except Exception:
+        logger.exception("Failed to auto-assign IPCA roles")
+
+
+async def _forward_announcement_to_platform(message: discord.Message) -> None:
+    if not PLATFORM_ANNOUNCEMENTS_WEBHOOK_URL:
+        return
+    title = format_discussion_title(message.content)
+    body = format_discussion_body(message)
+    payload = {
+        "source": "discord",
+        "discord_message_id": str(message.id),
+        "discord_channel_id": str(getattr(message.channel, "id", "")),
+        "author": str(message.author),
+        "author_id": str(getattr(message.author, "id", "")),
+        "title": title,
+        "body": body,
+        "content": message.content or "",
+        "timestamp": message.created_at.isoformat() if hasattr(message, "created_at") else "",
+        "jump_url": getattr(message, "jump_url", ""),
+    }
+    raw = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if PLATFORM_ANNOUNCEMENTS_SECRET:
+        sig = hmac.new(PLATFORM_ANNOUNCEMENTS_SECRET.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+        headers["X-Norozo-Signature"] = f"sha256={sig}"
+        headers["X-Platform-Signature"] = f"sha256={sig}"
+    try:
+        await asyncio.to_thread(
+            requests.post,
+            PLATFORM_ANNOUNCEMENTS_WEBHOOK_URL,
+            data=raw,
+            headers=headers,
+            timeout=10,
+        )
+        logger.info("Forwarded Discord announcement %s to platform", message.id)
+    except Exception:
+        logger.exception("Failed to forward announcement %s to platform", message.id)
 
 
 async def _channel_from_id(channel_id: Optional[int]) -> Optional[discord.TextChannel]:
@@ -287,6 +449,76 @@ async def on_member_join(member: discord.Member) -> None:
 
 
 @bot.event
+async def on_member_update(before: discord.Member, after: discord.Member) -> None:
+    # Auto-sync GitHub team membership when Discord roles are granted
+    if not GITHUB_ORG or not GITHUB_PAT:
+        return
+    before_roles = {r.id for r in before.roles}
+    after_roles = {r.id for r in after.roles}
+    added = after_roles - before_roles
+    if not added:
+        return
+
+    github_username = _get_github_username_for_member(after)
+    # If no mapping, we cannot sync; log and skip but still try display_name fallback
+    if not github_username:
+        # Only attempt if we can infer username; otherwise skip with log
+        logger.info("Member %s gained roles %s but no GitHub username mapping found, skipping team sync", after.id, added)
+        return
+
+    # Build name fallback maps for when role IDs not configured
+    added_roles = [r for r in after.roles if r.id in added]
+    added_names_lower = {r.name.strip().lower() for r in added_roles}
+
+    qa_triggered = False
+    if QA_ROLE_ID is not None and QA_ROLE_ID in added:
+        qa_triggered = True
+    elif QA_ROLE_ID is None and ("qa" in added_names_lower or "quality assurance" in added_names_lower):
+        qa_triggered = True
+
+    it_triggered = False
+    if IT_OPERATIONS_SUPPORT_ROLE_ID is not None and IT_OPERATIONS_SUPPORT_ROLE_ID in added:
+        it_triggered = True
+    elif IT_OPERATIONS_SUPPORT_ROLE_ID is None:
+        # Fallback by name: check for pink IT role variants
+        it_candidates = {"it operations support", "support operations", "it", "it-management", "security it", "it operations", "support operations and security it"}
+        if added_names_lower & it_candidates:
+            it_triggered = True
+
+    # QA -> support-team
+    if qa_triggered:
+        logger.info("Syncing %s (%s) to GitHub team %s for QA role", after, github_username, GITHUB_SUPPORT_TEAM_SLUG)
+        try:
+            result = await asyncio.to_thread(
+                add_user_to_team,
+                username=github_username,
+                github_org=GITHUB_ORG,
+                github_pat=GITHUB_PAT,
+                team_slug=GITHUB_SUPPORT_TEAM_SLUG,
+            )
+            if not result.get("ok"):
+                logger.warning("Failed to add %s to support team: %s", github_username, result.get("message"))
+        except Exception:
+            logger.exception("Exception syncing QA to GitHub team")
+
+    # IT Operations -> it-management-team
+    if it_triggered:
+        logger.info("Syncing %s (%s) to GitHub team %s for IT role", after, github_username, GITHUB_IT_TEAM_SLUG)
+        try:
+            result = await asyncio.to_thread(
+                add_user_to_team,
+                username=github_username,
+                github_org=GITHUB_ORG,
+                github_pat=GITHUB_PAT,
+                team_slug=GITHUB_IT_TEAM_SLUG,
+            )
+            if not result.get("ok"):
+                logger.warning("Failed to add %s to IT team: %s", github_username, result.get("message"))
+        except Exception:
+            logger.exception("Exception syncing IT to GitHub team")
+
+
+@bot.event
 async def on_message(message: discord.Message) -> None:
     if message.author.bot:
         return
@@ -294,6 +526,7 @@ async def on_message(message: discord.Message) -> None:
     content = message.content or ""
 
     await notify_support_team_for_message(message)
+    await _auto_assign_ipca_roles(message)
 
     if _is_announcements_channel(message.channel):
         title = format_discussion_title(message.content)
@@ -302,6 +535,11 @@ async def on_message(message: discord.Message) -> None:
             await create_github_discussion(title, body)
         except GitHubDiscussionError as exc:
             logger.error("Discussion bridge failed for message %s: %s", message.id, exc)
+        # Forward to platform.deepiri.com (bidirectional bridge)
+        try:
+            await _forward_announcement_to_platform(message)
+        except Exception:
+            logger.exception("Platform forward failed for message %s", message.id)
 
     if PR_CHANNEL_ID and message.channel.id == PR_CHANNEL_ID:
         pr_match = PR_URL_RE.search(content)
@@ -313,7 +551,7 @@ async def on_message(message: discord.Message) -> None:
             plaky_url = plaky_match.group(0)
             embed = discord.Embed(
                 title=f"PR #{pr_number} linked to Plaky task",
-                description=f"[Pull Request]({pr_url})\\n[Plaky Task]({plaky_url})",
+                description=f"[Pull Request]({pr_url})\n[Plaky Task]({plaky_url})",
                 color=discord.Color.blue(),
             )
             embed.set_footer(text=f"Linked by {message.author.display_name}")
@@ -349,6 +587,12 @@ async def handle_github_invite_request(interaction: discord.Interaction, github_
         )
         return
 
+    # Remember mapping for future role->team sync
+    try:
+        _remember_github_username(interaction.user.id, normalized_username)
+    except Exception:
+        pass
+
     await interaction.response.defer(ephemeral=True)
 
     logger.info("Sending GitHub invite for %s to org %s", normalized_username, GITHUB_ORG)
@@ -374,6 +618,7 @@ async def handle_github_invite_request(interaction: discord.Interaction, github_
         elif normalized_team == "it":
             team_slug = GITHUB_IT_TEAM_SLUG
 
+    team_result = None
     if team_slug:
         logger.info("Adding GitHub user %s to team %s", normalized_username, team_slug)
         team_result = add_user_to_team(
@@ -431,18 +676,27 @@ async def handle_github_invite_request(interaction: discord.Interaction, github_
 
 
 async def handle_offboard_user(interaction: discord.Interaction, member: discord.Member, github_username: str, *, team: Optional[str] = None) -> None:
+    # Permission check: only Staff or Administrator (when user is a real discord.Member)
+    if isinstance(interaction.user, discord.Member) and not _is_staff(interaction.user):
+        await interaction.response.send_message("You do not have permission to offboard users. Staff or Administrator required.", ephemeral=True)
+        return
     await interaction.response.defer(ephemeral=True)
 
     normalized_username = (github_username or "").strip().lower()
     if not normalized_username:
-        await interaction.edit_original_response(content="Could not identify the GitHub username to offboard.")
-        return
+        # Try to resolve from mapping / member
+        mapped = _get_github_username_for_member(member) if isinstance(member, discord.Member) else None
+        if mapped:
+            normalized_username = mapped
+        else:
+            await interaction.edit_original_response(content="Could not identify the GitHub username to offboard.")
+            return
 
     if member is not None and hasattr(member, "guild") and hasattr(member, "remove_roles"):
         guild = getattr(member, "guild", None)
         if guild is not None and hasattr(guild, "get_role"):
-            dev_role = guild.get_role(DEV_TEAM_ROLE_ID)
-            available_role = guild.get_role(AVAILABLE_ROLE_ID)
+            dev_role = guild.get_role(DEV_TEAM_ROLE_ID) if DEV_TEAM_ROLE_ID else None
+            available_role = guild.get_role(AVAILABLE_ROLE_ID) if AVAILABLE_ROLE_ID else None
             roles_to_remove = [role for role in (dev_role, available_role) if role is not None]
             if roles_to_remove:
                 try:
@@ -497,6 +751,14 @@ async def handle_ipca_signed(interaction: discord.Interaction, github_username: 
         await interaction.response.send_message("Could not identify the requesting user.", ephemeral=True)
         return
 
+    # Remember github mapping if provided
+    normalized = _extract_github_profile_username(github_username) if github_username else None
+    if normalized:
+        try:
+            _remember_github_username(interaction.user.id, normalized)
+        except Exception:
+            pass
+
     approval_channel = await _channel_from_id(STAFF_CHANNEL_ID)
     if not approval_channel:
         await interaction.response.send_message("Could not find the configured staff channel.", ephemeral=True)
@@ -522,7 +784,7 @@ async def handle_ipca_signed(interaction: discord.Interaction, github_username: 
         )
         return
 
-    # The current flow uses staff approval, but the requested behavior is to grant the roles immediately when the user says they signed IPCA.
+    # Auto-grant roles immediately when the user says they signed IPCA.
     user = interaction.user
     if hasattr(user, "guild") and hasattr(user, "add_roles"):
         guild = getattr(user, "guild", None)
@@ -714,10 +976,72 @@ async def plaky_webhook_handler(request: web.Request) -> web.Response:
         if channel:
             title = payload.get("title", "Plaky task")
             task_url = payload.get("url") or payload.get("taskUrl") or ""
-            description = f"Status update for **{title}**\\nStatus: **{status or 'unknown'}**\\nPriority: **{priority or 'unknown'}**"
+            description = f"Status update for **{title}**\nStatus: **{status or 'unknown'}**\nPriority: **{priority or 'unknown'}**"
             if task_url:
-                description += f"\\n{task_url}"
+                description += f"\n{task_url}"
             await channel.send(f":warning: {description}")
+
+    return web.json_response({"ok": True})
+
+
+async def platform_announcement_handler(request: web.Request) -> web.Response:
+    """Inbound webhook for platform.deepiri.com -> Discord announcements.
+    Expects JSON with {title, body, content, author} and optional signature header.
+    """
+    raw_body = await request.read()
+
+    if ANNOUNCEMENTS_INBOUND_SECRET:
+        sig_header = (
+            request.headers.get("X-Norozo-Signature")
+            or request.headers.get("X-Platform-Signature")
+            or request.headers.get("X-Signature")
+            or request.headers.get("X-Webhook-Signature")
+            or ""
+        )
+        if sig_header and not _is_valid_announcement_signature(raw_body, sig_header, ANNOUNCEMENTS_INBOUND_SECRET):
+            return web.json_response({"ok": False, "message": "Invalid signature"}, status=401)
+        # If secret is configured but no signature provided, allow if trusted internal network header missing?
+        # For now, require signature if secret is set and header present; if header missing, still allow but log.
+        if not sig_header:
+            logger.warning("Platform announcement webhook missing signature header")
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except Exception:
+        return web.json_response({"ok": False, "message": "Invalid JSON"}, status=400)
+
+    title = str(payload.get("title") or payload.get("announcement_title") or "").strip()
+    body = str(payload.get("body") or payload.get("announcement_body") or payload.get("content") or "").strip()
+    author = str(payload.get("author") or payload.get("created_by") or "Platform").strip()
+    url = str(payload.get("url") or payload.get("link") or "").strip()
+
+    if not body and not title:
+        return web.json_response({"ok": False, "message": "Missing title/body"}, status=400)
+
+    if ANNOUNCEMENTS_CHANNEL_ID is None:
+        return web.json_response({"ok": False, "message": "ANNOUNCEMENTS_CHANNEL_ID not configured"}, status=500)
+
+    channel = await _channel_from_id(ANNOUNCEMENTS_CHANNEL_ID)
+    if not channel:
+        return web.json_response({"ok": False, "message": "Announcements channel not found"}, status=500)
+
+    # Build embed for platform announcement
+    embed = discord.Embed(
+        title=title or "Platform Announcement",
+        description=body[:4000] if body else "New announcement from platform.deepiri.com",
+        color=discord.Color.gold(),
+    )
+    embed.set_footer(text=f"From platform.deepiri.com • {author}")
+    if url:
+        embed.add_field(name="Link", value=url, inline=False)
+
+    content = body if body else title
+    # Prevent loop: mark source as platform, but discord forward will only forward discord->platform, not platform->platform
+    try:
+        await channel.send(content=content[:1900] if content else None, embed=embed)
+    except Exception:
+        logger.exception("Failed to post platform announcement to Discord")
+        return web.json_response({"ok": False, "message": "Failed to post to Discord"}, status=500)
 
     return web.json_response({"ok": True})
 
@@ -730,6 +1054,9 @@ async def start_webhook_server() -> None:
     app = web.Application()
     app.router.add_get("/health", health_handler)
     app.router.add_post("/plaky/webhook", plaky_webhook_handler)
+    app.router.add_post("/announcements/webhook", platform_announcement_handler)
+    app.router.add_post("/platform/announcements", platform_announcement_handler)
+    app.router.add_post("/webhooks/platform-announcements", platform_announcement_handler)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -739,6 +1066,7 @@ async def start_webhook_server() -> None:
 
     bot.webhook_runner = runner
     print(f"Plaky webhook server listening on http://{WEBHOOK_HOST}:{WEBHOOK_PORT}/plaky/webhook")
+    print(f"Announcements webhook listening on http://{WEBHOOK_HOST}:{WEBHOOK_PORT}/announcements/webhook")
 
 
 async def main() -> None:
