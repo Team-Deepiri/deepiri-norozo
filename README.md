@@ -47,10 +47,8 @@ Discord-to-GitHub mappings. When no mapping exists, the bot may infer a username
 from the member's Discord name, but this is best-effort; explicit mapping is the
 reliable option for team synchronization and offboarding.
 
-In production, set `PERSISTENT_DATA_DIR` to a persistent volume mount. This keeps
-the GitHub username map and inbound-announcement idempotency records across
-restarts and deployments. The announcement webhook also requires
-`ANNOUNCEMENTS_INBOUND_SECRET`; requests fail closed when it is unset.
+The announcement webhook requires `ANNOUNCEMENTS_INBOUND_SECRET`; requests fail
+closed when it is unset.
 
 You can also let setup.py populate IDs:
 

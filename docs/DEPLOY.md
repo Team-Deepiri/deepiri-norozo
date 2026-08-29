@@ -37,7 +37,6 @@ If auto-deploy stays **On**, every merge to `main` deploys immediately (what hap
 - **Environment variables** — `DISCORD_TOKEN`, `GITHUB_PAT`, channel/role IDs, Plaky keys, etc. (never in git)
 - **Port** — Render sets `PORT`; the bot reads `PORT` or `WEBHOOK_PORT` (default `8080`)
 - **Deploy hook** — Settings → Deploy Hook → copy URL → GitHub secret `RENDER_DEPLOY_HOOK_URL`
-- **Persistent disk** — mount a disk at `/var/data` and set `PERSISTENT_DATA_DIR=/var/data`. GitHub username mappings and announcement idempotency records are stored there. Render's default filesystem is ephemeral and is not safe for these files.
 
 Plaky webhooks: `https://<your-service>.onrender.com/plaky/webhook`
 
@@ -51,7 +50,6 @@ Configure these values on both sides with the same randomly generated secret:
 | `ANNOUNCEMENTS_INBOUND_SECRET` | Required. Incoming platform announcements return `503` when unset and `401` for missing or invalid signatures. |
 | `PLATFORM_ANNOUNCEMENTS_WEBHOOK_URL` | Platform/gateway endpoint that accepts Discord announcements. Leave unset until that endpoint is deployed. |
 | `PLATFORM_ANNOUNCEMENTS_WEBHOOK_SECRET` | Required whenever the outbound URL is set; must match the gateway's verification secret. |
-| `PERSISTENT_DATA_DIR` | Set to the Render persistent-disk mount (`/var/data`) for durable mappings and webhook deduplication. |
 
 The gateway should send a stable `Idempotency-Key`, `X-Idempotency-Key`, `event_id`,
 or `announcement_id` with retries. Norozo falls back to hashing the signed request

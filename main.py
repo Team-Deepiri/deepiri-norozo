@@ -85,13 +85,8 @@ ANNOUNCEMENTS_INBOUND_SECRET = (
     os.getenv("ANNOUNCEMENTS_INBOUND_SECRET") or PLATFORM_ANNOUNCEMENTS_SECRET or ""
 ).strip()
 
-PERSISTENT_DATA_DIR = Path(os.getenv("PERSISTENT_DATA_DIR", "."))
-GITHUB_USERNAME_MAP_PATH = Path(
-    os.getenv("GITHUB_USERNAME_MAP_FILE", str(PERSISTENT_DATA_DIR / "github_username_map.json"))
-)
-ANNOUNCEMENT_DEDUP_PATH = Path(
-    os.getenv("ANNOUNCEMENT_DEDUP_FILE", str(PERSISTENT_DATA_DIR / "announcement_webhook_events.json"))
-)
+GITHUB_USERNAME_MAP_PATH = Path(os.getenv("GITHUB_USERNAME_MAP_FILE", "github_username_map.json"))
+ANNOUNCEMENT_DEDUP_PATH = Path("announcement_webhook_events.json")
 ANNOUNCEMENT_DEDUP_TTL_SECONDS = 7 * 24 * 60 * 60
 ANNOUNCEMENT_DEDUP_MAX_EVENTS = 1000
 _announcement_dedup_lock = asyncio.Lock()
