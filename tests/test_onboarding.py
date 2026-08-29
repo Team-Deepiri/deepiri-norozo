@@ -327,7 +327,7 @@ async def test_ipca_signed_requests_roles(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_ipca_signed_assigns_dev_and_available_roles(monkeypatch):
+async def test_ipca_signed_waits_for_staff_before_assigning_roles(monkeypatch):
     role_one = FakeRole(456, "<@&456>")
     role_two = FakeRole(123, "<@&123>")
     guild = SimpleNamespace(get_role=lambda role_id: role_one if role_id == 456 else role_two if role_id == 123 else None)
@@ -353,12 +353,7 @@ async def test_ipca_signed_assigns_dev_and_available_roles(monkeypatch):
 
     await main.handle_ipca_signed(cast(discord.Interaction, interaction), "SomeUser")
 
-    member.add_roles.assert_awaited_once()
-    args, kwargs = member.add_roles.await_args
-    assert len(args) == 2
-    assert args[0].id == 456
-    assert args[1].id == 123
-    assert kwargs["reason"] == "IPCA signed"
+    member.add_roles.assert_not_awaited()
 
 
 @pytest.mark.asyncio
