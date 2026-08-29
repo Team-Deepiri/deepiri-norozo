@@ -1155,18 +1155,6 @@ async def main() -> None:
                     setup_meeting_features(new_bot)
                 except Exception:
                     pass
-                # Also need to update closure reference for _channel_from_id which uses global bot — already updated
-                # Continue loop will try with new_bot
-                # Monkey-patch main's bot variable by reassigning in global scope and restarting loop with new_bot
-                # Use exec to rebind local bot name for next iteration
-                import sys
-
-                # Replace current bot reference for next loop iteration
-                globals()["bot"] = new_bot
-                # We need to loop with new bot — hack: set bot in this scope via globals and continue, next iteration will use new global
-                # To avoid needing to change loop variable, just assign to outer scope via globals and continue
-                # Next iteration's `await bot.start` will use the new global bot because we reassign `bot` name via globals
-                # Python's closure for `bot` in this function is global, so updating globals is enough
                 continue
             raise
         except Exception:
