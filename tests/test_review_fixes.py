@@ -70,12 +70,15 @@ async def test_maybe_auto_assign_ipca_roles_assigns_when_missing(monkeypatch):
     message.author = author
     message.guild = guild
     message.add_reaction = AsyncMock()
+    message.reply = AsyncMock()
 
     assigned = await main._maybe_auto_assign_ipca_roles(message)
 
     assert assigned is True
     author.add_roles.assert_awaited_once_with(available_role, dev_role, reason="IPCA signed auto-assign")
     message.add_reaction.assert_awaited_once_with("✅")
+    message.reply.assert_awaited_once()
+    assert "We gave you access to the rest of the Discord." in message.reply.call_args.args[0]
 
 
 @pytest.mark.asyncio
