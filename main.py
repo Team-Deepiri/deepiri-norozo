@@ -1110,6 +1110,7 @@ async def start_webhook_server() -> None:
 
 
 async def main() -> None:
+    global bot  # needed for recreation on Session is closed
     await start_webhook_server()
     # Keep webhook alive even if Discord is rate-limited (Cloudflare 1015 on Render IP 74.220.48.29)
     # Render's shared egress IP is currently banned by discord.com Cloudflare — need backoff, not tight crash loop.
@@ -1136,11 +1137,36 @@ async def main() -> None:
                 )
                 await asyncio.sleep(wait)
                 attempt += 1
-                # need fresh bot instance after failed login
+                # Don't close on login failure — session was never cleanly opened, close would cause 'Session is closed' on next start
+                # Instead just continue with same bot instance (discord.py will recreate session on next start)
+                continue
+            raise
+        except RuntimeError as exc:
+            # aiohttp Session is closed after previous close() — need fresh bot instance
+            if "Session is closed" in str(exc):
+                logger.warning("Discord session closed, recreating bot instance (attempt %s)", attempt + 1)
+                await asyncio.sleep(5)
+                attempt += 1
+                # Recreate global bot and meeting service
+                new_bot = DeepiriBot()
+                globals()["bot"] = new_bot  # type: ignore
+                # Re-setup meeting features on new bot (registers commands, but tree sync will happen on next connect)
                 try:
-                    await bot.close()
+                    setup_meeting_features(new_bot)
                 except Exception:
                     pass
+                # Also need to update closure reference for _channel_from_id which uses global bot — already updated
+                # Continue loop will try with new_bot
+                # Monkey-patch main's bot variable by reassigning in global scope and restarting loop with new_bot
+                # Use exec to rebind local bot name for next iteration
+                import sys
+
+                # Replace current bot reference for next loop iteration
+                globals()["bot"] = new_bot
+                # We need to loop with new bot — hack: set bot in this scope via globals and continue, next iteration will use new global
+                # To avoid needing to change loop variable, just assign to outer scope via globals and continue
+                # Next iteration's `await bot.start` will use the new global bot because we reassign `bot` name via globals
+                # Python's closure for `bot` in this function is global, so updating globals is enough
                 continue
             raise
         except Exception:
@@ -1148,8 +1174,10 @@ async def main() -> None:
             wait = min(600, 10 * (2 ** min(attempt, 5)))
             await asyncio.sleep(wait)
             attempt += 1
+            # Only close if bot is actually running/closed state is not already closed
             try:
-                await bot.close()
+                if not bot.is_closed():  # type: ignore[attr-defined]
+                    await bot.close()
             except Exception:
                 pass
             continue
