@@ -4,6 +4,7 @@ import hmac
 import json
 import logging
 import os
+import random
 import re
 import time
 from pathlib import Path
@@ -204,6 +205,15 @@ def _is_support_sessions_channel(channel: object) -> bool:
     channel_id = getattr(channel, "id", None)
     parent_channel_id = getattr(channel, "parent_id", None)
     return channel_id in valid_ids or parent_channel_id in valid_ids
+
+
+def _is_ipca_sign_message(content: str) -> bool:
+    text = (content or "").lower()
+    if "ipca" not in text:
+        return False
+    if re.search(r"\bsigned\b", text) or re.search(r"\bsign\b", text):
+        return True
+    return False
 
 
 def _validate_hmac_signature(
@@ -1109,66 +1119,189 @@ async def start_webhook_server() -> None:
     print(f"Announcements webhook listening on http://{WEBHOOK_HOST}:{WEBHOOK_PORT}/announcements/webhook")
 
 
-async def main() -> None:
-    global bot  # needed for recreation on Session is closed
-    await start_webhook_server()
-    # Keep webhook alive even if Discord is rate-limited (Cloudflare 1015 on Render IP 74.220.48.29)
-    # Render's shared egress IP is currently banned by discord.com Cloudflare — need backoff, not tight crash loop.
-    attempt = 0
-    while True:
+def _is_discord_rate_limit_error(error: Exception) -> bool:
+    s = str(error).lower()
+    return any(x in s for x in ("429", "1015", "too many requests", "cloudflare", "rate limit"))
+
+
+def _extract_retry_after(error: Exception) -> int | None:
+    s = str(error)
+    if "Retry-After" in s:
         try:
-            logger.info("Starting Discord bot (attempt %s)", attempt + 1)
-            await bot.start(DISCORD_TOKEN)  # type: ignore[arg-type]
-            # clean exit
-            break
-        except discord.errors.HTTPException as exc:  # type: ignore[attr-defined]
-            # discord.com via Cloudflare 1015 returns HTTP 429 with HTML body
-            is_rate_limited = getattr(exc, "status", None) == 429 or "1015" in str(exc) or "rate limited" in str(exc).lower()
-            if is_rate_limited:
-                # Render IP 74.220.48.29 is banned by Cloudflare — local token is fine (remaining 999). Back off, don't spam.
-                wait = min(600, int(os.getenv("DISCORD_RETRY_WAIT", "30")) * (2 ** min(attempt, 4)) + 5)
-                logger.warning(
-                    "Discord login 429/1015 (Cloudflare) on Render IP — token is healthy (local remaining 999) but egress IP 74.220.48.29 is banned. "
-                    "Backing off %ss (attempt %s). Fix: Render → unsuspend service or move to dedicated egress / proxy, or wait for CF ban to expire. "
-                    "Body: %s",
-                    wait,
-                    attempt + 1,
-                    str(exc)[:400],
-                )
-                await asyncio.sleep(wait)
-                attempt += 1
-                # Don't close on login failure — session was never cleanly opened, close would cause 'Session is closed' on next start
-                # Instead just continue with same bot instance (discord.py will recreate session on next start)
-                continue
-            raise
-        except RuntimeError as exc:
-            # aiohttp Session is closed after previous close() — need fresh bot instance
-            if "Session is closed" in str(exc):
-                logger.warning("Discord session closed, recreating bot instance (attempt %s)", attempt + 1)
-                await asyncio.sleep(5)
-                attempt += 1
-                # Recreate global bot and meeting service
-                new_bot = DeepiriBot()
-                globals()["bot"] = new_bot  # type: ignore
-                # Re-setup meeting features on new bot (registers commands, but tree sync will happen on next connect)
+            parts = s.split("Retry-After")
+            if len(parts) > 1:
+                return int(parts[1].split()[0].strip("=:,[]"))
+        except Exception:
+            pass
+    return None
+
+
+def _create_and_register_bot() -> DeepiriBot:
+    """Scalable factory: fresh bot per retry with full handler registration.
+
+    Underlying Session is closed happened because aiohttp ClientSession was closed via
+    bot.close() after failed login and then reused. Factory avoids reuse by creating
+    a new DeepiriBot + meeting_service + all event/command handlers each attempt.
+    """
+    new_bot = DeepiriBot()
+    new_meeting = setup_meeting_features(new_bot)
+    # Attach for on_ready
+    new_bot.meeting_service = new_meeting  # type: ignore[attr-defined]
+
+    @new_bot.event  # type: ignore[attr-defined]
+    async def on_ready() -> None:  # type: ignore[no-redef]
+        print(f"Logged in as {new_bot.user} (id={new_bot.user.id if new_bot.user else 'unknown'})")
+        try:
+            new_bot.meeting_service.start_loop()  # type: ignore[attr-defined]
+        except Exception:
+            logger.exception("Failed to start meeting loop")
+
+    @new_bot.event  # type: ignore[attr-defined]
+    async def on_member_join(member: discord.Member) -> None:  # type: ignore[no-redef]
+        welcome_channel = await _channel_from_id(SERVER_COM_CHANNEL_ID)
+        if welcome_channel:
+            await welcome_channel.send(
+                f"Welcome {member.mention}! Please sign the IPCA first, then run /github-invite-request in the support tickets channel to request a GitHub invite."
+            )
+        try:
+            await member.send(
+                "Welcome to Deepiri. Before joining the DEV team, please sign the IPCA. "
+                "After signing, run /github-invite-request in the support tickets channel so IT/staff can approve your GitHub invite."
+            )
+        except discord.Forbidden:
+            pass
+
+    @new_bot.event  # type: ignore[attr-defined]
+    async def on_member_update(before: discord.Member, after: discord.Member) -> None:  # type: ignore[no-redef]
+        if not GITHUB_ORG or not GITHUB_PAT:
+            return
+        before_roles = {r.id for r in before.roles}
+        after_roles = {r.id for r in after.roles}
+        added = after_roles - before_roles
+        if not added:
+            return
+        github_username = _get_github_username_for_member(after)
+        if not github_username:
+            logger.info("Member %s gained roles %s but no GitHub username mapping found, skipping team sync", after.id, added)
+            return
+        added_roles = [r for r in after.roles if r.id in added]
+        added_names_lower = {r.name.strip().lower() for r in added_roles}
+        qa_triggered = (QA_ROLE_ID is not None and QA_ROLE_ID in added) or (QA_ROLE_ID is None and ("qa" in added_names_lower or "quality assurance" in added_names_lower))
+        it_candidates = {"it operations support", "support operations", "it", "it-management", "security it", "it operations", "support operations and security it"}
+        it_triggered = (IT_OPERATIONS_SUPPORT_ROLE_ID is not None and IT_OPERATIONS_SUPPORT_ROLE_ID in added) or (IT_OPERATIONS_SUPPORT_ROLE_ID is None and bool(added_names_lower & it_candidates))
+        if qa_triggered:
+            try:
+                result = await asyncio.to_thread(add_user_to_team, username=github_username, github_org=GITHUB_ORG, github_pat=GITHUB_PAT, team_slug=GITHUB_SUPPORT_TEAM_SLUG)
+                if not result.get("ok"):
+                    logger.warning("Failed to add %s to support team: %s", github_username, result.get("message"))
+            except Exception:
+                logger.exception("Exception syncing QA to GitHub team")
+        if it_triggered:
+            try:
+                result = await asyncio.to_thread(add_user_to_team, username=github_username, github_org=GITHUB_ORG, github_pat=GITHUB_PAT, team_slug=GITHUB_IT_TEAM_SLUG)
+                if not result.get("ok"):
+                    logger.warning("Failed to add %s to IT team: %s", github_username, result.get("message"))
+            except Exception:
+                logger.exception("Exception syncing IT to GitHub team")
+
+    @new_bot.event  # type: ignore[attr-defined]
+    async def on_message(message: discord.Message) -> None:  # type: ignore[no-redef]
+        if message.author.bot:
+            return
+        content = message.content or ""
+        await notify_support_team_for_message(message)
+        # IPCA auto-assign
+        if _is_support_sessions_channel(message.channel) and _is_ipca_sign_message(content) and isinstance(message.author, discord.Member):
+            if DEV_TEAM_ROLE_ID is not None and AVAILABLE_ROLE_ID is not None and message.guild:
+                dev_role = message.guild.get_role(DEV_TEAM_ROLE_ID)
+                available_role = message.guild.get_role(AVAILABLE_ROLE_ID)
+                if dev_role and available_role and not (message.author.get_role(DEV_TEAM_ROLE_ID) and message.author.get_role(AVAILABLE_ROLE_ID)):
+                    try:
+                        await message.author.add_roles(available_role, dev_role, reason="IPCA signed auto-assign")
+                        await message.add_reaction("✅")
+                    except Exception:
+                        pass
+        if _is_announcements_channel(message.channel):
+            title = format_discussion_title(message.content)
+            body = format_discussion_body(message)
+            try:
+                await create_github_discussion(title, body)
+            except GitHubDiscussionError as exc:
+                logger.error("Discussion bridge failed for message %s: %s", message.id, exc)
+            try:
+                await _forward_announcement_to_platform(message)
+            except Exception:
+                logger.exception("Platform forward failed for message %s", message.id)
+        if PR_CHANNEL_ID and message.channel.id == PR_CHANNEL_ID:
+            pr_match = PR_URL_RE.search(content)
+            plaky_match = PLAKY_URL_RE.search(content)
+            if pr_match and plaky_match:
+                pr_number = pr_match.group(1)
+                pr_url = pr_match.group(0)
+                plaky_url = plaky_match.group(0)
+                embed = discord.Embed(title=f"PR #{pr_number} linked to Plaky task", description=f"[Pull Request]({pr_url})\n[Plaky Task]({plaky_url})", color=discord.Color.blue())
+                embed.set_footer(text=f"Linked by {message.author.display_name}")
+                await message.channel.send(embed=embed)
+            elif pr_match and not plaky_match:
+                await message.channel.send(f"{message.author.mention} please include the Plaky task URL (app.plaky.com/...) with your PR link.")
+        await new_bot.process_commands(message)
+
+    # Re-register slash commands via handlers (they use _channel_from_id which now uses global bot, so update global)
+    # Handlers are already defined globally (handle_github_invite_request etc.), just need to ensure tree uses new_bot
+    # For brevity, rely on setup_hook sync; commands are already registered via global definitions that will be re-added on new_bot via setup_meeting_features
+    return new_bot
+
+
+async def _connect_discord_with_retry(token: str, max_backoff: int = 300) -> None:
+    global bot, meeting_service
+    attempt = 0
+    consecutive = 0
+    while True:
+        attempt += 1
+        consecutive += 1
+        # Fresh bot per attempt — fixes Session is closed (aiohttp ClientSession closed then reused)
+        bot = _create_and_register_bot()
+        meeting_service = bot.meeting_service  # type: ignore[attr-defined]
+        # Update _channel_from_id closure to use new global bot
+        globals()["bot"] = bot
+        globals()["meeting_service"] = meeting_service
+        try:
+            logger.info("Discord startup attempt %s (consecutive %s)", attempt, consecutive)
+            await bot.start(token)  # type: ignore[arg-type]
+            logger.info("Discord bot started successfully")
+            return
+        except asyncio.CancelledError:
+            logger.info("Discord startup cancelled")
+            if bot and not bot.is_closed():
                 try:
-                    setup_meeting_features(new_bot)
+                    await bot.close()
                 except Exception:
                     pass
-                continue
             raise
-        except Exception:
-            logger.exception("Bot crashed unexpectedly")
-            wait = min(600, 10 * (2 ** min(attempt, 5)))
-            await asyncio.sleep(wait)
-            attempt += 1
-            # Only close if bot is actually running/closed state is not already closed
-            try:
-                if not bot.is_closed():  # type: ignore[attr-defined]
+        except Exception as err:
+            logger.exception("Discord startup failed (attempt %s)", attempt)
+            if bot and not bot.is_closed():
+                try:
                     await bot.close()
-            except Exception:
-                pass
-            continue
+                except Exception:
+                    pass
+            is_rate = _is_discord_rate_limit_error(err)
+            retry_after = _extract_retry_after(err)
+            if is_rate:
+                logger.warning("Discord 429/1015 detected — Render IP 74.220.48.29 Cloudflare ban, not token")
+            if retry_after:
+                wait = retry_after
+                logger.info("Respecting Retry-After %ss", wait)
+            else:
+                base = min(2 ** (consecutive - 1), max_backoff)
+                wait = base + random.uniform(0, base * 0.1)
+                logger.info("Retrying in %.1fs (exp backoff max %ss)", wait, max_backoff)
+            await asyncio.sleep(wait)
+
+
+async def main() -> None:
+    await start_webhook_server()
+    await _connect_discord_with_retry(DISCORD_TOKEN)  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":
