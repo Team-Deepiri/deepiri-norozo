@@ -823,6 +823,45 @@ async def handle_offboard_user(interaction: discord.Interaction, member: discord
     await interaction.edit_original_response(content=f"Offboarding completed for {getattr(member, 'mention', normalized_username)}.")
 
 
+async def handle_discord_kick(interaction: discord.Interaction, member: discord.Member, reason: str | None = None) -> None:
+    if not isinstance(interaction.user, discord.Member) or not _is_staff(interaction.user):
+        await interaction.response.send_message("You do not have permission to kick members. Staff or Administrator required.", ephemeral=True)
+        return
+
+    if not isinstance(member, discord.Member):
+        await interaction.response.send_message("Could not resolve that member.", ephemeral=True)
+        return
+
+    if member.id == interaction.user.id:
+        await interaction.response.send_message("You cannot kick yourself.", ephemeral=True)
+        return
+
+    if member.guild_permissions.administrator or (STAFF_ROLE_ID is not None and member.get_role(STAFF_ROLE_ID) is not None):
+        await interaction.response.send_message("Cannot kick an Admin/staff member via this command.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    kick_reason = (reason or f"Kicked by {interaction.user} via /discord-kick").strip()[:512]
+    try:
+        await member.kick(reason=kick_reason)
+    except discord.Forbidden:
+        await interaction.edit_original_response(content="I don't have permission to kick that member (check my role position).")
+        return
+    except Exception:
+        logger.exception("Failed to kick member %s", member.id)
+        await interaction.edit_original_response(content=f"Failed to kick {member.mention}.")
+        return
+
+    await interaction.edit_original_response(content=f"Kicked {member.mention} from the server.")
+    if STAFF_CHANNEL_ID:
+        log_channel = await _channel_from_id(STAFF_CHANNEL_ID)
+        if log_channel:
+            try:
+                await log_channel.send(f"{member} ({member.id}) was kicked by {interaction.user.mention}. Reason: {kick_reason}")
+            except Exception:
+                pass
+
+
 async def handle_ipca_signed(interaction: discord.Interaction, github_username: str) -> None:
     if not isinstance(interaction.user, discord.Member) or not _can_dispatch_ipca_signed(interaction.user):
         await interaction.response.send_message(
@@ -923,6 +962,11 @@ def _register_slash_commands(target_bot: DeepiriBot) -> None:
     ) -> None:
         team_value = team.value if hasattr(team, "value") else team
         await handle_offboard_user(interaction, member, github_username, team=team_value)
+
+    @target_bot.tree.command(name="discord-kick", description="Kick a member from the Discord server (staff only)")
+    @app_commands.describe(member="The Discord member to kick", reason="Optional reason")
+    async def discord_kick(interaction: discord.Interaction, member: discord.Member, reason: str | None = None) -> None:
+        await handle_discord_kick(interaction, member, reason)
 
 
     @target_bot.tree.command(name="plaky-request", description="Create a Plaky task")
