@@ -300,8 +300,13 @@ async def test_support_session_thread_message_uses_parent_channel(monkeypatch):
 @pytest.mark.asyncio
 async def test_ipca_signed_requests_roles(monkeypatch):
     channel = SimpleNamespace(send=AsyncMock())
+    staff_user = Mock(spec=discord.Member)
+    staff_user.id = 10
+    staff_user.mention = "@test-user"
+    staff_user.guild_permissions = SimpleNamespace(administrator=True)
+    staff_user.get_role = Mock(return_value=None)
     interaction = SimpleNamespace(
-        user=SimpleNamespace(id=10, mention="@test-user"),
+        user=staff_user,
         channel=SimpleNamespace(id=888),
         response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
         edit_original_response=AsyncMock(),
@@ -324,6 +329,61 @@ async def test_ipca_signed_requests_roles(monkeypatch):
     interaction.edit_original_response.assert_awaited_once_with(
         content="Your approval request was sent to staff for review.",
     )
+
+
+@pytest.mark.asyncio
+async def test_ipca_signed_rejects_non_admin_non_security_member(monkeypatch):
+    regular_user = Mock(spec=discord.Member)
+    regular_user.id = 11
+    regular_user.mention = "@regular-user"
+    regular_user.guild_permissions = SimpleNamespace(administrator=False)
+    regular_user.get_role = Mock(return_value=None)
+    interaction = SimpleNamespace(
+        user=regular_user,
+        response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
+    )
+
+    monkeypatch.setattr(main, "STAFF_ROLE_ID", 500)
+    monkeypatch.setattr(main, "IT_OPERATIONS_SUPPORT_ROLE_ID", 600)
+    channel_from_id = AsyncMock()
+    monkeypatch.setattr(main, "_channel_from_id", channel_from_id)
+
+    await main.handle_ipca_signed(cast(discord.Interaction, interaction), "SomeUser")
+
+    interaction.response.send_message.assert_awaited_once()
+    assert "Only Admins" in interaction.response.send_message.await_args.args[0]
+    interaction.response.defer.assert_not_awaited()
+    channel_from_id.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ipca_signed_allows_security_operations_role(monkeypatch):
+    it_role = FakeRole(600, "<@&600>")
+    security_user = Mock(spec=discord.Member)
+    security_user.id = 12
+    security_user.mention = "@security-user"
+    security_user.guild_permissions = SimpleNamespace(administrator=False)
+    security_user.get_role = Mock(side_effect=lambda rid: it_role if rid == 600 else None)
+    channel = SimpleNamespace(send=AsyncMock())
+    interaction = SimpleNamespace(
+        user=security_user,
+        response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+        edit_original_response=AsyncMock(),
+    )
+
+    monkeypatch.setattr(main, "STAFF_ROLE_ID", 500)
+    monkeypatch.setattr(main, "IT_OPERATIONS_SUPPORT_ROLE_ID", 600)
+    monkeypatch.setattr(main, "STAFF_CHANNEL_ID", 999)
+    monkeypatch.setattr(main, "DEV_TEAM_ROLE_ID", 456)
+    monkeypatch.setattr(main, "AVAILABLE_ROLE_ID", 123)
+    monkeypatch.setattr(main, "ApprovalView", FakeApprovalView)
+    monkeypatch.setattr(main, "_channel_from_id", AsyncMock(return_value=channel))
+
+    await main.handle_ipca_signed(cast(discord.Interaction, interaction), "SomeUser")
+
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    channel.send.assert_awaited_once()
 
 
 @pytest.mark.asyncio
