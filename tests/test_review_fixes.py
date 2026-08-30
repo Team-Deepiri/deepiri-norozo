@@ -200,6 +200,7 @@ def test_create_and_register_bot_registers_all_global_slash_commands(monkeypatch
         "github-invite-request",
         "ipca-signed",
         "offboard-user",
+        "discord-kick",
         "plaky-request",
         "plaky-status",
         "poll",

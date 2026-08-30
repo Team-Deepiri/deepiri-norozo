@@ -485,3 +485,129 @@ async def test_offboard_user_command_uses_handler(monkeypatch):
     )
 
     assert called["args"] == (interaction, member, "SomeUser", "support")
+
+
+@pytest.mark.asyncio
+async def test_discord_kick_requires_staff(monkeypatch):
+    regular_user = Mock(spec=discord.Member)
+    regular_user.id = 1
+    regular_user.guild_permissions = SimpleNamespace(administrator=False)
+    regular_user.get_role = Mock(return_value=None)
+    target = Mock(spec=discord.Member)
+    target.id = 2
+    target.kick = AsyncMock()
+
+    monkeypatch.setattr(main, "STAFF_ROLE_ID", 500)
+    interaction = SimpleNamespace(
+        user=regular_user,
+        response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
+    )
+
+    await main.handle_discord_kick(cast(discord.Interaction, interaction), target, None)
+
+    interaction.response.send_message.assert_awaited_once()
+    assert "permission" in interaction.response.send_message.await_args.args[0].lower()
+    target.kick.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_discord_kick_refuses_to_kick_staff(monkeypatch):
+    admin_user = Mock(spec=discord.Member)
+    admin_user.id = 1
+    admin_user.guild_permissions = SimpleNamespace(administrator=True)
+    admin_user.get_role = Mock(return_value=None)
+
+    staff_role = FakeRole(500, "<@&500>")
+    target = Mock(spec=discord.Member)
+    target.id = 2
+    target.guild_permissions = SimpleNamespace(administrator=False)
+    target.get_role = Mock(side_effect=lambda rid: staff_role if rid == 500 else None)
+    target.kick = AsyncMock()
+
+    monkeypatch.setattr(main, "STAFF_ROLE_ID", 500)
+    interaction = SimpleNamespace(
+        user=admin_user,
+        response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
+    )
+
+    await main.handle_discord_kick(cast(discord.Interaction, interaction), target, None)
+
+    interaction.response.send_message.assert_awaited_once()
+    assert "Admin/staff" in interaction.response.send_message.await_args.args[0]
+    target.kick.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_discord_kick_refuses_self_kick(monkeypatch):
+    admin_user = Mock(spec=discord.Member)
+    admin_user.id = 1
+    admin_user.guild_permissions = SimpleNamespace(administrator=True)
+    admin_user.get_role = Mock(return_value=None)
+
+    monkeypatch.setattr(main, "STAFF_ROLE_ID", 500)
+    interaction = SimpleNamespace(
+        user=admin_user,
+        response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
+    )
+
+    await main.handle_discord_kick(cast(discord.Interaction, interaction), admin_user, None)
+
+    interaction.response.send_message.assert_awaited_once()
+    assert "yourself" in interaction.response.send_message.await_args.args[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_discord_kick_succeeds_for_staff(monkeypatch):
+    admin_user = Mock(spec=discord.Member)
+    admin_user.id = 1
+    admin_user.mention = "@admin"
+    admin_user.guild_permissions = SimpleNamespace(administrator=True)
+    admin_user.get_role = Mock(return_value=None)
+    admin_user.__str__ = Mock(return_value="admin#0001")
+
+    target = Mock(spec=discord.Member)
+    target.id = 2
+    target.mention = "@target"
+    target.guild_permissions = SimpleNamespace(administrator=False)
+    target.get_role = Mock(return_value=None)
+    target.kick = AsyncMock()
+    target.__str__ = Mock(return_value="target#0002")
+
+    monkeypatch.setattr(main, "STAFF_ROLE_ID", 500)
+    monkeypatch.setattr(main, "STAFF_CHANNEL_ID", None)
+    interaction = SimpleNamespace(
+        user=admin_user,
+        response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
+    )
+
+    await main.handle_discord_kick(cast(discord.Interaction, interaction), target, "spamming")
+
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    target.kick.assert_awaited_once_with(reason="spamming")
+    interaction.edit_original_response.assert_awaited_once_with(content="Kicked @target from the server.")
+
+
+@pytest.mark.asyncio
+async def test_discord_kick_command_uses_handler(monkeypatch):
+    called = {}
+
+    async def fake_handler(interaction, member, reason=None):
+        called["args"] = (interaction, member, reason)
+
+    monkeypatch.setattr(main, "handle_discord_kick", fake_handler)
+
+    interaction = SimpleNamespace(
+        response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+        user=SimpleNamespace(id=1, mention="@staff"),
+    )
+    member = SimpleNamespace(id=10, mention="@test-user")
+    fresh_bot = main.DeepiriBot()
+    main._register_slash_commands(fresh_bot)
+    discord_kick = fresh_bot.tree.get_command("discord-kick")
+    await discord_kick.callback(cast(discord.Interaction, interaction), member, "rule violation")
+
+    assert called["args"] == (interaction, member, "rule violation")
