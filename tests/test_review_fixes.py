@@ -64,7 +64,7 @@ async def test_maybe_auto_assign_ipca_roles_assigns_when_missing(monkeypatch):
     author.get_role = Mock(return_value=None)
     author.add_roles = AsyncMock()
 
-    thread = SimpleNamespace(send=AsyncMock())
+    thread = SimpleNamespace(send=AsyncMock(), edit=AsyncMock(), id=555)
     channel = SimpleNamespace(id=100, parent_id=None, send=AsyncMock())
 
     message = Mock(spec=discord.Message)
@@ -85,6 +85,8 @@ async def test_maybe_auto_assign_ipca_roles_assigns_when_missing(monkeypatch):
     thread.send.assert_awaited_once()
     assert "We gave you access to the rest of the Discord." in thread.send.call_args.args[0]
     channel.send.assert_not_awaited()
+    # Ticket resolved -> the companion thread gets archived (closed).
+    thread.edit.assert_awaited_once_with(archived=True, locked=False, reason="IPCA signed — ticket resolved")
 
 
 @pytest.mark.asyncio
@@ -117,6 +119,45 @@ async def test_maybe_auto_assign_ipca_roles_posts_to_channel_when_no_companion_t
     assert assigned is True
     channel.send.assert_awaited_once()
     assert "We gave you access to the rest of the Discord." in channel.send.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_maybe_auto_assign_ipca_roles_archives_current_thread_when_message_posted_inside_one(monkeypatch):
+    """A follow-up message sent directly inside an already-open ticket thread:
+    message.thread is None (only set on the starter message), but
+    message.channel IS the thread — that thread should still get archived."""
+    monkeypatch.setattr(main, "DEV_TEAM_ROLE_ID", 10)
+    monkeypatch.setattr(main, "AVAILABLE_ROLE_ID", 20)
+    monkeypatch.setattr(main, "SUPPORT_SESSIONS_CHANNEL_ID", 100)
+    monkeypatch.setattr(main, "GITHUB_PROFILES_CHANNEL_ID", None)
+
+    dev_role = SimpleNamespace(id=10)
+    available_role = SimpleNamespace(id=20)
+    guild = SimpleNamespace(get_role=lambda rid: {10: dev_role, 20: available_role}.get(rid))
+
+    author = Mock(spec=discord.Member)
+    author.get_role = Mock(return_value=None)
+    author.add_roles = AsyncMock()
+
+    thread_channel = Mock(spec=discord.Thread)
+    thread_channel.id = 100
+    thread_channel.parent_id = 999
+    thread_channel.send = AsyncMock()
+    thread_channel.edit = AsyncMock()
+
+    message = Mock(spec=discord.Message)
+    message.channel = thread_channel
+    message.content = "I signed the IPCA"
+    message.author = author
+    message.guild = guild
+    message.add_reaction = AsyncMock()
+    message.thread = None
+
+    assigned = await main._maybe_auto_assign_ipca_roles(message)
+
+    assert assigned is True
+    thread_channel.send.assert_awaited_once()
+    thread_channel.edit.assert_awaited_once_with(archived=True, locked=False, reason="IPCA signed — ticket resolved")
 
 
 @pytest.mark.asyncio

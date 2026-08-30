@@ -274,6 +274,14 @@ async def _maybe_auto_assign_ipca_roles(message: discord.Message) -> bool:
         await target_channel.send(f"{message.author.mention} We gave you access to the rest of the Discord.")
     except Exception:
         logger.exception("Failed to post IPCA access confirmation reply for %s", message.author.id)
+
+    ticket_thread = message.thread if message.thread else (message.channel if isinstance(message.channel, discord.Thread) else None)
+    if ticket_thread is not None:
+        try:
+            await ticket_thread.edit(archived=True, locked=False, reason="IPCA signed — ticket resolved")
+        except Exception:
+            logger.exception("Failed to archive IPCA ticket thread %s", getattr(ticket_thread, "id", "?"))
+
     return True
 
 
@@ -963,7 +971,6 @@ def _register_slash_commands(target_bot: DeepiriBot) -> None:
 
         await qa_channel.send("\n".join(lines))
         await interaction.response.send_message("Posted status to QA channel.", ephemeral=True)
-
 
     @target_bot.tree.command(name="poll", description="Create a poll (staff only)")
     @app_commands.describe(question="The poll question", options="Comma-separated options (e.g., Yes, No, Maybe)")
