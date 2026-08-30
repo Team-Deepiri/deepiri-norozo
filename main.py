@@ -450,6 +450,16 @@ def _is_staff(member: discord.Member) -> bool:
     return member.get_role(STAFF_ROLE_ID) is not None or member.guild_permissions.administrator
 
 
+def _can_dispatch_ipca_signed(member: discord.Member) -> bool:
+    """/ipca-signed grants DEV Team + Available roles on approval — restrict who can
+    even open that approval request to admins and Security & Operations Support, so a
+    member can't just self-serve the escalation path (the normal path is the automatic
+    IPCA-message detection in support tickets, not this command)."""
+    if _is_staff(member):
+        return True
+    return IT_OPERATIONS_SUPPORT_ROLE_ID is not None and member.get_role(IT_OPERATIONS_SUPPORT_ROLE_ID) is not None
+
+
 def _poll_option_emoji(index: int) -> str:
     emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣"]
     return emojis[index] if index < len(emojis) else str(index + 1)
@@ -814,6 +824,14 @@ async def handle_offboard_user(interaction: discord.Interaction, member: discord
 
 
 async def handle_ipca_signed(interaction: discord.Interaction, github_username: str) -> None:
+    if not isinstance(interaction.user, discord.Member) or not _can_dispatch_ipca_signed(interaction.user):
+        await interaction.response.send_message(
+            "Only Admins or Security & Operations Support can run this command. "
+            "Roles are normally granted automatically when you sign the IPCA in your support ticket.",
+            ephemeral=True,
+        )
+        return
+
     if STAFF_CHANNEL_ID is None:
         await interaction.response.send_message("STAFF_CHANNEL_ID is not configured.", ephemeral=True)
         return
