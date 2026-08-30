@@ -23,7 +23,8 @@ from github import add_user_to_team, invite_user, remove_user_from_org, remove_u
 from github_discussion import GitHubDiscussionError, create_github_discussion
 from meetings import setup_meeting_features
 from onboarding import ApprovalView
-from plaky import create_task, get_tasks
+from plaky import check_membership, create_task, get_tasks
+from plaky_bridge import bridge_status, invite_via_bridge, kick_via_bridge
 
 
 load_dotenv()
@@ -870,6 +871,74 @@ async def handle_ipca_signed(interaction: discord.Interaction, github_username: 
     await interaction.edit_original_response(content="Your approval request was sent to staff for review.")
 
 
+async def handle_plaky_invite(interaction: discord.Interaction, email: str, role: str | None = None) -> None:
+    if isinstance(interaction.user, discord.Member) and not _is_staff(interaction.user):
+        await interaction.response.send_message("Staff or Administrator required to invite to Plaky.", ephemeral=True)
+        return
+    email = (email or "").strip()
+    if not email or "@" not in email:
+        await interaction.response.send_message("Provide a valid email.", ephemeral=True)
+        return
+    role_val = (role or "MEMBER").upper()
+    if role_val not in {"MEMBER", "VIEWER", "ADMIN", "OWNER"}:
+        role_val = "MEMBER"
+    await interaction.response.defer(ephemeral=True)
+    try:
+        exist = await asyncio.to_thread(check_membership, PLAKY_API_KEY or "", email)
+        if exist.get("ok"):
+            await interaction.edit_original_response(content=f"{email} is already a member ({exist['user'].get('type')}/{exist['user'].get('status')}).")
+            return
+    except Exception:
+        pass
+    result = await asyncio.to_thread(invite_via_bridge, email, role_val)
+    if result.get("ok"):
+        msg = f"✅ Plaky invite sent to {email} (via {'headless browser' if result.get('via')=='browser' else 'bridge'}, role={role_val}, status={result.get('status','pending')})"
+        await interaction.edit_original_response(content=msg)
+        if STAFF_CHANNEL_ID:
+            ch = await _channel_from_id(STAFF_CHANNEL_ID)
+            if ch:
+                try:
+                    await ch.send(f"Plaky invite: {email} invited by {interaction.user.mention} via norozo (role={role_val})")
+                except Exception:
+                    pass
+        return
+    err = result.get("message", "Failed")
+    if "PLAKY_BRIDGE_URL" in err or "headless" in err.lower():
+        await interaction.edit_original_response(content=f"❌ Bridge not ready: {err}\n\nFix: set PLAKY_EMAIL/PLAKY_PASSWORD in deepiri-platform (plaky-bridge) and PLAKY_BRIDGE_URL in norozo.")
+        return
+    await interaction.edit_original_response(content=f"❌ Invite failed for {email}: {err}")
+
+
+async def handle_plaky_kick(interaction: discord.Interaction, email: str) -> None:
+    if isinstance(interaction.user, discord.Member) and not _is_staff(interaction.user):
+        await interaction.response.send_message("Staff or Administrator required to kick from Plaky.", ephemeral=True)
+        return
+    email = (email or "").strip()
+    if not email or "@" not in email:
+        await interaction.response.send_message("Provide a valid email.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        exist = await asyncio.to_thread(check_membership, PLAKY_API_KEY or "", email)
+        if not exist.get("ok"):
+            await interaction.edit_original_response(content=f"{email} not found in workspace; nothing to remove.")
+            return
+    except Exception:
+        pass
+    result = await asyncio.to_thread(kick_via_bridge, email)
+    if result.get("ok"):
+        await interaction.edit_original_response(content=f"✅ Removed {email} from Plaky (via headless browser)")
+        if STAFF_CHANNEL_ID:
+            ch = await _channel_from_id(STAFF_CHANNEL_ID)
+            if ch:
+                try:
+                    await ch.send(f"Plaky kick: {email} removed by {interaction.user.mention} via norozo")
+                except Exception:
+                    pass
+        return
+    await interaction.edit_original_response(content=f"❌ Kick failed for {email}: {result.get('message','Failed')}")
+
+
 def _register_slash_commands(target_bot: DeepiriBot) -> None:
     @target_bot.tree.command(name="github-invite-request", description="Request a GitHub invite after signing ICPA")
     @app_commands.describe(github_username="Your GitHub profile username", team="Optional team to add the user to (support or it)")
@@ -971,6 +1040,27 @@ def _register_slash_commands(target_bot: DeepiriBot) -> None:
 
         await qa_channel.send("\n".join(lines))
         await interaction.response.send_message("Posted status to QA channel.", ephemeral=True)
+
+    @target_bot.tree.command(name="plaky-invite", description="Invite a user to Plaky (staff only, headless browser)")
+    @app_commands.describe(email="Email to invite", role="Role: MEMBER/VIEWER (default MEMBER)")
+    @app_commands.choices(role=[app_commands.Choice(name="member", value="member"), app_commands.Choice(name="viewer", value="viewer")])
+    async def plaky_invite(interaction: discord.Interaction, email: str, role: app_commands.Choice[str] | None = None) -> None:
+        await handle_plaky_invite(interaction, email, role.value if role else None)
+
+    @target_bot.tree.command(name="plaky-kick", description="Remove a user from Plaky (staff only, headless browser)")
+    @app_commands.describe(email="Email to remove")
+    async def plaky_kick(interaction: discord.Interaction, email: str) -> None:
+        await handle_plaky_kick(interaction, email)
+
+    @target_bot.tree.command(name="plaky-bridge-status", description="Check Plaky bridge + real API status")
+    async def plaky_bridge_status(interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        api_check = await asyncio.to_thread(check_membership, PLAKY_API_KEY or "", "check@deepiri.invalid")
+        api_ok = api_check.get("status") != 400
+        bridge = await asyncio.to_thread(bridge_status)
+        lines = [f"Real API (X-API-Key): {'OK' if api_ok else 'NOT OK — check PLAKY_API_KEY'}", f"Bridge ({'configured' if bridge.get('configured') else 'NOT configured'}): {bridge.get('message') or bridge.get('status') or bridge}"]
+        await interaction.edit_original_response(content="\n".join(lines))
+
 
     @target_bot.tree.command(name="poll", description="Create a poll (staff only)")
     @app_commands.describe(question="The poll question", options="Comma-separated options (e.g., Yes, No, Maybe)")
