@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+import discord
 import pytest
 
 import main
@@ -33,6 +34,180 @@ def test_webhook_signature_validators_share_supported_formats():
 
 def test_announcement_signature_fails_closed_without_secret():
     assert not main._is_valid_announcement_signature(b"body", "invalid", "")
+
+
+def test_discord_proxy_kwargs_empty_when_unset(monkeypatch):
+    monkeypatch.setattr(main, "DISCORD_PROXY_URL", None)
+    assert main._discord_proxy_kwargs() == {}
+
+
+def test_discord_proxy_kwargs_parses_url_and_auth(monkeypatch):
+    monkeypatch.setattr(main, "DISCORD_PROXY_URL", "http://user:pass@1.2.3.4:8888")
+    kwargs = main._discord_proxy_kwargs()
+    assert kwargs["proxy"] == "http://1.2.3.4:8888"
+    assert kwargs["proxy_auth"].login == "user"
+    assert kwargs["proxy_auth"].password == "pass"
+
+
+@pytest.mark.asyncio
+async def test_maybe_auto_assign_ipca_roles_assigns_when_missing(monkeypatch):
+    monkeypatch.setattr(main, "DEV_TEAM_ROLE_ID", 10)
+    monkeypatch.setattr(main, "AVAILABLE_ROLE_ID", 20)
+    monkeypatch.setattr(main, "SUPPORT_SESSIONS_CHANNEL_ID", 100)
+    monkeypatch.setattr(main, "GITHUB_PROFILES_CHANNEL_ID", None)
+
+    dev_role = SimpleNamespace(id=10)
+    available_role = SimpleNamespace(id=20)
+    guild = SimpleNamespace(get_role=lambda rid: {10: dev_role, 20: available_role}.get(rid))
+
+    author = Mock(spec=discord.Member)
+    author.get_role = Mock(return_value=None)
+    author.add_roles = AsyncMock()
+
+    thread = SimpleNamespace(send=AsyncMock(), edit=AsyncMock(), id=555)
+    channel = SimpleNamespace(id=100, parent_id=None, send=AsyncMock())
+
+    message = Mock(spec=discord.Message)
+    message.channel = channel
+    message.content = "I signed the IPCA"
+    message.author = author
+    message.guild = guild
+    message.add_reaction = AsyncMock()
+    message.thread = thread
+
+    assigned = await main._maybe_auto_assign_ipca_roles(message)
+
+    assert assigned is True
+    author.add_roles.assert_awaited_once_with(available_role, dev_role, reason="IPCA signed auto-assign")
+    message.add_reaction.assert_awaited_once_with("✅")
+    # support-tickets auto-thread: confirmation must land in the companion
+    # thread (message.thread), not back in the parent channel via reply().
+    thread.send.assert_awaited_once()
+    assert "We gave you access to the rest of the Discord." in thread.send.call_args.args[0]
+    channel.send.assert_not_awaited()
+    # Ticket resolved -> the companion thread gets archived (closed).
+    thread.edit.assert_awaited_once_with(archived=True, locked=False, reason="IPCA signed — ticket resolved")
+
+
+@pytest.mark.asyncio
+async def test_maybe_auto_assign_ipca_roles_posts_to_channel_when_no_companion_thread(monkeypatch):
+    monkeypatch.setattr(main, "DEV_TEAM_ROLE_ID", 10)
+    monkeypatch.setattr(main, "AVAILABLE_ROLE_ID", 20)
+    monkeypatch.setattr(main, "SUPPORT_SESSIONS_CHANNEL_ID", 100)
+    monkeypatch.setattr(main, "GITHUB_PROFILES_CHANNEL_ID", None)
+
+    dev_role = SimpleNamespace(id=10)
+    available_role = SimpleNamespace(id=20)
+    guild = SimpleNamespace(get_role=lambda rid: {10: dev_role, 20: available_role}.get(rid))
+
+    author = Mock(spec=discord.Member)
+    author.get_role = Mock(return_value=None)
+    author.add_roles = AsyncMock()
+
+    channel = SimpleNamespace(id=100, parent_id=None, send=AsyncMock())
+
+    message = Mock(spec=discord.Message)
+    message.channel = channel
+    message.content = "I signed the IPCA"
+    message.author = author
+    message.guild = guild
+    message.add_reaction = AsyncMock()
+    message.thread = None
+
+    assigned = await main._maybe_auto_assign_ipca_roles(message)
+
+    assert assigned is True
+    channel.send.assert_awaited_once()
+    assert "We gave you access to the rest of the Discord." in channel.send.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_maybe_auto_assign_ipca_roles_archives_current_thread_when_message_posted_inside_one(monkeypatch):
+    """A follow-up message sent directly inside an already-open ticket thread:
+    message.thread is None (only set on the starter message), but
+    message.channel IS the thread — that thread should still get archived."""
+    monkeypatch.setattr(main, "DEV_TEAM_ROLE_ID", 10)
+    monkeypatch.setattr(main, "AVAILABLE_ROLE_ID", 20)
+    monkeypatch.setattr(main, "SUPPORT_SESSIONS_CHANNEL_ID", 100)
+    monkeypatch.setattr(main, "GITHUB_PROFILES_CHANNEL_ID", None)
+
+    dev_role = SimpleNamespace(id=10)
+    available_role = SimpleNamespace(id=20)
+    guild = SimpleNamespace(get_role=lambda rid: {10: dev_role, 20: available_role}.get(rid))
+
+    author = Mock(spec=discord.Member)
+    author.get_role = Mock(return_value=None)
+    author.add_roles = AsyncMock()
+
+    thread_channel = Mock(spec=discord.Thread)
+    thread_channel.id = 100
+    thread_channel.parent_id = 999
+    thread_channel.send = AsyncMock()
+    thread_channel.edit = AsyncMock()
+
+    message = Mock(spec=discord.Message)
+    message.channel = thread_channel
+    message.content = "I signed the IPCA"
+    message.author = author
+    message.guild = guild
+    message.add_reaction = AsyncMock()
+    message.thread = None
+
+    assigned = await main._maybe_auto_assign_ipca_roles(message)
+
+    assert assigned is True
+    thread_channel.send.assert_awaited_once()
+    thread_channel.edit.assert_awaited_once_with(archived=True, locked=False, reason="IPCA signed — ticket resolved")
+
+
+@pytest.mark.asyncio
+async def test_maybe_auto_assign_ipca_roles_skips_when_already_has_both(monkeypatch):
+    monkeypatch.setattr(main, "DEV_TEAM_ROLE_ID", 10)
+    monkeypatch.setattr(main, "AVAILABLE_ROLE_ID", 20)
+    monkeypatch.setattr(main, "SUPPORT_SESSIONS_CHANNEL_ID", 100)
+    monkeypatch.setattr(main, "GITHUB_PROFILES_CHANNEL_ID", None)
+
+    dev_role = SimpleNamespace(id=10)
+    available_role = SimpleNamespace(id=20)
+    guild = SimpleNamespace(get_role=lambda rid: {10: dev_role, 20: available_role}.get(rid))
+
+    author = Mock(spec=discord.Member)
+    author.get_role = Mock(side_effect=lambda rid: {10: dev_role, 20: available_role}.get(rid))
+    author.add_roles = AsyncMock()
+
+    message = Mock(spec=discord.Message)
+    message.channel = SimpleNamespace(id=100, parent_id=None)
+    message.content = "IPCA signed"
+    message.author = author
+    message.guild = guild
+
+    assigned = await main._maybe_auto_assign_ipca_roles(message)
+
+    assert assigned is False
+    author.add_roles.assert_not_awaited()
+
+
+def test_create_and_register_bot_registers_all_global_slash_commands(monkeypatch):
+    """Regression test: _create_and_register_bot()'s new_bot previously never got
+    github-invite-request/ipca-signed/offboard-user/plaky-request/plaky-status/poll
+    registered on its own tree — they were bound to the discarded module-level `bot`
+    at import time and silently never synced, leaving only the meetings commands."""
+    monkeypatch.setattr(main, "DEV_TEAM_ROLE_ID", 1)
+    monkeypatch.setattr(main, "AVAILABLE_ROLE_ID", 2)
+    new_bot = main._create_and_register_bot()
+    command_names = {cmd.name for cmd in new_bot.tree.get_commands()}
+    assert {
+        "github-invite-request",
+        "ipca-signed",
+        "offboard-user",
+        "discord-kick",
+        "plaky-request",
+        "plaky-status",
+        "poll",
+        "schedule-meeting",
+        "list-meetings",
+        "cancel-meeting",
+    }.issubset(command_names)
 
 
 def test_github_username_map_load_failure_is_logged(monkeypatch, tmp_path, caplog):

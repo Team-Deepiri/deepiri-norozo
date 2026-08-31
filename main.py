@@ -4,6 +4,7 @@ import hmac
 import json
 import logging
 import os
+import random
 import re
 import time
 from pathlib import Path
@@ -12,7 +13,7 @@ from urllib.parse import urlparse
 
 import discord
 import httpx
-from aiohttp import web
+from aiohttp import BasicAuth, web
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -40,6 +41,7 @@ GITHUB_SUPPORT_TEAM_SLUG = os.getenv("GITHUB_SUPPORT_TEAM_SLUG", "support-team")
 GITHUB_IT_TEAM_SLUG = os.getenv("GITHUB_IT_TEAM_SLUG", "it-management-team")
 PLAKY_API_KEY = os.getenv("PLAKY_API_KEY")
 PLAKY_WEBHOOK_SECRET = os.getenv("PLAKY_WEBHOOK_SECRET", "")
+DISCORD_PROXY_URL = (os.getenv("DISCORD_PROXY_URL") or "").strip() or None
 
 
 def _int_env(name: str) -> Optional[int]:
@@ -128,6 +130,25 @@ GITHUB_RESERVED_PATHS = {
 }
 
 
+def _discord_proxy_kwargs() -> dict:
+    """Route Discord traffic (REST + gateway) through DISCORD_PROXY_URL if set.
+
+    Render's shared egress IP can pick up a Cloudflare 1015 ban from
+    unrelated tenants; routing through deepiri-proxy sidesteps that since
+    it isn't fixable from retry/session logic alone. DISCORD_PROXY_URL must
+    be an http:// proxy URL (e.g. http://user:pass@vps-ip:8888) — aiohttp's
+    proxy=/proxy_auth= support (what discord.py passes this straight into)
+    is HTTP-only, not SOCKS5.
+    """
+    if not DISCORD_PROXY_URL:
+        return {}
+    parsed = urlparse(DISCORD_PROXY_URL)
+    kwargs: dict = {"proxy": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
+    if parsed.username and parsed.password:
+        kwargs["proxy_auth"] = BasicAuth(parsed.username, parsed.password)
+    return kwargs
+
+
 class DeepiriBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
@@ -135,7 +156,7 @@ class DeepiriBot(commands.Bot):
         intents.message_content = True
         intents.guilds = True
 
-        super().__init__(command_prefix="!", intents=intents)
+        super().__init__(command_prefix="!", intents=intents, **_discord_proxy_kwargs())
         self.webhook_runner: Optional[web.AppRunner] = None
 
     async def setup_hook(self) -> None:
@@ -204,6 +225,92 @@ def _is_support_sessions_channel(channel: object) -> bool:
     channel_id = getattr(channel, "id", None)
     parent_channel_id = getattr(channel, "parent_id", None)
     return channel_id in valid_ids or parent_channel_id in valid_ids
+
+
+def _is_ipca_sign_message(content: str) -> bool:
+    text = (content or "").lower()
+    if "ipca" not in text:
+        return False
+    if re.search(r"\bsigned\b", text) or re.search(r"\bsign\b", text):
+        return True
+    return False
+
+
+async def _maybe_auto_assign_ipca_roles(message: discord.Message) -> bool:
+    """Assign AVAILABLE_ROLE_ID + DEV_TEAM_ROLE_ID if this message signals IPCA
+    signed. Shared by the live on_message handler and the startup catch-up sweep
+    (_sweep_open_support_threads_for_ipca) so a bot-downtime window doesn't
+    silently skip role assignment. Returns True if roles were newly assigned.
+    """
+    if not (
+        _is_support_sessions_channel(message.channel)
+        and _is_ipca_sign_message(message.content or "")
+        and isinstance(message.author, discord.Member)
+    ):
+        return False
+    if DEV_TEAM_ROLE_ID is None or AVAILABLE_ROLE_ID is None or not message.guild:
+        return False
+    dev_role = message.guild.get_role(DEV_TEAM_ROLE_ID)
+    available_role = message.guild.get_role(AVAILABLE_ROLE_ID)
+    if not (dev_role and available_role):
+        return False
+    if message.author.get_role(DEV_TEAM_ROLE_ID) and message.author.get_role(AVAILABLE_ROLE_ID):
+        return False
+    try:
+        await message.author.add_roles(available_role, dev_role, reason="IPCA signed auto-assign")
+    except Exception:
+        logger.exception("Failed to auto-assign IPCA roles to %s", message.author.id)
+        return False
+    try:
+        await message.add_reaction("✅")
+    except Exception:
+        pass
+    try:
+        # support-tickets uses Discord's auto-thread feature: the triggering
+        # message lives in the parent channel and spawns a same-id companion
+        # thread. message.reply() posts back into the parent channel, not the
+        # thread — so post into message.thread when this message started one.
+        target_channel = message.thread or message.channel
+        await target_channel.send(f"{message.author.mention} We gave you access to the rest of the Discord.")
+    except Exception:
+        logger.exception("Failed to post IPCA access confirmation reply for %s", message.author.id)
+
+    ticket_thread = message.thread if message.thread else (message.channel if isinstance(message.channel, discord.Thread) else None)
+    if ticket_thread is not None:
+        try:
+            await ticket_thread.edit(archived=True, locked=False, reason="IPCA signed — ticket resolved")
+        except Exception:
+            logger.exception("Failed to archive IPCA ticket thread %s", getattr(ticket_thread, "id", "?"))
+
+    return True
+
+
+async def _sweep_open_support_threads_for_ipca(target_bot: "DeepiriBot") -> None:
+    """Catch up on IPCA-signed messages posted while the bot was offline (e.g.
+    during a Cloudflare 1015 egress ban) — on_message only fires for live events,
+    so a downtime window would otherwise silently skip auto role assignment.
+    Runs once per successful login, scanning currently-open threads only.
+    """
+    if SUPPORT_SESSIONS_CHANNEL_ID is None:
+        return
+    channel = target_bot.get_channel(SUPPORT_SESSIONS_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await target_bot.fetch_channel(SUPPORT_SESSIONS_CHANNEL_ID)
+        except Exception:
+            logger.exception("IPCA sweep: could not resolve support-sessions channel")
+            return
+    threads = list(getattr(channel, "threads", []) or [])
+    assigned = 0
+    for thread in threads:
+        try:
+            async for msg in thread.history(limit=200, oldest_first=True):
+                if await _maybe_auto_assign_ipca_roles(msg):
+                    assigned += 1
+        except Exception:
+            logger.exception("IPCA sweep: failed scanning thread %s", getattr(thread, "id", "?"))
+    if assigned:
+        logger.info("IPCA sweep: assigned roles to %s member(s) from %s open thread(s)", assigned, len(threads))
 
 
 def _validate_hmac_signature(
@@ -341,6 +448,16 @@ def _is_staff(member: discord.Member) -> bool:
     if STAFF_ROLE_ID is None:
         return member.guild_permissions.administrator
     return member.get_role(STAFF_ROLE_ID) is not None or member.guild_permissions.administrator
+
+
+def _can_dispatch_ipca_signed(member: discord.Member) -> bool:
+    """/ipca-signed grants DEV Team + Available roles on approval — restrict who can
+    even open that approval request to admins and Security & Operations Support, so a
+    member can't just self-serve the escalation path (the normal path is the automatic
+    IPCA-message detection in support tickets, not this command)."""
+    if _is_staff(member):
+        return True
+    return IT_OPERATIONS_SUPPORT_ROLE_ID is not None and member.get_role(IT_OPERATIONS_SUPPORT_ROLE_ID) is not None
 
 
 def _poll_option_emoji(index: int) -> str:
@@ -706,7 +823,54 @@ async def handle_offboard_user(interaction: discord.Interaction, member: discord
     await interaction.edit_original_response(content=f"Offboarding completed for {getattr(member, 'mention', normalized_username)}.")
 
 
+async def handle_discord_kick(interaction: discord.Interaction, member: discord.Member, reason: str | None = None) -> None:
+    if not isinstance(interaction.user, discord.Member) or not _is_staff(interaction.user):
+        await interaction.response.send_message("You do not have permission to kick members. Staff or Administrator required.", ephemeral=True)
+        return
+
+    if not isinstance(member, discord.Member):
+        await interaction.response.send_message("Could not resolve that member.", ephemeral=True)
+        return
+
+    if member.id == interaction.user.id:
+        await interaction.response.send_message("You cannot kick yourself.", ephemeral=True)
+        return
+
+    if member.guild_permissions.administrator or (STAFF_ROLE_ID is not None and member.get_role(STAFF_ROLE_ID) is not None):
+        await interaction.response.send_message("Cannot kick an Admin/staff member via this command.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    kick_reason = (reason or f"Kicked by {interaction.user} via /discord-kick").strip()[:512]
+    try:
+        await member.kick(reason=kick_reason)
+    except discord.Forbidden:
+        await interaction.edit_original_response(content="I don't have permission to kick that member (check my role position).")
+        return
+    except Exception:
+        logger.exception("Failed to kick member %s", member.id)
+        await interaction.edit_original_response(content=f"Failed to kick {member.mention}.")
+        return
+
+    await interaction.edit_original_response(content=f"Kicked {member.mention} from the server.")
+    if STAFF_CHANNEL_ID:
+        log_channel = await _channel_from_id(STAFF_CHANNEL_ID)
+        if log_channel:
+            try:
+                await log_channel.send(f"{member} ({member.id}) was kicked by {interaction.user.mention}. Reason: {kick_reason}")
+            except Exception:
+                pass
+
+
 async def handle_ipca_signed(interaction: discord.Interaction, github_username: str) -> None:
+    if not isinstance(interaction.user, discord.Member) or not _can_dispatch_ipca_signed(interaction.user):
+        await interaction.response.send_message(
+            "Only Admins or Security & Operations Support can run this command. "
+            "Roles are normally granted automatically when you sign the IPCA in your support ticket.",
+            ephemeral=True,
+        )
+        return
+
     if STAFF_CHANNEL_ID is None:
         await interaction.response.send_message("STAFF_CHANNEL_ID is not configured.", ephemeral=True)
         return
@@ -763,151 +927,156 @@ async def handle_ipca_signed(interaction: discord.Interaction, github_username: 
     await interaction.edit_original_response(content="Your approval request was sent to staff for review.")
 
 
-@bot.tree.command(name="github-invite-request", description="Request a GitHub invite after signing ICPA")
-@app_commands.describe(github_username="Your GitHub profile username", team="Optional team to add the user to (support or it)")
-@app_commands.choices(
-    team=[
-        app_commands.Choice(name="support", value="support"),
-        app_commands.Choice(name="it", value="it"),
-    ]
-)
-async def github_invite_request(interaction: discord.Interaction, github_username: str, team: app_commands.Choice[str] | None = None) -> None:
-    await handle_github_invite_request(interaction, github_username, team=team.value if team else None)
-
-
-@bot.tree.command(name="ipca-signed", description="Request DEV team and Available roles after signing ICPA")
-@app_commands.describe(github_username="Your GitHub profile username")
-async def ipca_signed(interaction: discord.Interaction, github_username: str) -> None:
-    await handle_ipca_signed(interaction, github_username)
-
-
-@bot.tree.command(name="offboard-user", description="Offboard a user from Discord roles and GitHub membership")
-@app_commands.describe(member="The Discord member to offboard", github_username="Their GitHub profile username", team="Optional team to remove them from (support or it)")
-@app_commands.choices(
-    team=[
-        app_commands.Choice(name="support", value="support"),
-        app_commands.Choice(name="it", value="it"),
-    ]
-)
-async def offboard_user(
-    interaction: discord.Interaction,
-    member: discord.Member,
-    github_username: str,
-    team: app_commands.Choice[str] | None = None,
-) -> None:
-    team_value = team.value if hasattr(team, "value") else team
-    await handle_offboard_user(interaction, member, github_username, team=team_value)
-
-
-@bot.tree.command(name="plaky-request", description="Create a Plaky task")
-@app_commands.describe(title="Task title", description="Task description", priority="Task priority")
-@app_commands.choices(
-    priority=[
-        app_commands.Choice(name="low", value="low"),
-        app_commands.Choice(name="medium", value="medium"),
-        app_commands.Choice(name="high", value="high"),
-    ]
-)
-async def plaky_request(
-    interaction: discord.Interaction,
-    title: str,
-    description: str,
-    priority: app_commands.Choice[str],
-) -> None:
-    result = create_task(
-        title=title,
-        description=description,
-        priority=priority.value,
-        api_key=PLAKY_API_KEY or "",
+def _register_slash_commands(target_bot: DeepiriBot) -> None:
+    @target_bot.tree.command(name="github-invite-request", description="Request a GitHub invite after signing ICPA")
+    @app_commands.describe(github_username="Your GitHub profile username", team="Optional team to add the user to (support or it)")
+    @app_commands.choices(
+        team=[
+            app_commands.Choice(name="support", value="support"),
+            app_commands.Choice(name="it", value="it"),
+        ]
     )
-
-    if result.get("ok"):
-        task_url = result.get("task_url") or "(no URL returned)"
-        await interaction.response.send_message(f"Plaky task created: {task_url}")
-        return
-
-    await interaction.response.send_message(result.get("message", "Failed to create Plaky task."), ephemeral=True)
+    async def github_invite_request(interaction: discord.Interaction, github_username: str, team: app_commands.Choice[str] | None = None) -> None:
+        await handle_github_invite_request(interaction, github_username, team=team.value if team else None)
 
 
-@bot.tree.command(name="plaky-status", description="Post open Plaky tasks summary to QA channel")
-async def plaky_status(interaction: discord.Interaction) -> None:
-    if QA_CHANNEL_ID is None:
-        await interaction.response.send_message("QA_CHANNEL_ID is not configured.", ephemeral=True)
-        return
+    @target_bot.tree.command(name="ipca-signed", description="Request DEV team and Available roles after signing ICPA")
+    @app_commands.describe(github_username="Your GitHub profile username")
+    async def ipca_signed(interaction: discord.Interaction, github_username: str) -> None:
+        await handle_ipca_signed(interaction, github_username)
 
-    qa_channel = await _channel_from_id(QA_CHANNEL_ID)
-    if not qa_channel:
-        await interaction.response.send_message("Could not find the configured QA channel.", ephemeral=True)
-        return
 
-    result = get_tasks(api_key=PLAKY_API_KEY or "", status="open")
-    if not result.get("ok"):
-        await interaction.response.send_message(result.get("message", "Failed to fetch tasks."), ephemeral=True)
-        return
+    @target_bot.tree.command(name="offboard-user", description="Offboard a user from Discord roles and GitHub membership")
+    @app_commands.describe(member="The Discord member to offboard", github_username="Their GitHub profile username", team="Optional team to remove them from (support or it)")
+    @app_commands.choices(
+        team=[
+            app_commands.Choice(name="support", value="support"),
+            app_commands.Choice(name="it", value="it"),
+        ]
+    )
+    async def offboard_user(
+        interaction: discord.Interaction,
+        member: discord.Member,
+        github_username: str,
+        team: app_commands.Choice[str] | None = None,
+    ) -> None:
+        team_value = team.value if hasattr(team, "value") else team
+        await handle_offboard_user(interaction, member, github_username, team=team_value)
 
-    tasks = result.get("tasks", [])
-    if not tasks:
-        await qa_channel.send("No open Plaky tasks found.")
+    @target_bot.tree.command(name="discord-kick", description="Kick a member from the Discord server (staff only)")
+    @app_commands.describe(member="The Discord member to kick", reason="Optional reason")
+    async def discord_kick(interaction: discord.Interaction, member: discord.Member, reason: str | None = None) -> None:
+        await handle_discord_kick(interaction, member, reason)
+
+
+    @target_bot.tree.command(name="plaky-request", description="Create a Plaky task")
+    @app_commands.describe(title="Task title", description="Task description", priority="Task priority")
+    @app_commands.choices(
+        priority=[
+            app_commands.Choice(name="low", value="low"),
+            app_commands.Choice(name="medium", value="medium"),
+            app_commands.Choice(name="high", value="high"),
+        ]
+    )
+    async def plaky_request(
+        interaction: discord.Interaction,
+        title: str,
+        description: str,
+        priority: app_commands.Choice[str],
+    ) -> None:
+        result = create_task(
+            title=title,
+            description=description,
+            priority=priority.value,
+            api_key=PLAKY_API_KEY or "",
+        )
+
+        if result.get("ok"):
+            task_url = result.get("task_url") or "(no URL returned)"
+            await interaction.response.send_message(f"Plaky task created: {task_url}")
+            return
+
+        await interaction.response.send_message(result.get("message", "Failed to create Plaky task."), ephemeral=True)
+
+
+    @target_bot.tree.command(name="plaky-status", description="Post open Plaky tasks summary to QA channel")
+    async def plaky_status(interaction: discord.Interaction) -> None:
+        if QA_CHANNEL_ID is None:
+            await interaction.response.send_message("QA_CHANNEL_ID is not configured.", ephemeral=True)
+            return
+
+        qa_channel = await _channel_from_id(QA_CHANNEL_ID)
+        if not qa_channel:
+            await interaction.response.send_message("Could not find the configured QA channel.", ephemeral=True)
+            return
+
+        result = get_tasks(api_key=PLAKY_API_KEY or "", status="open")
+        if not result.get("ok"):
+            await interaction.response.send_message(result.get("message", "Failed to fetch tasks."), ephemeral=True)
+            return
+
+        tasks = result.get("tasks", [])
+        if not tasks:
+            await qa_channel.send("No open Plaky tasks found.")
+            await interaction.response.send_message("Posted status to QA channel.", ephemeral=True)
+            return
+
+        lines = ["Open Plaky tasks:"]
+        for task in tasks[:20]:
+            task_title = task.get("title", "Untitled")
+            task_status = task.get("status", "unknown")
+            task_url = task.get("url") or task.get("taskUrl") or ""
+            if task_url:
+                lines.append(f"- [{task_title}]({task_url}) - status: {task_status}")
+            else:
+                lines.append(f"- {task_title} - status: {task_status}")
+
+        await qa_channel.send("\n".join(lines))
         await interaction.response.send_message("Posted status to QA channel.", ephemeral=True)
-        return
 
-    lines = ["Open Plaky tasks:"]
-    for task in tasks[:20]:
-        task_title = task.get("title", "Untitled")
-        task_status = task.get("status", "unknown")
-        task_url = task.get("url") or task.get("taskUrl") or ""
-        if task_url:
-            lines.append(f"- [{task_title}]({task_url}) - status: {task_status}")
-        else:
-            lines.append(f"- {task_title} - status: {task_status}")
+    @target_bot.tree.command(name="poll", description="Create a poll (staff only)")
+    @app_commands.describe(question="The poll question", options="Comma-separated options (e.g., Yes, No, Maybe)")
+    async def poll(interaction: discord.Interaction, question: str, options: str) -> None:
+        if not interaction.guild or not interaction.user:
+            await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+            return
 
-    await qa_channel.send("\n".join(lines))
-    await interaction.response.send_message("Posted status to QA channel.", ephemeral=True)
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Could not verify your permissions.", ephemeral=True)
+            return
 
+        if not _is_staff(interaction.user):
+            await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
+            return
 
-@bot.tree.command(name="poll", description="Create a poll (staff only)")
-@app_commands.describe(question="The poll question", options="Comma-separated options (e.g., Yes, No, Maybe)")
-async def poll(interaction: discord.Interaction, question: str, options: str) -> None:
-    if not interaction.guild or not interaction.user:
-        await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
-        return
+        option_list = [opt.strip() for opt in options.split(",") if opt.strip()]
+        if len(option_list) < 2:
+            await interaction.response.send_message("Please provide at least 2 options separated by commas.", ephemeral=True)
+            return
 
-    if not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message("Could not verify your permissions.", ephemeral=True)
-        return
+        if len(option_list) > 9:
+            await interaction.response.send_message("Maximum 9 options allowed.", ephemeral=True)
+            return
 
-    if not _is_staff(interaction.user):
-        await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
-        return
+        embed = discord.Embed(
+            title=f"📊 {question}",
+            color=discord.Color.blue(),
+        )
+        embed.set_footer(text=f"Poll created by {interaction.user.display_name}")
 
-    option_list = [opt.strip() for opt in options.split(",") if opt.strip()]
-    if len(option_list) < 2:
-        await interaction.response.send_message("Please provide at least 2 options separated by commas.", ephemeral=True)
-        return
+        for i, option in enumerate(option_list):
+            embed.add_field(name=f"{_poll_option_emoji(i)} {option}", value="\u200b", inline=True)
 
-    if len(option_list) > 9:
-        await interaction.response.send_message("Maximum 9 options allowed.", ephemeral=True)
-        return
+        channel = interaction.channel
+        if not channel or not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message("This command can only be used in a text channel.", ephemeral=True)
+            return
 
-    embed = discord.Embed(
-        title=f"📊 {question}",
-        color=discord.Color.blue(),
-    )
-    embed.set_footer(text=f"Poll created by {interaction.user.display_name}")
+        await interaction.response.send_message("Poll created!", ephemeral=True)
+        poll_message = await channel.send(embed=embed)
 
-    for i, option in enumerate(option_list):
-        embed.add_field(name=f"{_poll_option_emoji(i)} {option}", value="\u200b", inline=True)
-
-    channel = interaction.channel
-    if not channel or not isinstance(channel, discord.TextChannel):
-        await interaction.response.send_message("This command can only be used in a text channel.", ephemeral=True)
-        return
-
-    await interaction.response.send_message("Poll created!", ephemeral=True)
-    poll_message = await channel.send(embed=embed)
-
-    for i in range(len(option_list)):
-        await poll_message.add_reaction(_poll_option_emoji(i))
+        for i in range(len(option_list)):
+            await poll_message.add_reaction(_poll_option_emoji(i))
 
 
 async def plaky_webhook_handler(request: web.Request) -> web.Response:
@@ -1109,50 +1278,184 @@ async def start_webhook_server() -> None:
     print(f"Announcements webhook listening on http://{WEBHOOK_HOST}:{WEBHOOK_PORT}/announcements/webhook")
 
 
-async def main() -> None:
-    await start_webhook_server()
-    # Keep webhook alive even if Discord is rate-limited (Cloudflare 1015 on Render IP 74.220.48.29)
-    # Render's shared egress IP is currently banned by discord.com Cloudflare — need backoff, not tight crash loop.
-    attempt = 0
-    while True:
+def _is_discord_rate_limit_error(error: Exception) -> bool:
+    s = str(error).lower()
+    return any(x in s for x in ("429", "1015", "too many requests", "cloudflare", "rate limit"))
+
+
+def _extract_retry_after(error: Exception) -> int | None:
+    s = str(error)
+    if "Retry-After" in s:
         try:
-            logger.info("Starting Discord bot (attempt %s)", attempt + 1)
-            await bot.start(DISCORD_TOKEN)  # type: ignore[arg-type]
-            # clean exit
-            break
-        except discord.errors.HTTPException as exc:  # type: ignore[attr-defined]
-            # discord.com via Cloudflare 1015 returns HTTP 429 with HTML body
-            is_rate_limited = getattr(exc, "status", None) == 429 or "1015" in str(exc) or "rate limited" in str(exc).lower()
-            if is_rate_limited:
-                # Render IP 74.220.48.29 is banned by Cloudflare — local token is fine (remaining 999). Back off, don't spam.
-                wait = min(600, int(os.getenv("DISCORD_RETRY_WAIT", "30")) * (2 ** min(attempt, 4)) + 5)
-                logger.warning(
-                    "Discord login 429/1015 (Cloudflare) on Render IP — token is healthy (local remaining 999) but egress IP 74.220.48.29 is banned. "
-                    "Backing off %ss (attempt %s). Fix: Render → unsuspend service or move to dedicated egress / proxy, or wait for CF ban to expire. "
-                    "Body: %s",
-                    wait,
-                    attempt + 1,
-                    str(exc)[:400],
-                )
-                await asyncio.sleep(wait)
-                attempt += 1
-                # need fresh bot instance after failed login
+            parts = s.split("Retry-After")
+            if len(parts) > 1:
+                return int(parts[1].split()[0].strip("=:,[]"))
+        except Exception:
+            pass
+    return None
+
+
+def _create_and_register_bot() -> DeepiriBot:
+    """Scalable factory: fresh bot per retry with full handler registration.
+
+    Underlying Session is closed happened because aiohttp ClientSession was closed via
+    bot.close() after failed login and then reused. Factory avoids reuse by creating
+    a new DeepiriBot + meeting_service + all event/command handlers each attempt.
+    """
+    new_bot = DeepiriBot()
+    new_meeting = setup_meeting_features(new_bot)
+    # Attach for on_ready
+    new_bot.meeting_service = new_meeting  # type: ignore[attr-defined]
+
+    @new_bot.event  # type: ignore[attr-defined]
+    async def on_ready() -> None:  # type: ignore[no-redef]
+        print(f"Logged in as {new_bot.user} (id={new_bot.user.id if new_bot.user else 'unknown'})")
+        try:
+            new_bot.meeting_service.start_loop()  # type: ignore[attr-defined]
+        except Exception:
+            logger.exception("Failed to start meeting loop")
+        asyncio.create_task(_sweep_open_support_threads_for_ipca(new_bot))
+
+    @new_bot.event  # type: ignore[attr-defined]
+    async def on_member_join(member: discord.Member) -> None:  # type: ignore[no-redef]
+        welcome_channel = await _channel_from_id(SERVER_COM_CHANNEL_ID)
+        if welcome_channel:
+            await welcome_channel.send(
+                f"Welcome {member.mention}! Please sign the IPCA first, then run /github-invite-request in the support tickets channel to request a GitHub invite."
+            )
+        try:
+            await member.send(
+                "Welcome to Deepiri. Before joining the DEV team, please sign the IPCA. "
+                "After signing, run /github-invite-request in the support tickets channel so IT/staff can approve your GitHub invite."
+            )
+        except discord.Forbidden:
+            pass
+
+    @new_bot.event  # type: ignore[attr-defined]
+    async def on_member_update(before: discord.Member, after: discord.Member) -> None:  # type: ignore[no-redef]
+        if not GITHUB_ORG or not GITHUB_PAT:
+            return
+        before_roles = {r.id for r in before.roles}
+        after_roles = {r.id for r in after.roles}
+        added = after_roles - before_roles
+        if not added:
+            return
+        github_username = _get_github_username_for_member(after)
+        if not github_username:
+            logger.info("Member %s gained roles %s but no GitHub username mapping found, skipping team sync", after.id, added)
+            return
+        added_roles = [r for r in after.roles if r.id in added]
+        added_names_lower = {r.name.strip().lower() for r in added_roles}
+        qa_triggered = (QA_ROLE_ID is not None and QA_ROLE_ID in added) or (QA_ROLE_ID is None and ("qa" in added_names_lower or "quality assurance" in added_names_lower))
+        it_candidates = {"it operations support", "support operations", "it", "it-management", "security it", "it operations", "support operations and security it"}
+        it_triggered = (IT_OPERATIONS_SUPPORT_ROLE_ID is not None and IT_OPERATIONS_SUPPORT_ROLE_ID in added) or (IT_OPERATIONS_SUPPORT_ROLE_ID is None and bool(added_names_lower & it_candidates))
+        if qa_triggered:
+            try:
+                result = await asyncio.to_thread(add_user_to_team, username=github_username, github_org=GITHUB_ORG, github_pat=GITHUB_PAT, team_slug=GITHUB_SUPPORT_TEAM_SLUG)
+                if not result.get("ok"):
+                    logger.warning("Failed to add %s to support team: %s", github_username, result.get("message"))
+            except Exception:
+                logger.exception("Exception syncing QA to GitHub team")
+        if it_triggered:
+            try:
+                result = await asyncio.to_thread(add_user_to_team, username=github_username, github_org=GITHUB_ORG, github_pat=GITHUB_PAT, team_slug=GITHUB_IT_TEAM_SLUG)
+                if not result.get("ok"):
+                    logger.warning("Failed to add %s to IT team: %s", github_username, result.get("message"))
+            except Exception:
+                logger.exception("Exception syncing IT to GitHub team")
+
+    @new_bot.event  # type: ignore[attr-defined]
+    async def on_message(message: discord.Message) -> None:  # type: ignore[no-redef]
+        if message.author.bot:
+            return
+        content = message.content or ""
+        await notify_support_team_for_message(message)
+        await _maybe_auto_assign_ipca_roles(message)
+        if _is_announcements_channel(message.channel):
+            title = format_discussion_title(message.content)
+            body = format_discussion_body(message)
+            try:
+                await create_github_discussion(title, body)
+            except GitHubDiscussionError as exc:
+                logger.error("Discussion bridge failed for message %s: %s", message.id, exc)
+            try:
+                await _forward_announcement_to_platform(message)
+            except Exception:
+                logger.exception("Platform forward failed for message %s", message.id)
+        if PR_CHANNEL_ID and message.channel.id == PR_CHANNEL_ID:
+            pr_match = PR_URL_RE.search(content)
+            plaky_match = PLAKY_URL_RE.search(content)
+            if pr_match and plaky_match:
+                pr_number = pr_match.group(1)
+                pr_url = pr_match.group(0)
+                plaky_url = plaky_match.group(0)
+                embed = discord.Embed(title=f"PR #{pr_number} linked to Plaky task", description=f"[Pull Request]({pr_url})\n[Plaky Task]({plaky_url})", color=discord.Color.blue())
+                embed.set_footer(text=f"Linked by {message.author.display_name}")
+                await message.channel.send(embed=embed)
+            elif pr_match and not plaky_match:
+                await message.channel.send(f"{message.author.mention} please include the Plaky task URL (app.plaky.com/...) with your PR link.")
+        await new_bot.process_commands(message)
+
+    # setup_meeting_features(new_bot) above already registers the meetings commands on
+    # new_bot.tree directly. The rest (github-invite-request, ipca-signed, offboard-user,
+    # plaky-request, plaky-status, poll) were previously bound to the module-level `bot`'s
+    # tree at import time — a tree that's never synced since only new_bot.start() runs.
+    # That silently dropped them from `/` every retry. Register them on new_bot too.
+    _register_slash_commands(new_bot)
+
+    return new_bot
+
+
+async def _connect_discord_with_retry(token: str, max_backoff: int = 300) -> None:
+    global bot, meeting_service
+    attempt = 0
+    consecutive = 0
+    while True:
+        attempt += 1
+        consecutive += 1
+        # Fresh bot per attempt — fixes Session is closed (aiohttp ClientSession closed then reused)
+        bot = _create_and_register_bot()
+        meeting_service = bot.meeting_service  # type: ignore[attr-defined]
+        # Update _channel_from_id closure to use new global bot
+        globals()["bot"] = bot
+        globals()["meeting_service"] = meeting_service
+        try:
+            logger.info("Discord startup attempt %s (consecutive %s)", attempt, consecutive)
+            await bot.start(token)  # type: ignore[arg-type]
+            logger.info("Discord bot started successfully")
+            return
+        except asyncio.CancelledError:
+            logger.info("Discord startup cancelled")
+            if bot and not bot.is_closed():
                 try:
                     await bot.close()
                 except Exception:
                     pass
-                continue
             raise
-        except Exception:
-            logger.exception("Bot crashed unexpectedly")
-            wait = min(600, 10 * (2 ** min(attempt, 5)))
+        except Exception as err:
+            logger.exception("Discord startup failed (attempt %s)", attempt)
+            if bot and not bot.is_closed():
+                try:
+                    await bot.close()
+                except Exception:
+                    pass
+            is_rate = _is_discord_rate_limit_error(err)
+            retry_after = _extract_retry_after(err)
+            if is_rate:
+                logger.warning("Discord 429/1015 detected — Render IP 74.220.48.29 Cloudflare ban, not token")
+            if retry_after:
+                wait = retry_after
+                logger.info("Respecting Retry-After %ss", wait)
+            else:
+                base = min(2 ** (consecutive - 1), max_backoff)
+                wait = base + random.uniform(0, base * 0.1)
+                logger.info("Retrying in %.1fs (exp backoff max %ss)", wait, max_backoff)
             await asyncio.sleep(wait)
-            attempt += 1
-            try:
-                await bot.close()
-            except Exception:
-                pass
-            continue
+
+
+async def main() -> None:
+    await start_webhook_server()
+    await _connect_discord_with_retry(DISCORD_TOKEN)  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":
