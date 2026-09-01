@@ -1437,6 +1437,35 @@ _ALERT_SEVERITY_COLORS = {
 }
 
 
+async def _dm_role_members(role_id: int, embed: discord.Embed) -> int:
+    """Critical alerts don't wait for someone to be looking at #it-notifications —
+    DM every member holding the given role (Security & Operations Support) directly.
+    Best-effort per member: one blocked-DMs member shouldn't stop the rest."""
+    guild = None
+    for candidate_channel_id in (STAFF_CHANNEL_ID, SUPPORT_SESSIONS_CHANNEL_ID, ANNOUNCEMENTS_CHANNEL_ID):
+        channel = await _channel_from_id(candidate_channel_id)
+        if channel is not None and getattr(channel, "guild", None) is not None:
+            guild = channel.guild
+            break
+    if guild is None:
+        logger.warning("Could not resolve a guild to DM role %s for a critical alert", role_id)
+        return 0
+
+    role = guild.get_role(role_id)
+    if role is None:
+        logger.warning("Role %s not found in guild %s; cannot DM for critical alert", role_id, guild.id)
+        return 0
+
+    sent = 0
+    for member in role.members:
+        try:
+            await member.send(embed=embed)
+            sent += 1
+        except Exception:
+            logger.warning("Could not DM %s (%s) for critical alert", member, member.id)
+    return sent
+
+
 async def platform_alert_handler(request: web.Request) -> web.Response:
     """Inbound webhook for platform.deepiri.com system/security notifications
     (auth failures, webhook signature rejections, backend errors, etc.) -> posted
@@ -1489,7 +1518,11 @@ async def platform_alert_handler(request: web.Request) -> web.Response:
         logger.exception("Failed to post platform alert to Discord")
         return web.json_response({"ok": False, "message": "Failed to post to Discord"}, status=500)
 
-    return web.json_response({"ok": True})
+    dm_count = 0
+    if severity == "critical" and IT_OPERATIONS_SUPPORT_ROLE_ID is not None:
+        dm_count = await _dm_role_members(IT_OPERATIONS_SUPPORT_ROLE_ID, embed)
+
+    return web.json_response({"ok": True, "dmed": dm_count})
 
 
 async def health_handler(_: web.Request) -> web.Response:
