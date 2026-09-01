@@ -39,3 +39,10 @@ def test_empty_query_no_match():
 
 def test_empty_candidates_no_match():
     assert best_match("Jordan", []) is None
+
+
+def test_bare_initial_does_not_spuriously_match_someone_with_that_initial():
+    # "L" must not match "Luke L" just because "L" is one of its tokens (an
+    # initial isn't a first name) -- found via a real-roster stress test.
+    m = best_match("L", ["Luke L", "Li Ho"])
+    assert m is None

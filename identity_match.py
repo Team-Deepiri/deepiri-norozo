@@ -59,7 +59,10 @@ def _score_one(query: str, candidate: str) -> tuple:
     q_tokens, v_tokens = _name_tokens(query), _name_tokens(candidate)
     multi_token = len(q_tokens) > 1
 
-    if q in v_tokens:
+    # len(q) >= 2 guards against a bare initial ("L") spuriously matching anyone
+    # whose name happens to include that single-letter token (e.g. "Luke L") —
+    # an initial isn't a first name, it's an abbreviation of the surname.
+    if len(q) >= 2 and q in v_tokens:
         return 0.93, f"first-name match in {candidate!r}"
 
     if multi_token and all(
