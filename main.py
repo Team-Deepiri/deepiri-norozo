@@ -1436,6 +1436,28 @@ _ALERT_SEVERITY_COLORS = {
     "info": discord.Color.blue(),
 }
 
+# Fallback "how to handle this" guidance when the sender doesn't provide its own
+# `steps`/`runbook` — so #it-notifications alerts are never just a bare "something
+# broke" with no next action.
+_DEFAULT_ALERT_STEPS = {
+    "critical": (
+        "1. You were DMed for this one — acknowledge in #it-notifications so others know it's being worked.\n"
+        "2. Check the service on the VM: `docker ps` / `docker logs <container>` for the named service.\n"
+        "3. If it's Postgres/Redis, check `docker logs deepiri-postgres-platform` / `deepiri-redis` first — most other services depend on them.\n"
+        "4. If the container is down, `docker compose up -d --no-deps <service>`; if it's crash-looping, check recent deploys/config changes.\n"
+        "5. Once resolved, confirm the 'recovered' alert lands here before standing down."
+    ),
+    "warning": (
+        "1. No page yet — this is a first-failure or a rejected/unauthorized request, not confirmed down.\n"
+        "2. If it's a service health check: watch for either a 'recovered' or an escalation to critical.\n"
+        "3. If it's a rejected webhook signature: check whether it's expected traffic (e.g. a rotated secret) vs. a probe — repeated rejections from the same source are worth investigating.\n"
+        "4. No action needed unless this repeats or escalates."
+    ),
+    "info": (
+        "Informational — no action needed. Health summaries and recoveries land here so the channel stays a complete log."
+    ),
+}
+
 
 async def _dm_role_members(role_id: int, embed: discord.Embed) -> int:
     """Critical alerts don't wait for someone to be looking at #it-notifications —
@@ -1498,6 +1520,7 @@ async def platform_alert_handler(request: web.Request) -> web.Response:
     message_text = str(payload.get("message") or payload.get("body") or "").strip()
     service = str(payload.get("service") or "platform.deepiri.com").strip()
     severity = str(payload.get("severity") or "info").strip().lower()
+    steps = str(payload.get("steps") or payload.get("runbook") or "").strip()
     if not message_text:
         return web.json_response({"ok": False, "message": "Missing message/body"}, status=400)
 
@@ -1512,6 +1535,9 @@ async def platform_alert_handler(request: web.Request) -> web.Response:
         description=message_text[:4000],
         color=_ALERT_SEVERITY_COLORS.get(severity, discord.Color.blue()),
     )
+    if not steps:
+        steps = _DEFAULT_ALERT_STEPS.get(severity, _DEFAULT_ALERT_STEPS["warning"])
+    embed.add_field(name="How to handle", value=steps[:1024], inline=False)
     embed.set_footer(text=f"{service} • {severity.upper()}")
 
     try:
