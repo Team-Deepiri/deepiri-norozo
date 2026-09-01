@@ -58,3 +58,43 @@ async def test_summary_lands_in_thread_discovered_after_handler_started(monkeypa
     assert handled is True
     companion_thread.send.assert_awaited_once()
     channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_org_roster_fallback_matches_truncated_discord_handle(monkeypatch):
+    """Real case: Discord handle 'mahlaka.' vs GitHub login 'samimahlaka' -- no
+    explicit mapping, not found in #github-profiles, but the org roster itself
+    has a fuzzy-matchable candidate."""
+    monkeypatch.setattr(main, "GITHUB_ORG", "Team-Deepiri")
+    monkeypatch.setattr(main, "GITHUB_PAT", "fake-token")
+    monkeypatch.setattr(main, "list_org_members", lambda org, pat: ["samimahlaka", "someoneelse"])
+    remember_mock = Mock()
+    monkeypatch.setattr(main, "_remember_github_username", remember_mock)
+
+    member = Mock(spec=discord.Member)
+    member.id = 42
+    member.display_name = "mahlaka."
+    member.global_name = None
+    member.name = "mahlaka."
+
+    result = await main._find_github_username_via_org_roster(member)
+
+    assert result == "samimahlaka"
+    remember_mock.assert_called_once_with(42, "samimahlaka")
+
+
+@pytest.mark.asyncio
+async def test_org_roster_fallback_refuses_on_no_confident_match(monkeypatch):
+    monkeypatch.setattr(main, "GITHUB_ORG", "Team-Deepiri")
+    monkeypatch.setattr(main, "GITHUB_PAT", "fake-token")
+    monkeypatch.setattr(main, "list_org_members", lambda org, pat: ["completelyunrelated"])
+
+    member = Mock(spec=discord.Member)
+    member.id = 42
+    member.display_name = "xyz123nomatch"
+    member.global_name = None
+    member.name = "xyz123nomatch"
+
+    result = await main._find_github_username_via_org_roster(member)
+
+    assert result is None

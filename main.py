@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 
 from bot import format_discussion_body, format_discussion_title
 from emailer import send_email
-from github import add_user_to_team, get_user_email, invite_user, is_org_member, remove_user_from_org, remove_user_from_team
+from github import add_user_to_team, get_user_email, invite_user, is_org_member, list_org_members, remove_user_from_org, remove_user_from_team
 from identity_match import best_match
 from github_discussion import GitHubDiscussionError, create_github_discussion
 from meetings import setup_meeting_features
@@ -527,24 +527,65 @@ async def _find_github_username_in_profiles_channel(member: discord.Member) -> O
     shouldn't silently pass through into a destructive op like org removal.
     """
     if GITHUB_PROFILES_CHANNEL_ID is None:
+        logger.warning("#github-profiles scan for %s skipped: GITHUB_PROFILES_CHANNEL_ID not configured", member.id)
         return None
     channel = await _channel_from_id(GITHUB_PROFILES_CHANNEL_ID)
     if channel is None:
+        logger.warning("#github-profiles scan for %s skipped: could not resolve channel %s", member.id, GITHUB_PROFILES_CHANNEL_ID)
         return None
+    scanned = 0
+    messages_from_author = 0
     try:
         async for msg in channel.history(limit=1000):
+            scanned += 1
             if msg.author.id != member.id:
                 continue
+            messages_from_author += 1
             candidate = _extract_github_profile_username(msg.content or "")
             if not candidate:
+                logger.info("#github-profiles: message from %s has no extractable GitHub link: %r", member.id, msg.content[:200])
                 continue
             if not await asyncio.to_thread(is_org_member, candidate, GITHUB_ORG, GITHUB_PAT):
                 logger.warning("Found GitHub link %s for %s in #github-profiles but they're not in %s", candidate, member.id, GITHUB_ORG)
                 continue
+            logger.info("#github-profiles: matched %s -> %s after scanning %s messages", member.id, candidate, scanned)
             _remember_github_username(member.id, candidate)
             return candidate
     except Exception:
         logger.exception("Failed scanning #github-profiles for member %s", member.id)
+        return None
+    logger.warning(
+        "#github-profiles: scanned %s messages, found %s from member %s, no usable GitHub link",
+        scanned, messages_from_author, member.id,
+    )
+    return None
+
+
+async def _find_github_username_via_org_roster(member: discord.Member) -> Optional[str]:
+    """Last resort: fuzzy-match the Discord name against the full GitHub org
+    member list. GitHub logins are often nothing like a real name, but they
+    sometimes genuinely overlap -- a Discord handle like "mahlaka." can be a
+    truncated form of the GitHub login "samimahlaka" (SequenceMatcher ratio
+    ~0.78 there, comfortably above best_match's threshold). Every candidate
+    here is already a confirmed org member by construction, so no separate
+    is_org_member re-check is needed the way the other two sources require.
+    """
+    if not GITHUB_ORG or not GITHUB_PAT:
+        logger.warning("Org roster fallback for %s skipped: GITHUB_ORG or GITHUB_PAT not configured", member.id)
+        return None
+    usernames = await asyncio.to_thread(list_org_members, GITHUB_ORG, GITHUB_PAT)
+    if not usernames:
+        logger.warning("Org roster fallback for %s: list_org_members returned nothing", member.id)
+        return None
+    for candidate_name in (member.display_name, str(getattr(member, "global_name", "") or ""), str(member.name)):
+        if not candidate_name:
+            continue
+        match = best_match(candidate_name, usernames)
+        if match is not None:
+            logger.info("Org roster fallback: matched %s (query %r) -> %s", member.id, candidate_name, usernames[match.index])
+            _remember_github_username(member.id, usernames[match.index])
+            return usernames[match.index]
+    logger.warning("Org roster fallback for %s: no confident match among %s org members", member.id, len(usernames))
     return None
 
 
@@ -1288,6 +1329,8 @@ async def _maybe_handle_kick_out_command(message: discord.Message) -> bool:
         github_username = None
     if not github_username:
         github_username = await _find_github_username_in_profiles_channel(target)
+    if not github_username:
+        github_username = await _find_github_username_via_org_roster(target)
 
     notice_outcome = await _send_termination_notice(target, github_username)
 
