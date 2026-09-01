@@ -1101,6 +1101,20 @@ async def _maybe_handle_kick_out_command(message: discord.Message) -> bool:
 
     reason = f"Kicked by {message.author} via kick-out command in #{getattr(message.channel, 'name', message.channel.id)}"[:512]
 
+    # Resolve GitHub username and send the termination notice BEFORE kicking —
+    # once someone's kicked, the bot can no longer DM them (no mutual server
+    # context), so the DM fallback would always fail if this happened after.
+    github_username = _get_github_username_for_member(target)
+    if github_username and not await asyncio.to_thread(is_org_member, github_username, GITHUB_ORG, GITHUB_PAT):
+        # The mapping/name-guess isn't actually in the org roster — don't trust it for
+        # a destructive op, fall through to searching #github-profiles instead.
+        logger.warning("Mapped/guessed GitHub username %s for %s is not in %s; falling back to #github-profiles", github_username, target.id, GITHUB_ORG)
+        github_username = None
+    if not github_username:
+        github_username = await _find_github_username_in_profiles_channel(target)
+
+    notice_outcome = await _send_termination_notice(target, github_username)
+
     discord_ok = True
     try:
         await target.kick(reason=reason)
@@ -1112,14 +1126,6 @@ async def _maybe_handle_kick_out_command(message: discord.Message) -> bool:
         logger.exception("Failed to kick member %s via kick-out command", target.id)
         await message.channel.send(f"{message.author.mention} Failed to kick {target.mention} from Discord.")
 
-    github_username = _get_github_username_for_member(target)
-    if github_username and not await asyncio.to_thread(is_org_member, github_username, GITHUB_ORG, GITHUB_PAT):
-        # The mapping/name-guess isn't actually in the org roster — don't trust it for
-        # a destructive op, fall through to searching #github-profiles instead.
-        logger.warning("Mapped/guessed GitHub username %s for %s is not in %s; falling back to #github-profiles", github_username, target.id, GITHUB_ORG)
-        github_username = None
-    if not github_username:
-        github_username = await _find_github_username_in_profiles_channel(target)
     github_ok = False
     github_note = "no mapped GitHub username, skipped"
     if github_username:
@@ -1128,8 +1134,6 @@ async def _maybe_handle_kick_out_command(message: discord.Message) -> bool:
         github_note = github_username if github_ok else f"{github_username} — {org_result.get('message')}"
         if not github_ok:
             logger.warning("GitHub org removal failed for %s during kick-out: %s", github_username, org_result.get("message"))
-
-    notice_outcome = await _send_termination_notice(target, github_username)
 
     summary = (
         f"{'✅' if discord_ok else '⚠️'} Discord kick: {target} ({target.id})\n"
