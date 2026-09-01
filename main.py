@@ -1148,11 +1148,15 @@ async def _maybe_handle_onboarding_dm(message: discord.Message) -> bool:
     # Self-reported GitHub username, most reliable source there is for kick-out's
     # GitHub org removal — checked ahead of the #github-profiles channel scan and
     # the display-name guess heuristic (_get_github_username_for_member already
-    # checks this mapping first). Restricted to an actual github.com link here
-    # (not _extract_github_profile_username's bare-word fallback, which would
-    # otherwise swallow a plain role pick like "Backend" or "AI" as if it were
-    # a username before role-matching ever got a chance to run).
-    github_username = _extract_github_profile_username(content) if "github.com" in content.lower() else None
+    # checks this mapping first). Only run this when the message actually
+    # contains a URL — _extract_github_profile_username's real host validation
+    # (host == "github.com" after urlparse) already lives downstream and is what
+    # actually enforces the domain; this is just a gate to skip that function's
+    # bare-word fallback, which would otherwise swallow a plain role pick like
+    # "Backend" or "AI" as if it were a username before role-matching ever ran.
+    # (Deliberately not a domain substring check — "notgithub.com.evil.com"
+    # contains "github.com" too, which is exactly the pattern CodeQL flags.)
+    github_username = _extract_github_profile_username(content) if URL_RE.search(content) else None
     if github_username:
         _remember_github_username(message.author.id, github_username)
         await message.channel.send(f"Got it — linked your GitHub as **{github_username}**.")
