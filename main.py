@@ -115,10 +115,24 @@ GITHUB_USERNAME_RE = re.compile(r"^[A-Za-z\d](?:[A-Za-z\d-]{0,37}[A-Za-z\d])?$")
 EMAIL_SEARCH_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 
 # New-member onboarding: DM asks for email + role, each reply classified
-# independently (no conversation state to track/lose on a restart). IT is
-# excluded by name before any fuzzy scoring runs -- it has elevated permissions
-# and must never be self-assignable through this flow.
+# independently (no conversation state to track/lose on a restart). IT/Security &
+# Operations Support is excluded by name before any fuzzy scoring runs -- it has
+# elevated permissions and must never be self-assignable through this flow.
+# Matched by fuzzy confidence against the known real name rather than requiring a
+# role ID to be configured -- same "look it up live" approach as the categories
+# below, and it still catches a renamed/differently-cased role since it's a
+# similarity match, not an exact string.
 _IT_ROLE_WORD_RE = re.compile(r"\bit\b", re.IGNORECASE)
+_ELEVATED_ROLE_REFERENCE_NAME = "Security & Operations Support"
+_ELEVATED_ROLE_EXCLUDE_MIN_SCORE = 0.75
+
+
+def _is_elevated_role(role_name: str) -> bool:
+    if _IT_ROLE_WORD_RE.search(role_name):
+        return True
+    match = best_match(role_name, [_ELEVATED_ROLE_REFERENCE_NAME], min_score=_ELEVATED_ROLE_EXCLUDE_MIN_SCORE)
+    return match is not None
+
 _ROLE_CATEGORY_PATTERNS = [
     ("AI Engineer", [re.compile(r"\bai\b", re.IGNORECASE)], False),
     ("ML Engineer", [re.compile(r"\bml\b", re.IGNORECASE), re.compile(r"\bmachine\s+learning\b", re.IGNORECASE)], False),
@@ -1102,14 +1116,15 @@ async def _send_termination_notice(target: discord.Member, github_username: Opti
 
 def _candidate_roles_by_category(guild: discord.Guild) -> "dict[str, discord.Role]":
     """One representative role per category, resolved live from the guild's actual
-    role list every time (no IDs to configure/maintain). IT is excluded by name
-    before any fuzzy scoring runs -- never a self-service candidate, elevated
-    permissions. Cloud/Infra/Security additionally requires "Engineer" in the
-    name to qualify, per how that category is actually named in this server."""
+    role list every time (no IDs to configure/maintain). IT/Security & Operations
+    Support is excluded before any fuzzy scoring runs -- never a self-service
+    candidate, elevated permissions. Cloud/Infra/Security additionally requires
+    "Engineer" in the name to qualify, per how that category is actually named
+    in this server."""
     result: "dict[str, discord.Role]" = {}
     for role in guild.roles:
         name = role.name
-        if _IT_ROLE_WORD_RE.search(name):
+        if _is_elevated_role(name):
             continue
         for label, patterns, requires_engineer in _ROLE_CATEGORY_PATTERNS:
             if label in result:
@@ -1169,18 +1184,21 @@ async def _maybe_handle_onboarding_dm(message: discord.Message) -> bool:
     if member is None:
         return False
 
-    if _IT_ROLE_WORD_RE.search(content):
+    candidates = _candidate_roles_by_category(guild)
+    labels = list(candidates.keys())
+    match = best_match(content, labels) if labels else None
+
+    if match is None and _is_elevated_role(content):
+        # Only reached when nothing in the real, self-assignable candidate list
+        # matched -- "Security" alone should (and does) resolve to Cloud/Infra/
+        # Security Engineer above before ever reaching this fallback, since that
+        # role isn't in `labels` to begin with and can't compete for the match.
         await message.channel.send(
-            "The IT role isn't self-assignable (it has elevated permissions) — "
-            "please contact staff directly if you need it."
+            "The IT / Security & Operations Support role isn't self-assignable "
+            "(it has elevated permissions) — please contact staff directly if you need it."
         )
         return True
 
-    candidates = _candidate_roles_by_category(guild)
-    if not candidates:
-        return False
-    labels = list(candidates.keys())
-    match = best_match(content, labels)
     if match is not None:
         role = candidates[labels[match.index]]
         if role in member.roles:
