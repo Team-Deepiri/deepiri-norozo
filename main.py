@@ -21,13 +21,13 @@ from dotenv import load_dotenv
 
 from bot import format_discussion_body, format_discussion_title
 from emailer import send_email
-from github import add_user_to_team, get_user_email, invite_user, is_org_member, list_org_members, remove_user_from_org, remove_user_from_team
+from github import add_user_to_team, get_user_profile, invite_user, is_org_member, list_org_members, remove_user_from_org, remove_user_from_team
 from identity_match import best_match
 from github_discussion import GitHubDiscussionError, create_github_discussion
 from meetings import setup_meeting_features
 from onboarding import ApprovalView
 from member_email_store import load_member_email, save_member_email
-from plaky import create_task, find_user_email_by_name, get_tasks
+from plaky import create_task, find_user_email, get_tasks
 from state_store import load_last_online_at, save_last_online_at
 
 
@@ -1133,19 +1133,32 @@ async def _send_termination_notice(target: discord.Member, github_username: Opti
     subject = "Notice of Termination — Deepiri Contributor Agreement"
 
     email = await load_member_email(target.id)
+    github_real_name = None
     if not email and github_username:
-        email = await asyncio.to_thread(get_user_email, github_username, GITHUB_PAT)
+        profile = await asyncio.to_thread(get_user_profile, github_username, GITHUB_PAT)
+        email = profile.get("email")
+        github_real_name = profile.get("name")
         if not email:
-            logger.info("Termination notice: no public GitHub email for %s", github_username)
+            logger.info("Termination notice: no public GitHub email for %s (real name on profile: %r)", github_username, github_real_name)
     if not email and not PLAKY_API_KEY:
         logger.warning("Termination notice: PLAKY_API_KEY not configured, skipping Plaky lookup for %s", target.id)
     if not email and PLAKY_API_KEY:
-        candidates = (target.display_name, str(getattr(target, "global_name", "") or ""), str(target.name))
+        # Throw every known identifier at Plaky at once instead of trying one
+        # candidate and giving up: GitHub's real display name (e.g. login
+        # "riccorx" -> name "Ricardo Beale" -- the person's own self-reported
+        # real name, a far stronger signal than any account handle), the GitHub
+        # login itself, and every Discord identifier. find_user_email picks the
+        # single best-scoring match across all of them, not just the first
+        # candidate that happens to clear the threshold.
+        candidates = [
+            github_real_name,
+            github_username,
+            target.display_name,
+            str(getattr(target, "global_name", "") or ""),
+            str(target.name),
+        ]
         logger.info("Termination notice: trying Plaky lookup for %s with candidates %s", target.id, candidates)
-        for candidate_name in candidates:
-            email = await asyncio.to_thread(find_user_email_by_name, candidate_name, PLAKY_API_KEY)
-            if email:
-                break
+        email = await asyncio.to_thread(find_user_email, candidates, PLAKY_API_KEY)
 
     if email:
         sent = await asyncio.to_thread(send_email, email, subject, body)

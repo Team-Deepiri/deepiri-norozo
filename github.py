@@ -69,11 +69,16 @@ def _get_user_id(username: str, github_pat: str) -> Dict[str, Any]:
     return {"ok": True, "user_id": payload.get("id")}
 
 
-def get_user_email(username: str, github_pat: str) -> Optional[str]:
-    """GitHub only returns `email` here if the user has made it public on their
-    profile — most don't, so this is a best-effort source, not a guaranteed one."""
+def get_user_profile(username: str, github_pat: str) -> Dict[str, Optional[str]]:
+    """GitHub's `name` field is the account holder's real display name (e.g. login
+    "jrb00013" -> name "Joe Black") -- a much stronger signal to feed into a Plaky
+    name lookup than the raw GitHub login or a Discord handle, since it's the
+    person's own self-reported name rather than an arbitrary account identifier.
+    `email` is only populated if the user made it public on their profile, so
+    both fields are best-effort, not guaranteed.
+    """
     if not username or not github_pat:
-        return None
+        return {"email": None, "name": None}
     headers = {
         "Authorization": f"Bearer {github_pat}",
         "Accept": "application/vnd.github+json",
@@ -82,8 +87,14 @@ def get_user_email(username: str, github_pat: str) -> Optional[str]:
     url = f"{GITHUB_API_BASE}/users/{username}"
     response = _request_with_rate_limit_retry("GET", url, headers=headers)
     if response.status_code != 200:
-        return None
-    return response.json().get("email") or None
+        return {"email": None, "name": None}
+    payload = response.json()
+    return {"email": payload.get("email") or None, "name": payload.get("name") or None}
+
+
+def get_user_email(username: str, github_pat: str) -> Optional[str]:
+    """Thin wrapper over get_user_profile for callers that only need the email."""
+    return get_user_profile(username, github_pat).get("email")
 
 
 def add_user_to_team(username: str, github_org: str, github_pat: str, team_slug: str) -> Dict[str, Any]:
