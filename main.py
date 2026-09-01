@@ -1458,6 +1458,8 @@ async def _dm_role_members(role_id: int, embed: discord.Embed) -> int:
 
     sent = 0
     for member in role.members:
+        if member.bot:
+            continue
         try:
             await member.send(embed=embed)
             sent += 1
