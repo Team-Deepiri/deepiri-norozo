@@ -1088,15 +1088,22 @@ async def _maybe_handle_kick_out_command(message: discord.Message) -> bool:
     if not isinstance(message.author, discord.Member) or not _is_staff(message.author):
         return False
 
+    # support-tickets uses Discord's auto-thread feature: the triggering message
+    # lives in the parent channel and spawns a same-id companion thread. Replying
+    # via message.channel.send() lands in the parent feed, not the ticket thread —
+    # same bug the IPCA confirmation had before it was fixed. Post into the thread
+    # when this message started one, falling back to the channel otherwise.
+    reply_channel = message.thread or message.channel
+
     target = _resolve_kick_target(message, match.group(1))
     if target is None:
-        await message.channel.send(f"{message.author.mention} Couldn't find that member to kick.")
+        await reply_channel.send(f"{message.author.mention} Couldn't find that member to kick.")
         return True
     if target.id == message.author.id:
-        await message.channel.send(f"{message.author.mention} You cannot kick yourself.")
+        await reply_channel.send(f"{message.author.mention} You cannot kick yourself.")
         return True
     if target.guild_permissions.administrator or (STAFF_ROLE_ID is not None and target.get_role(STAFF_ROLE_ID) is not None):
-        await message.channel.send(f"{message.author.mention} Cannot kick an Admin/staff member this way.")
+        await reply_channel.send(f"{message.author.mention} Cannot kick an Admin/staff member this way.")
         return True
 
     reason = f"Kicked by {message.author} via kick-out command in #{getattr(message.channel, 'name', message.channel.id)}"[:512]

@@ -1,4 +1,5 @@
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional
 
@@ -8,6 +9,14 @@ from identity_match import best_match
 
 
 PLAKY_API_BASE = os.getenv("PLAKY_API_BASE", "https://api.plaky.com/v2")
+
+
+def _leading_name_token(s: str) -> str:
+    """First alphabetic run in a Discord/Plaky-handle-shaped string —
+    'wren.h._83898' -> 'wren', 'Wren.m.2h35' -> 'Wren'. Strips the random
+    suffixes these account handles carry, which a real human-typed name never has."""
+    m = re.match(r"[A-Za-z]+", (s or "").strip())
+    return m.group(0) if m else ""
 
 
 def _request_with_rate_limit_retry(method: str, url: str, headers: Dict[str, str], json: Optional[Dict[str, Any]] = None, params: Optional[Dict[str, Any]] = None, retries: int = 2) -> requests.Response:
@@ -134,6 +143,18 @@ def find_user_email_by_name(name: str, api_key: str) -> Optional[str]:
         for user in users
     ]
     match = best_match(name, display_names)
+    if match is None:
+        # Second pass: Discord account handles/usernames aren't clean human-typed
+        # names ("wren.h._83898") -- they carry random suffixes that make every
+        # token required to line up, which kills an otherwise-unique first-name
+        # match ("wren" vs the only "Wren.*" in the whole roster). Retry on
+        # just the leading name token from both sides. Still goes through
+        # best_match's ambiguity refusal, so two people sharing a first name
+        # still won't get guessed at.
+        leading_query = _leading_name_token(name)
+        leading_candidates = [_leading_name_token(n) for n in display_names]
+        if leading_query:
+            match = best_match(leading_query, leading_candidates)
     if match is None:
         return None
     emails = _user_emails(users[match.index])
