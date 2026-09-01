@@ -20,11 +20,12 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 from bot import format_discussion_body, format_discussion_title
-from github import add_user_to_team, invite_user, is_org_member, remove_user_from_org, remove_user_from_team
+from emailer import send_email
+from github import add_user_to_team, get_user_email, invite_user, is_org_member, remove_user_from_org, remove_user_from_team
 from github_discussion import GitHubDiscussionError, create_github_discussion
 from meetings import setup_meeting_features
 from onboarding import ApprovalView
-from plaky import create_task, get_tasks
+from plaky import create_task, find_user_email_by_name, get_tasks
 from state_store import load_last_online_at, save_last_online_at
 
 
@@ -1011,6 +1012,69 @@ def _resolve_kick_target(message: discord.Message, raw_target: str) -> Optional[
     return None
 
 
+def _termination_notice_text(display_name: str) -> str:
+    return (
+        f"Dear {display_name},\n\n"
+        "This email serves as formal notice that your participation in the Deepiri project "
+        "is terminated effective immediately pursuant to Section 15 of the Deepiri Contributor "
+        "and Intellectual Property Agreement.\n\n"
+        "As a result of this termination, the following terms apply:\n"
+        "1. Cessation of Representation\n\n"
+        "Effective immediately, you may not represent yourself as:\n\n"
+        "    A current contributor to Deepiri\n\n"
+        "    Acting on behalf of Deepiri\n\n"
+        "    Affiliated with Deepiri in any ongoing capacity\n\n"
+        "You may update LinkedIn, résumés, and other public profiles to reflect that your "
+        "participation has ended. Any description of your past involvement must be accurate "
+        "and must not imply ongoing affiliation, authority, or endorsement.\n"
+        "2. Access and Assets\n\n"
+        "You must immediately cease access to all Deepiri systems, repositories, accounts, "
+        "credentials, or internal tools.\n\n"
+        "If you possess any materials that were explicitly designated as private and not "
+        "publicly released under Apache 2.0, those materials must be deleted or returned in "
+        "accordance with Sections 11 and 12 of the Agreement.\n\n"
+        "This requirement does not apply to publicly released open-source repositories "
+        "governed by Apache 2.0.\n"
+        "3. Continuing Obligations\n\n"
+        "All confidentiality provisions remain in effect with respect to any non-public "
+        "materials previously accessed.\n\n"
+        "If you have questions regarding this notice, please submit them in writing.\n\n"
+        "Sincerely,\n"
+        "Deepiri Management"
+    )
+
+
+async def _send_termination_notice(target: discord.Member, github_username: Optional[str]) -> str:
+    """Resolve an email for the kicked member (GitHub public email -> best-effort
+    Plaky lookup -> Discord DM as last resort) and send the termination notice.
+    Returns a short human-readable outcome string for the kick-out summary.
+    """
+    body = _termination_notice_text(target.display_name)
+    subject = "Notice of Termination — Deepiri Contributor Agreement"
+
+    email = None
+    if github_username:
+        email = await asyncio.to_thread(get_user_email, github_username, GITHUB_PAT)
+    if not email and PLAKY_API_KEY:
+        for candidate_name in (target.display_name, str(getattr(target, "global_name", "") or ""), str(target.name)):
+            email = await asyncio.to_thread(find_user_email_by_name, candidate_name, PLAKY_API_KEY)
+            if email:
+                break
+
+    if email:
+        sent = await asyncio.to_thread(send_email, email, subject, body)
+        if sent:
+            return f"emailed to {email}"
+        logger.warning("Termination email to %s failed to send; falling back to DM for %s", email, target.id)
+
+    try:
+        await target.send(f"**{subject}**\n\n{body}")
+        return "no email found — sent via Discord DM" if not email else "email send failed — sent via Discord DM instead"
+    except Exception:
+        logger.exception("Failed to DM termination notice to %s", target.id)
+        return "could not deliver notice via email or DM"
+
+
 async def _maybe_handle_kick_out_command(message: discord.Message) -> bool:
     """Staff saying 'kick out <name>' (or 'kick <name>') in #support-tickets,
     #admin-terminal, or #it-kick-list removes the member from Discord AND the
@@ -1065,9 +1129,12 @@ async def _maybe_handle_kick_out_command(message: discord.Message) -> bool:
         if not github_ok:
             logger.warning("GitHub org removal failed for %s during kick-out: %s", github_username, org_result.get("message"))
 
+    notice_outcome = await _send_termination_notice(target, github_username)
+
     summary = (
         f"{'✅' if discord_ok else '⚠️'} Discord kick: {target} ({target.id})\n"
-        f"{'✅' if github_ok else '⚠️'} GitHub org removal: {github_note}"
+        f"{'✅' if github_ok else '⚠️'} GitHub org removal: {github_note}\n"
+        f"📧 Termination notice: {notice_outcome}"
     )
     await message.channel.send(summary)
     if STAFF_CHANNEL_ID:
