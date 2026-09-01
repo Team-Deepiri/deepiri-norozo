@@ -1094,8 +1094,14 @@ async def _send_termination_notice(target: discord.Member, github_username: Opti
     email = await load_member_email(target.id)
     if not email and github_username:
         email = await asyncio.to_thread(get_user_email, github_username, GITHUB_PAT)
+        if not email:
+            logger.info("Termination notice: no public GitHub email for %s", github_username)
+    if not email and not PLAKY_API_KEY:
+        logger.warning("Termination notice: PLAKY_API_KEY not configured, skipping Plaky lookup for %s", target.id)
     if not email and PLAKY_API_KEY:
-        for candidate_name in (target.display_name, str(getattr(target, "global_name", "") or ""), str(target.name)):
+        candidates = (target.display_name, str(getattr(target, "global_name", "") or ""), str(target.name))
+        logger.info("Termination notice: trying Plaky lookup for %s with candidates %s", target.id, candidates)
+        for candidate_name in candidates:
             email = await asyncio.to_thread(find_user_email_by_name, candidate_name, PLAKY_API_KEY)
             if email:
                 break
@@ -1237,22 +1243,36 @@ async def _maybe_handle_kick_out_command(message: discord.Message) -> bool:
     if not isinstance(message.author, discord.Member) or not _is_staff(message.author):
         return False
 
-    # support-tickets uses Discord's auto-thread feature: the triggering message
-    # lives in the parent channel and spawns a same-id companion thread. Replying
-    # via message.channel.send() lands in the parent feed, not the ticket thread —
-    # same bug the IPCA confirmation had before it was fixed. Post into the thread
-    # when this message started one, falling back to the channel otherwise.
-    reply_channel = message.thread or message.channel
+    async def _reply_channel():
+        # support-tickets uses Discord's auto-thread feature: the triggering
+        # message lives in the parent channel and spawns a same-id companion
+        # thread as a SIDE EFFECT that can land after on_message already fired —
+        # message.thread captured once at handler-start can still be None even
+        # though the thread exists by the time we're ready to reply (kick +
+        # GitHub removal + email resolution all take real time first). Re-check
+        # fresh every time instead of trusting a value cached at the top.
+        if message.thread is not None:
+            return message.thread
+        cached = message.channel.get_thread(message.id) if hasattr(message.channel, "get_thread") else None
+        if cached is not None:
+            return cached
+        try:
+            fresh = await message.channel.fetch_message(message.id)
+            if fresh.thread is not None:
+                return fresh.thread
+        except Exception:
+            pass
+        return message.channel
 
     target = _resolve_kick_target(message, match.group(1))
     if target is None:
-        await reply_channel.send(f"{message.author.mention} Couldn't find that member to kick.")
+        await (await _reply_channel()).send(f"{message.author.mention} Couldn't find that member to kick.")
         return True
     if target.id == message.author.id:
-        await reply_channel.send(f"{message.author.mention} You cannot kick yourself.")
+        await (await _reply_channel()).send(f"{message.author.mention} You cannot kick yourself.")
         return True
     if target.guild_permissions.administrator or (STAFF_ROLE_ID is not None and target.get_role(STAFF_ROLE_ID) is not None):
-        await reply_channel.send(f"{message.author.mention} Cannot kick an Admin/staff member this way.")
+        await (await _reply_channel()).send(f"{message.author.mention} Cannot kick an Admin/staff member this way.")
         return True
 
     reason = f"Kicked by {message.author} via kick-out command in #{getattr(message.channel, 'name', message.channel.id)}"[:512]
@@ -1276,11 +1296,11 @@ async def _maybe_handle_kick_out_command(message: discord.Message) -> bool:
         await target.kick(reason=reason)
     except discord.Forbidden:
         discord_ok = False
-        await message.channel.send(f"{message.author.mention} I don't have permission to kick {target.mention} (check my role position).")
+        await (await _reply_channel()).send(f"{message.author.mention} I don't have permission to kick {target.mention} (check my role position).")
     except Exception:
         discord_ok = False
         logger.exception("Failed to kick member %s via kick-out command", target.id)
-        await message.channel.send(f"{message.author.mention} Failed to kick {target.mention} from Discord.")
+        await (await _reply_channel()).send(f"{message.author.mention} Failed to kick {target.mention} from Discord.")
 
     github_ok = False
     github_note = "no mapped GitHub username, skipped"
@@ -1296,7 +1316,7 @@ async def _maybe_handle_kick_out_command(message: discord.Message) -> bool:
         f"{'✅' if github_ok else '⚠️'} GitHub org removal: {github_note}\n"
         f"📧 Termination notice: {notice_outcome}"
     )
-    await message.channel.send(summary)
+    await (await _reply_channel()).send(summary)
     if STAFF_CHANNEL_ID:
         log_channel = await _channel_from_id(STAFF_CHANNEL_ID)
         if log_channel:
