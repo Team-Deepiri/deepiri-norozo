@@ -47,6 +47,31 @@ class NameMatch:
     reason: str
 
 
+def _containment_score(q: str, v: str) -> float:
+    """Full, unbroken containment of the shorter string inside the longer one is a
+    fundamentally stronger signal than generic edit-similarity gives it credit for.
+    SequenceMatcher's length-normalized ratio (2M / (|q|+|v|)) treats the longer
+    string's extra characters as "dissimilarity" -- but when the whole shorter
+    string matches as one contiguous run, that extra content is just surrounding
+    context, not evidence against a match (e.g. Discord handle "mahlaka" fully
+    inside GitHub login "samimahlaka" scores a middling 0.78 on raw ratio despite
+    being a near-certain match). Guarded to length >= 4: short substrings ("al",
+    "an") recur constantly through the ordinary structure of real names, not
+    through the rare-coincidence assumption this score is built on -- the same
+    floor already used independently elsewhere in this module and in
+    deepiri-boardman's person_match.py.
+    """
+    # Strip anything that isn't a letter/digit -- q and v are already casefolded
+    # by the caller, but a Discord handle carries trailing/separator punctuation
+    # ("mahlaka.") that has no bearing on whether the *name* is contained; only
+    # the alphanumeric content should participate in the containment check.
+    qa, va = re.sub(r"[^a-z0-9]", "", q), re.sub(r"[^a-z0-9]", "", v)
+    shorter, longer = (qa, va) if len(qa) <= len(va) else (va, qa)
+    if len(shorter) >= 4 and shorter in longer:
+        return 0.95
+    return 0.0
+
+
 def _score_one(query: str, candidate: str) -> tuple:
     q = _norm_ws_casefold(query)
     v = _norm_ws_casefold(candidate)
@@ -72,6 +97,9 @@ def _score_one(query: str, candidate: str) -> tuple:
         return 0.9, f"all parts of {query!r} match {candidate!r}"
 
     if not multi_token:
+        containment = _containment_score(q, v)
+        if containment > 0:
+            return containment, f"{q!r} fully contained in {candidate!r}"
         ratio = _similar(q, v)
         if ratio >= 0.5:
             return ratio, f"{int(ratio * 100)}% similar to {candidate!r}"
