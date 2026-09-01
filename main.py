@@ -7,6 +7,7 @@ import os
 import random
 import re
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
@@ -24,6 +25,7 @@ from github_discussion import GitHubDiscussionError, create_github_discussion
 from meetings import setup_meeting_features
 from onboarding import ApprovalView
 from plaky import create_task, get_tasks
+from state_store import load_last_online_at, save_last_online_at
 
 
 load_dotenv()
@@ -67,6 +69,16 @@ IT_OPERATIONS_SUPPORT_ROLE_ID = _int_env("IT_OPERATIONS_SUPPORT_ROLE_ID") or _in
 QA_ROLE_ID = _int_env("QA_ROLE_ID")
 ANNOUNCEMENTS_CHANNEL_ID = _int_env("DISCORD_CHANNEL_ID") or _int_env("ANNOUNCEMENTS_CHANNEL_ID")  # #announcements 1436509524818395156
 ANNOUNCEMENTS_CHANNEL_NAME = os.getenv("DISCORD_CHANNEL_NAME", "announcements")
+
+# Channels where staff can say "kick out <name>" to remove someone from both
+# Discord and the GitHub org in one shot. Env-overridable, defaulting to the IDs
+# actually in use so this works without extra Render config.
+ADMIN_TERMINAL_CHANNEL_ID = _int_env("ADMIN_TERMINAL_CHANNEL_ID") or 1437210346975924347  # #admin-terminal
+IT_KICK_LIST_CHANNEL_ID = _int_env("IT_KICK_LIST_CHANNEL_ID") or 1494803547957760000  # #it-kick-list
+KICK_OUT_COMMAND_CHANNEL_IDS = {
+    cid for cid in (SUPPORT_SESSIONS_CHANNEL_ID, ADMIN_TERMINAL_CHANNEL_ID, IT_KICK_LIST_CHANNEL_ID) if cid is not None
+}
+KICK_OUT_COMMAND_RE = re.compile(r"^\s*kick\s*(?:out)?\s+(.+)$", re.IGNORECASE)
 
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "0.0.0.0")
 WEBHOOK_PORT = int(os.getenv("PORT") or os.getenv("WEBHOOK_PORT", "8080"))
@@ -255,6 +267,11 @@ async def _maybe_auto_assign_ipca_roles(message: discord.Message) -> bool:
     if not (dev_role and available_role):
         return False
     if message.author.get_role(DEV_TEAM_ROLE_ID) and message.author.get_role(AVAILABLE_ROLE_ID):
+        try:
+            target_channel = message.thread or message.channel
+            await target_channel.send(f"{message.author.mention} You already have access.")
+        except Exception:
+            logger.exception("Failed to post IPCA already-has-access reply for %s", message.author.id)
         return False
     try:
         await message.author.add_roles(available_role, dev_role, reason="IPCA signed auto-assign")
@@ -285,6 +302,9 @@ async def _maybe_auto_assign_ipca_roles(message: discord.Message) -> bool:
     return True
 
 
+DEFAULT_CATCHUP_LOOKBACK_HOURS = 72
+
+
 async def _sweep_open_support_threads_for_ipca(target_bot: "DeepiriBot") -> None:
     """Catch up on IPCA-signed messages posted while the bot was offline (e.g.
     during a Cloudflare 1015 egress ban) — on_message only fires for live events,
@@ -311,6 +331,77 @@ async def _sweep_open_support_threads_for_ipca(target_bot: "DeepiriBot") -> None
             logger.exception("IPCA sweep: failed scanning thread %s", getattr(thread, "id", "?"))
     if assigned:
         logger.info("IPCA sweep: assigned roles to %s member(s) from %s open thread(s)", assigned, len(threads))
+
+
+async def _sweep_archived_support_threads_for_ipca(target_bot: "DeepiriBot", since) -> None:
+    """Companion to _sweep_open_support_threads_for_ipca: a ticket thread that gets
+    archived (staff marks it 'Handled') *while the bot is offline* is invisible to
+    the open-thread sweep, so an IPCA-signed message sitting in it would silently
+    never grant roles (this is exactly what happened to genericpro's ticket during
+    the 2026-08-31 downtime — archived at 02:49, bot didn't wake until 04:46).
+    Scans threads archived since the last-known-online checkpoint.
+    """
+    if SUPPORT_SESSIONS_CHANNEL_ID is None:
+        return
+    channel = target_bot.get_channel(SUPPORT_SESSIONS_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await target_bot.fetch_channel(SUPPORT_SESSIONS_CHANNEL_ID)
+        except Exception:
+            logger.exception("IPCA archived-sweep: could not resolve support-sessions channel")
+            return
+    assigned = 0
+    scanned = 0
+    try:
+        async for thread in channel.archived_threads(limit=100):
+            archived_at = getattr(thread, "archive_timestamp", None)
+            if archived_at is not None and archived_at < since:
+                # archived_threads() is newest-first, so once we're past `since` nothing older matters
+                break
+            scanned += 1
+            try:
+                async for msg in thread.history(limit=200, oldest_first=True):
+                    if await _maybe_auto_assign_ipca_roles(msg):
+                        assigned += 1
+            except Exception:
+                logger.exception("IPCA archived-sweep: failed scanning thread %s", getattr(thread, "id", "?"))
+    except Exception:
+        logger.exception("IPCA archived-sweep: failed listing archived threads")
+        return
+    if assigned or scanned:
+        logger.info(
+            "IPCA archived-sweep: assigned roles to %s member(s) from %s archived thread(s) since %s",
+            assigned, scanned, since,
+        )
+
+
+async def _catch_up_since_last_online(target_bot: "DeepiriBot") -> None:
+    """Runs once per successful login (before the heartbeat starts writing a fresh
+    checkpoint). Reads the persisted last-online checkpoint (survives Render
+    restarts — the disk itself doesn't) and replays anything missed, open or
+    archived, instead of relying on 'currently open' as a proxy for 'not yet
+    handled'. Falls back to a fixed lookback window if no checkpoint exists yet.
+    """
+    since = await load_last_online_at()
+    if since is None:
+        since = datetime.now(timezone.utc) - timedelta(hours=DEFAULT_CATCHUP_LOOKBACK_HOURS)
+        logger.info("No last-online checkpoint found; defaulting catch-up lookback to %sh", DEFAULT_CATCHUP_LOOKBACK_HOURS)
+    else:
+        logger.info("Catching up on missed activity since %s", since)
+
+    await _sweep_open_support_threads_for_ipca(target_bot)
+    await _sweep_archived_support_threads_for_ipca(target_bot, since)
+
+    await save_last_online_at()
+
+
+async def _heartbeat_last_online(interval_seconds: int = 300) -> None:
+    """Keeps the checkpoint fresh while alive, so a hard crash (no graceful
+    shutdown) still only loses a few minutes of catch-up window on next boot,
+    instead of however long since the last successful login."""
+    while True:
+        await asyncio.sleep(interval_seconds)
+        await save_last_online_at()
 
 
 def _validate_hmac_signature(
@@ -862,6 +953,96 @@ async def handle_discord_kick(interaction: discord.Interaction, member: discord.
                 pass
 
 
+def _resolve_kick_target(message: discord.Message, raw_target: str) -> Optional[discord.Member]:
+    if message.mentions:
+        return message.mentions[0]
+    guild = message.guild
+    if guild is None:
+        return None
+    needle = raw_target.strip().strip("@").strip('"').strip("'").lower()
+    if not needle:
+        return None
+    for candidate in guild.members:
+        names = {
+            str(getattr(candidate, "name", "") or "").lower(),
+            str(getattr(candidate, "display_name", "") or "").lower(),
+            str(getattr(candidate, "global_name", "") or "").lower(),
+        }
+        if needle in names:
+            return candidate
+    # Fall back to a substring match if no exact name matched
+    for candidate in guild.members:
+        names = " ".join(
+            str(getattr(candidate, attr, "") or "").lower()
+            for attr in ("name", "display_name", "global_name")
+        )
+        if needle in names:
+            return candidate
+    return None
+
+
+async def _maybe_handle_kick_out_command(message: discord.Message) -> bool:
+    """Staff saying 'kick out <name>' (or 'kick <name>') in #support-tickets,
+    #admin-terminal, or #it-kick-list removes the member from Discord AND the
+    GitHub org in one shot, instead of needing /discord-kick + /offboard-user
+    separately. Returns True if this message was handled as a kick command."""
+    if message.guild is None or message.channel.id not in KICK_OUT_COMMAND_CHANNEL_IDS:
+        return False
+    match = KICK_OUT_COMMAND_RE.match(message.content or "")
+    if not match:
+        return False
+    if not isinstance(message.author, discord.Member) or not _is_staff(message.author):
+        return False
+
+    target = _resolve_kick_target(message, match.group(1))
+    if target is None:
+        await message.channel.send(f"{message.author.mention} Couldn't find that member to kick.")
+        return True
+    if target.id == message.author.id:
+        await message.channel.send(f"{message.author.mention} You cannot kick yourself.")
+        return True
+    if target.guild_permissions.administrator or (STAFF_ROLE_ID is not None and target.get_role(STAFF_ROLE_ID) is not None):
+        await message.channel.send(f"{message.author.mention} Cannot kick an Admin/staff member this way.")
+        return True
+
+    reason = f"Kicked by {message.author} via kick-out command in #{getattr(message.channel, 'name', message.channel.id)}"[:512]
+
+    discord_ok = True
+    try:
+        await target.kick(reason=reason)
+    except discord.Forbidden:
+        discord_ok = False
+        await message.channel.send(f"{message.author.mention} I don't have permission to kick {target.mention} (check my role position).")
+    except Exception:
+        discord_ok = False
+        logger.exception("Failed to kick member %s via kick-out command", target.id)
+        await message.channel.send(f"{message.author.mention} Failed to kick {target.mention} from Discord.")
+
+    github_username = _get_github_username_for_member(target)
+    github_ok = False
+    github_note = "no mapped GitHub username, skipped"
+    if github_username:
+        org_result = remove_user_from_org(username=github_username, github_org=GITHUB_ORG, github_pat=GITHUB_PAT)
+        github_ok = bool(org_result.get("ok"))
+        github_note = github_username if github_ok else f"{github_username} — {org_result.get('message')}"
+        if not github_ok:
+            logger.warning("GitHub org removal failed for %s during kick-out: %s", github_username, org_result.get("message"))
+
+    summary = (
+        f"{'✅' if discord_ok else '⚠️'} Discord kick: {target} ({target.id})\n"
+        f"{'✅' if github_ok else '⚠️'} GitHub org removal: {github_note}"
+    )
+    await message.channel.send(summary)
+    if STAFF_CHANNEL_ID:
+        log_channel = await _channel_from_id(STAFF_CHANNEL_ID)
+        if log_channel:
+            try:
+                await log_channel.send(f"{message.author.mention} kicked {target} ({target.id}) via kick-out command.\n{summary}")
+            except Exception:
+                pass
+    return True
+
+
 async def handle_ipca_signed(interaction: discord.Interaction, github_username: str) -> None:
     if not isinstance(interaction.user, discord.Member) or not _can_dispatch_ipca_signed(interaction.user):
         await interaction.response.send_message(
@@ -1248,6 +1429,102 @@ async def platform_announcement_handler(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+_ALERT_SEVERITY_COLORS = {
+    "critical": discord.Color.dark_red(),
+    "error": discord.Color.red(),
+    "warning": discord.Color.orange(),
+    "info": discord.Color.blue(),
+}
+
+
+async def _dm_role_members(role_id: int, embed: discord.Embed) -> int:
+    """Critical alerts don't wait for someone to be looking at #it-notifications —
+    DM every member holding the given role (Security & Operations Support) directly.
+    Best-effort per member: one blocked-DMs member shouldn't stop the rest."""
+    guild = None
+    for candidate_channel_id in (STAFF_CHANNEL_ID, SUPPORT_SESSIONS_CHANNEL_ID, ANNOUNCEMENTS_CHANNEL_ID):
+        channel = await _channel_from_id(candidate_channel_id)
+        if channel is not None and getattr(channel, "guild", None) is not None:
+            guild = channel.guild
+            break
+    if guild is None:
+        logger.warning("Could not resolve a guild to DM role %s for a critical alert", role_id)
+        return 0
+
+    role = guild.get_role(role_id)
+    if role is None:
+        logger.warning("Role %s not found in guild %s; cannot DM for critical alert", role_id, guild.id)
+        return 0
+
+    sent = 0
+    for member in role.members:
+        try:
+            await member.send(embed=embed)
+            sent += 1
+        except Exception:
+            logger.warning("Could not DM %s (%s) for critical alert", member, member.id)
+    return sent
+
+
+async def platform_alert_handler(request: web.Request) -> web.Response:
+    """Inbound webhook for platform.deepiri.com system/security notifications
+    (auth failures, webhook signature rejections, backend errors, etc.) -> posted
+    into #it-notifications (STAFF_CHANNEL_ID). Same signed-webhook scheme as the
+    announcements bridge — shares ANNOUNCEMENTS_INBOUND_SECRET since it's the same
+    trust boundary (platform.deepiri.com talking to Norozo).
+    """
+    raw_body = await request.read()
+
+    if not ANNOUNCEMENTS_INBOUND_SECRET:
+        logger.error("Platform alert webhook disabled: ANNOUNCEMENTS_INBOUND_SECRET is not configured")
+        return web.json_response({"ok": False, "message": "Webhook authentication is not configured"}, status=503)
+
+    sig_header = (
+        request.headers.get("X-Norozo-Signature")
+        or request.headers.get("X-Platform-Signature")
+        or ""
+    )
+    if not sig_header or not _is_valid_announcement_signature(raw_body, sig_header, ANNOUNCEMENTS_INBOUND_SECRET):
+        return web.json_response({"ok": False, "message": "Missing or invalid signature"}, status=401)
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except Exception:
+        return web.json_response({"ok": False, "message": "Invalid JSON"}, status=400)
+
+    title = str(payload.get("title") or "Platform Alert").strip()[:256]
+    message_text = str(payload.get("message") or payload.get("body") or "").strip()
+    service = str(payload.get("service") or "platform.deepiri.com").strip()
+    severity = str(payload.get("severity") or "info").strip().lower()
+    if not message_text:
+        return web.json_response({"ok": False, "message": "Missing message/body"}, status=400)
+
+    if STAFF_CHANNEL_ID is None:
+        return web.json_response({"ok": False, "message": "STAFF_CHANNEL_ID not configured"}, status=500)
+    channel = await _channel_from_id(STAFF_CHANNEL_ID)
+    if not channel:
+        return web.json_response({"ok": False, "message": "it-notifications channel not found"}, status=500)
+
+    embed = discord.Embed(
+        title=title,
+        description=message_text[:4000],
+        color=_ALERT_SEVERITY_COLORS.get(severity, discord.Color.blue()),
+    )
+    embed.set_footer(text=f"{service} • {severity.upper()}")
+
+    try:
+        await channel.send(embed=embed)
+    except Exception:
+        logger.exception("Failed to post platform alert to Discord")
+        return web.json_response({"ok": False, "message": "Failed to post to Discord"}, status=500)
+
+    dm_count = 0
+    if severity == "critical" and IT_OPERATIONS_SUPPORT_ROLE_ID is not None:
+        dm_count = await _dm_role_members(IT_OPERATIONS_SUPPORT_ROLE_ID, embed)
+
+    return web.json_response({"ok": True, "dmed": dm_count})
+
+
 async def health_handler(_: web.Request) -> web.Response:
     announcement_webhook_ready = bool(ANNOUNCEMENTS_INBOUND_SECRET)
     return web.json_response(
@@ -1266,6 +1543,8 @@ async def start_webhook_server() -> None:
     app.router.add_post("/announcements/webhook", platform_announcement_handler)
     app.router.add_post("/platform/announcements", platform_announcement_handler)
     app.router.add_post("/webhooks/platform-announcements", platform_announcement_handler)
+    app.router.add_post("/alerts/webhook", platform_alert_handler)
+    app.router.add_post("/webhooks/platform-alerts", platform_alert_handler)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -1314,7 +1593,8 @@ def _create_and_register_bot() -> DeepiriBot:
             new_bot.meeting_service.start_loop()  # type: ignore[attr-defined]
         except Exception:
             logger.exception("Failed to start meeting loop")
-        asyncio.create_task(_sweep_open_support_threads_for_ipca(new_bot))
+        asyncio.create_task(_catch_up_since_last_online(new_bot))
+        asyncio.create_task(_heartbeat_last_online())
 
     @new_bot.event  # type: ignore[attr-defined]
     async def on_member_join(member: discord.Member) -> None:  # type: ignore[no-redef]
@@ -1370,6 +1650,9 @@ def _create_and_register_bot() -> DeepiriBot:
             return
         content = message.content or ""
         await notify_support_team_for_message(message)
+        if await _maybe_handle_kick_out_command(message):
+            await new_bot.process_commands(message)
+            return
         await _maybe_auto_assign_ipca_roles(message)
         if _is_announcements_channel(message.channel):
             title = format_discussion_title(message.content)
