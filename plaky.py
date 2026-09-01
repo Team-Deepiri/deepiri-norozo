@@ -4,6 +4,8 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
+from identity_match import best_match
+
 
 PLAKY_API_BASE = os.getenv("PLAKY_API_BASE", "https://api.plaky.com/v2")
 
@@ -76,6 +78,66 @@ def create_task(title: str, description: str, priority: str, api_key: str) -> Di
         "status": response.status_code,
         "message": f"Failed to create Plaky task ({response.status_code}): {response.text[:200]}",
     }
+
+
+def _user_emails(user: Dict[str, Any]) -> List[str]:
+    """Mirrors deepiri-boardman's identity_common.plaky_email_addresses — Plaky user
+    records aren't consistent about which field carries the email, so check all the
+    field names boardman's own matcher has already had to account for."""
+    out: List[str] = []
+    for key in ("email", "primaryEmail", "mail", "userEmail"):
+        v = user.get(key)
+        if isinstance(v, str) and v.strip():
+            out.append(v.strip())
+    raw_list = user.get("emails")
+    if isinstance(raw_list, list):
+        for item in raw_list:
+            if isinstance(item, str) and item.strip():
+                out.append(item.strip())
+            elif isinstance(item, dict):
+                ev = item.get("email") or item.get("value")
+                if isinstance(ev, str) and ev.strip():
+                    out.append(ev.strip())
+    return out
+
+
+def find_user_email_by_name(name: str, api_key: str) -> Optional[str]:
+    """Best-effort: Plaky's public API docs describe GET /users but say it requires
+    admin/project-owner privileges, and don't document a board-membership-by-name
+    lookup. Try it and fail quietly (403/anything-but-200) rather than treating an
+    unverified endpoint as guaranteed — callers should already have a fallback.
+
+    Uses scored fuzzy name matching (identity_match.best_match) instead of exact
+    equality — same philosophy as deepiri-boardman's person_match: a clear winner
+    or nothing, never a guess on a near-tie between two different people.
+    """
+    if not api_key or not name:
+        return None
+    if not name.strip():
+        return None
+    try:
+        response = _request_with_rate_limit_retry("GET", f"{PLAKY_API_BASE}/users", headers=_headers(api_key))
+    except requests.RequestException:
+        return None
+    if response.status_code != 200:
+        return None
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    users = payload if isinstance(payload, list) else payload.get("users", [])
+    if not users:
+        return None
+
+    display_names = [
+        str(user.get("name") or user.get("displayName") or user.get("username") or "")
+        for user in users
+    ]
+    match = best_match(name, display_names)
+    if match is None:
+        return None
+    emails = _user_emails(users[match.index])
+    return emails[0] if emails else None
 
 
 def get_tasks(api_key: str, status: str = "open") -> Dict[str, Any]:

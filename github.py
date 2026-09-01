@@ -69,6 +69,23 @@ def _get_user_id(username: str, github_pat: str) -> Dict[str, Any]:
     return {"ok": True, "user_id": payload.get("id")}
 
 
+def get_user_email(username: str, github_pat: str) -> Optional[str]:
+    """GitHub only returns `email` here if the user has made it public on their
+    profile — most don't, so this is a best-effort source, not a guaranteed one."""
+    if not username or not github_pat:
+        return None
+    headers = {
+        "Authorization": f"Bearer {github_pat}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    url = f"{GITHUB_API_BASE}/users/{username}"
+    response = _request_with_rate_limit_retry("GET", url, headers=headers)
+    if response.status_code != 200:
+        return None
+    return response.json().get("email") or None
+
+
 def add_user_to_team(username: str, github_org: str, github_pat: str, team_slug: str) -> Dict[str, Any]:
     """Add a GitHub user to a team in the configured org by username."""
     normalized_org = _normalize_org_name(github_org)
