@@ -20,7 +20,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 from bot import format_discussion_body, format_discussion_title
-from github import add_user_to_team, invite_user, remove_user_from_org, remove_user_from_team
+from github import add_user_to_team, invite_user, is_org_member, remove_user_from_org, remove_user_from_team
 from github_discussion import GitHubDiscussionError, create_github_discussion
 from meetings import setup_meeting_features
 from onboarding import ApprovalView
@@ -476,6 +476,36 @@ def _get_github_username_for_member(member: discord.Member) -> Optional[str]:
             # Only use if single word
             if " " not in candidate.strip():
                 return candidate.strip().lower()
+    return None
+
+
+async def _find_github_username_in_profiles_channel(member: discord.Member) -> Optional[str]:
+    """Fallback when there's no explicit mapping and the name-guess heuristic fails:
+    scan #github-profiles for a message *authored by this exact member* containing
+    their GitHub profile link (that's what the channel is for — no fuzzy name
+    matching needed, just match by author.id), then verify the extracted username
+    is an actual member of GITHUB_ORG before trusting it — a stale/wrong link
+    shouldn't silently pass through into a destructive op like org removal.
+    """
+    if GITHUB_PROFILES_CHANNEL_ID is None:
+        return None
+    channel = await _channel_from_id(GITHUB_PROFILES_CHANNEL_ID)
+    if channel is None:
+        return None
+    try:
+        async for msg in channel.history(limit=1000):
+            if msg.author.id != member.id:
+                continue
+            candidate = _extract_github_profile_username(msg.content or "")
+            if not candidate:
+                continue
+            if not await asyncio.to_thread(is_org_member, candidate, GITHUB_ORG, GITHUB_PAT):
+                logger.warning("Found GitHub link %s for %s in #github-profiles but they're not in %s", candidate, member.id, GITHUB_ORG)
+                continue
+            _remember_github_username(member.id, candidate)
+            return candidate
+    except Exception:
+        logger.exception("Failed scanning #github-profiles for member %s", member.id)
     return None
 
 
@@ -1019,6 +1049,13 @@ async def _maybe_handle_kick_out_command(message: discord.Message) -> bool:
         await message.channel.send(f"{message.author.mention} Failed to kick {target.mention} from Discord.")
 
     github_username = _get_github_username_for_member(target)
+    if github_username and not await asyncio.to_thread(is_org_member, github_username, GITHUB_ORG, GITHUB_PAT):
+        # The mapping/name-guess isn't actually in the org roster — don't trust it for
+        # a destructive op, fall through to searching #github-profiles instead.
+        logger.warning("Mapped/guessed GitHub username %s for %s is not in %s; falling back to #github-profiles", github_username, target.id, GITHUB_ORG)
+        github_username = None
+    if not github_username:
+        github_username = await _find_github_username_in_profiles_channel(target)
     github_ok = False
     github_note = "no mapped GitHub username, skipped"
     if github_username:
