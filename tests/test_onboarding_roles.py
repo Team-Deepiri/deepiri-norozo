@@ -64,6 +64,54 @@ def test_it_query_never_matches_any_real_category():
     assert match is None
 
 
+def test_security_and_operations_support_excluded_by_fuzzy_name_not_just_id():
+    """The real elevated role is named 'Security & Operations Support', not
+    literally 'IT' -- must be excluded by fuzzy confidence against the known
+    name, without requiring a role ID to be configured."""
+    guild = SimpleNamespace(roles=[_role("Security & Operations Support"), _role("Backend Engineer")])
+    candidates = main._candidate_roles_by_category(guild)
+    assert "Backend Engineer" in candidates
+    assert all("operations support" not in r.name.lower() for r in candidates.values())
+
+
+@pytest.mark.asyncio
+async def test_plain_security_still_resolves_to_cloud_infra_security_engineer(monkeypatch):
+    """Regression: the elevated-role guard must not fire before the real role
+    match is attempted -- typing "Security" alone is a legitimate pick for
+    Cloud/Infra/Security Engineer and must not get blocked as if it were an
+    attempt at Security & Operations Support."""
+    security_engineer = _role("Cloud/Infra/Security Engineer")
+    elevated = _role("Security & Operations Support")
+    guild = SimpleNamespace(roles=[security_engineer, elevated], get_member=lambda uid: _member())
+    monkeypatch.setattr(main, "_get_primary_guild", AsyncMock(return_value=guild))
+
+    author = SimpleNamespace(id=999, bot=False, __str__=lambda self: "tester#0")
+    channel = SimpleNamespace(send=AsyncMock())
+    message = SimpleNamespace(guild=None, author=author, content="Security", channel=channel)
+
+    handled = await main._maybe_handle_onboarding_dm(message)
+
+    assert handled is True
+    sent_text = channel.send.call_args[0][0]
+    assert "Cloud/Infra/Security Engineer" in sent_text
+    assert "not self-assignable" not in sent_text
+
+
+@pytest.mark.asyncio
+async def test_security_ops_support_reply_still_gets_guidance_not_assigned(monkeypatch):
+    guild = SimpleNamespace(roles=[_role("Backend Engineer"), _role("Security & Operations Support")], get_member=lambda uid: _member())
+    monkeypatch.setattr(main, "_get_primary_guild", AsyncMock(return_value=guild))
+
+    author = SimpleNamespace(id=999, bot=False, __str__=lambda self: "tester#0")
+    channel = SimpleNamespace(send=AsyncMock())
+    message = SimpleNamespace(guild=None, author=author, content="Security & Operations Support", channel=channel)
+
+    handled = await main._maybe_handle_onboarding_dm(message)
+
+    assert handled is True
+    assert "isn't self-assignable" in channel.send.call_args[0][0]
+
+
 def _member(roles=None):
     return SimpleNamespace(roles=roles or [], add_roles=AsyncMock())
 
