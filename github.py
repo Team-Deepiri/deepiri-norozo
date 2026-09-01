@@ -164,6 +164,36 @@ def is_org_member(username: str, github_org: str, github_pat: str) -> bool:
     return response.status_code == 204
 
 
+def list_org_members(github_org: str, github_pat: str) -> list:
+    """Full org roster (paginated), for fuzzy-matching a Discord name against
+    when there's no explicit mapping and #github-profiles has nothing for them.
+    Last-resort source -- GitHub logins are often nothing like a real name, but
+    when they overlap (a shortened Discord handle vs a fuller GitHub login) it's
+    worth trying rather than giving up."""
+    normalized_org = _normalize_org_name(github_org)
+    if not github_pat or not normalized_org:
+        return []
+    headers = {
+        "Authorization": f"Bearer {github_pat}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    usernames: list = []
+    url = f"{GITHUB_API_BASE}/orgs/{normalized_org}/members?per_page=100"
+    while url:
+        response = _request_with_rate_limit_retry("GET", url, headers=headers)
+        if response.status_code != 200:
+            break
+        usernames.extend(u.get("login") for u in response.json() if u.get("login"))
+        next_url = None
+        link_header = response.headers.get("Link", "")
+        for part in link_header.split(","):
+            if 'rel="next"' in part:
+                next_url = part[part.find("<") + 1 : part.find(">")]
+        url = next_url
+    return usernames
+
+
 def remove_user_from_org(username: str, github_org: str, github_pat: str) -> Dict[str, Any]:
     """Remove a GitHub user from the configured org by username."""
     normalized_org = _normalize_org_name(github_org)
