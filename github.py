@@ -131,6 +131,22 @@ def add_user_to_team(username: str, github_org: str, github_pat: str, team_slug:
     }
 
 
+def is_org_member(username: str, github_org: str, github_pat: str) -> bool:
+    """Check the actual org roster rather than trusting a guessed/extracted username —
+    GET /orgs/{org}/members/{username} returns 204 if they're a member, 404 otherwise."""
+    normalized_org = _normalize_org_name(github_org)
+    if not github_pat or not normalized_org or not username:
+        return False
+    headers = {
+        "Authorization": f"Bearer {github_pat}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    url = f"{GITHUB_API_BASE}/orgs/{normalized_org}/members/{username}"
+    response = _request_with_rate_limit_retry("GET", url, headers=headers)
+    return response.status_code == 204
+
+
 def remove_user_from_org(username: str, github_org: str, github_pat: str) -> Dict[str, Any]:
     """Remove a GitHub user from the configured org by username."""
     normalized_org = _normalize_org_name(github_org)
