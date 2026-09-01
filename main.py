@@ -22,9 +22,11 @@ from dotenv import load_dotenv
 from bot import format_discussion_body, format_discussion_title
 from emailer import send_email
 from github import add_user_to_team, get_user_email, invite_user, is_org_member, remove_user_from_org, remove_user_from_team
+from identity_match import best_match
 from github_discussion import GitHubDiscussionError, create_github_discussion
 from meetings import setup_meeting_features
 from onboarding import ApprovalView
+from member_email_store import load_member_email, save_member_email
 from plaky import create_task, find_user_email_by_name, get_tasks
 from state_store import load_last_online_at, save_last_online_at
 
@@ -110,6 +112,28 @@ URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 PR_URL_RE = re.compile(r"https?://(?:www\.)?github\.com/[^\s]+/[^\s]+/pull/(\d+)", re.IGNORECASE)
 PLAKY_URL_RE = re.compile(r"https?://(?:www\.)?app\.plaky\.com/\S+", re.IGNORECASE)
 GITHUB_USERNAME_RE = re.compile(r"^[A-Za-z\d](?:[A-Za-z\d-]{0,37}[A-Za-z\d])?$")
+EMAIL_SEARCH_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+
+# New-member onboarding: DM asks for email + role, each reply classified
+# independently (no conversation state to track/lose on a restart). IT is
+# excluded by name before any fuzzy scoring runs -- it has elevated permissions
+# and must never be self-assignable through this flow.
+_IT_ROLE_WORD_RE = re.compile(r"\bit\b", re.IGNORECASE)
+_ROLE_CATEGORY_PATTERNS = [
+    ("AI Engineer", [re.compile(r"\bai\b", re.IGNORECASE)], False),
+    ("ML Engineer", [re.compile(r"\bml\b", re.IGNORECASE), re.compile(r"\bmachine\s+learning\b", re.IGNORECASE)], False),
+    ("Data Engineer", [re.compile(r"\bdata\b", re.IGNORECASE)], False),
+    ("Cloud/Infra/Security Engineer", [re.compile(r"\b(cloud|infra(structure)?|security)\b", re.IGNORECASE)], True),
+    ("Frontend Engineer", [re.compile(r"\bfront[-\s]?end\b", re.IGNORECASE)], False),
+    ("Fullstack Engineer", [re.compile(r"\bfull[-\s]?stack\b", re.IGNORECASE)], False),
+    ("Backend Engineer", [re.compile(r"\bback[-\s]?end\b", re.IGNORECASE)], False),
+]
+_ENGINEER_WORD_RE = re.compile(r"\bengineer\b", re.IGNORECASE)
+_ROLE_ATTEMPT_HINT_RE = re.compile(
+    r"\b(ai|ml|data|cloud|infra|infrastructure|security|frontend|front-end|front end|"
+    r"fullstack|full-stack|full stack|backend|back-end|back end|engineer|developer|dev|role|team|it)\b",
+    re.IGNORECASE,
+)
 GITHUB_RESERVED_PATHS = {
     "about",
     "account",
@@ -1045,15 +1069,16 @@ def _termination_notice_text(display_name: str) -> str:
 
 
 async def _send_termination_notice(target: discord.Member, github_username: Optional[str]) -> str:
-    """Resolve an email for the kicked member (GitHub public email -> best-effort
-    Plaky lookup -> Discord DM as last resort) and send the termination notice.
-    Returns a short human-readable outcome string for the kick-out summary.
+    """Resolve an email for the kicked member (self-reported at join -> GitHub
+    public email -> best-effort Plaky lookup -> Discord DM as last resort) and
+    send the termination notice. Returns a short human-readable outcome string
+    for the kick-out summary.
     """
     body = _termination_notice_text(target.display_name)
     subject = "Notice of Termination — Deepiri Contributor Agreement"
 
-    email = None
-    if github_username:
+    email = await load_member_email(target.id)
+    if not email and github_username:
         email = await asyncio.to_thread(get_user_email, github_username, GITHUB_PAT)
     if not email and PLAKY_API_KEY:
         for candidate_name in (target.display_name, str(getattr(target, "global_name", "") or ""), str(target.name)):
@@ -1073,6 +1098,108 @@ async def _send_termination_notice(target: discord.Member, github_username: Opti
     except Exception:
         logger.exception("Failed to DM termination notice to %s", target.id)
         return "could not deliver notice via email or DM"
+
+
+def _candidate_roles_by_category(guild: discord.Guild) -> "dict[str, discord.Role]":
+    """One representative role per category, resolved live from the guild's actual
+    role list every time (no IDs to configure/maintain). IT is excluded by name
+    before any fuzzy scoring runs -- never a self-service candidate, elevated
+    permissions. Cloud/Infra/Security additionally requires "Engineer" in the
+    name to qualify, per how that category is actually named in this server."""
+    result: "dict[str, discord.Role]" = {}
+    for role in guild.roles:
+        name = role.name
+        if _IT_ROLE_WORD_RE.search(name):
+            continue
+        for label, patterns, requires_engineer in _ROLE_CATEGORY_PATTERNS:
+            if label in result:
+                continue
+            if requires_engineer and not _ENGINEER_WORD_RE.search(name):
+                continue
+            if any(p.search(name) for p in patterns):
+                result[label] = role
+    return result
+
+
+async def _maybe_handle_onboarding_dm(message: discord.Message) -> bool:
+    """Classify a DM from (possibly) a new member, stateless: any DM at any time
+    can be an email or a role pick, checked independently, no conversation state
+    to track or lose on a restart. Only replies when the content plausibly looks
+    like an attempt at one of these -- otherwise stays silent, so Norozo doesn't
+    start responding to unrelated DMs with onboarding noise.
+    """
+    if message.guild is not None or message.author.bot:
+        return False
+    content = (message.content or "").strip()
+    if not content:
+        return False
+
+    email_match = EMAIL_SEARCH_RE.search(content)
+    if email_match:
+        email = email_match.group(0)
+        ok = await save_member_email(message.author.id, str(message.author), email)
+        if ok:
+            await message.channel.send(f"Got it — saved {email} on file. Thanks!")
+        else:
+            logger.error("Failed to persist member email for %s", message.author.id)
+            await message.channel.send("Got your email but couldn't save it right now — please try sending it again shortly.")
+        return True
+
+    # Self-reported GitHub username, most reliable source there is for kick-out's
+    # GitHub org removal — checked ahead of the #github-profiles channel scan and
+    # the display-name guess heuristic (_get_github_username_for_member already
+    # checks this mapping first). Restricted to an actual github.com link here
+    # (not _extract_github_profile_username's bare-word fallback, which would
+    # otherwise swallow a plain role pick like "Backend" or "AI" as if it were
+    # a username before role-matching ever got a chance to run).
+    github_username = _extract_github_profile_username(content) if "github.com" in content.lower() else None
+    if github_username:
+        _remember_github_username(message.author.id, github_username)
+        await message.channel.send(f"Got it — linked your GitHub as **{github_username}**.")
+        return True
+
+    guild = await _get_primary_guild()
+    if guild is None:
+        return False
+    member = guild.get_member(message.author.id)
+    if member is None:
+        return False
+
+    if _IT_ROLE_WORD_RE.search(content):
+        await message.channel.send(
+            "The IT role isn't self-assignable (it has elevated permissions) — "
+            "please contact staff directly if you need it."
+        )
+        return True
+
+    candidates = _candidate_roles_by_category(guild)
+    if not candidates:
+        return False
+    labels = list(candidates.keys())
+    match = best_match(content, labels)
+    if match is not None:
+        role = candidates[labels[match.index]]
+        if role in member.roles:
+            await message.channel.send(f"You already have the {role.name} role.")
+            return True
+        try:
+            await member.add_roles(role, reason="Self-selected via onboarding DM")
+        except Exception:
+            logger.exception("Failed to add role %s to %s via onboarding DM", role.id, member.id)
+            await message.channel.send(f"Matched you to {role.name} but couldn't assign it — please contact staff.")
+            return True
+        await message.channel.send(f"Added you to the {role.name} role!")
+        return True
+
+    if _ROLE_ATTEMPT_HINT_RE.search(content):
+        options = ", ".join(labels) if labels else "no roles currently configured"
+        await message.channel.send(
+            f"Couldn't confidently match a role from that. Options: {options}. "
+            "Try replying with just the team name, e.g. \"Backend\"."
+        )
+        return True
+
+    return False
 
 
 async def _maybe_handle_kick_out_command(message: discord.Message) -> bool:
@@ -1574,16 +1701,21 @@ _DEFAULT_ALERT_STEPS = {
 }
 
 
+async def _get_primary_guild() -> Optional[discord.Guild]:
+    """This bot only ever operates in one guild; there's no GUILD_ID env var, so
+    resolve it via any well-known channel instead."""
+    for candidate_channel_id in (STAFF_CHANNEL_ID, SUPPORT_SESSIONS_CHANNEL_ID, ANNOUNCEMENTS_CHANNEL_ID):
+        channel = await _channel_from_id(candidate_channel_id)
+        if channel is not None and getattr(channel, "guild", None) is not None:
+            return channel.guild
+    return None
+
+
 async def _dm_role_members(role_id: int, embed: discord.Embed) -> int:
     """Critical alerts don't wait for someone to be looking at #it-notifications —
     DM every member holding the given role (Security & Operations Support) directly.
     Best-effort per member: one blocked-DMs member shouldn't stop the rest."""
-    guild = None
-    for candidate_channel_id in (STAFF_CHANNEL_ID, SUPPORT_SESSIONS_CHANNEL_ID, ANNOUNCEMENTS_CHANNEL_ID):
-        channel = await _channel_from_id(candidate_channel_id)
-        if channel is not None and getattr(channel, "guild", None) is not None:
-            guild = channel.guild
-            break
+    guild = await _get_primary_guild()
     if guild is None:
         logger.warning("Could not resolve a guild to DM role %s for a critical alert", role_id)
         return 0
@@ -1749,7 +1881,10 @@ def _create_and_register_bot() -> DeepiriBot:
         try:
             await member.send(
                 "Welcome to Deepiri. Before joining the DEV team, please sign the IPCA. "
-                "After signing, run /github-invite-request in the support tickets channel so IT/staff can approve your GitHub invite."
+                "After signing, run /github-invite-request in the support tickets channel so IT/staff can approve your GitHub invite.\n\n"
+                "Also, reply here with your email so we can keep it on file, your GitHub profile link, "
+                "and which team you're on: AI, ML, Data, Cloud/Infra/Security Engineer, Frontend, Fullstack, or Backend. "
+                "You can send these as separate messages, in any order."
             )
         except discord.Forbidden:
             pass
@@ -1790,6 +1925,10 @@ def _create_and_register_bot() -> DeepiriBot:
     @new_bot.event  # type: ignore[attr-defined]
     async def on_message(message: discord.Message) -> None:  # type: ignore[no-redef]
         if message.author.bot:
+            return
+        if message.guild is None:
+            await _maybe_handle_onboarding_dm(message)
+            await new_bot.process_commands(message)
             return
         content = message.content or ""
         await notify_support_team_for_message(message)
