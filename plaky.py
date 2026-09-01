@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 import time
@@ -6,6 +7,9 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from identity_match import best_match
+
+
+logger = logging.getLogger("deepiri.plaky")
 
 
 PLAKY_API_BASE = os.getenv("PLAKY_API_BASE", "https://api.plaky.com/v2")
@@ -121,21 +125,30 @@ def find_user_email_by_name(name: str, api_key: str) -> Optional[str]:
     or nothing, never a guess on a near-tie between two different people.
     """
     if not api_key or not name:
+        logger.warning("find_user_email_by_name: missing api_key or name (name=%r)", name)
         return None
     if not name.strip():
+        logger.warning("find_user_email_by_name: name is blank after strip")
         return None
     try:
         response = _request_with_rate_limit_retry("GET", f"{PLAKY_API_BASE}/users", headers=_headers(api_key))
     except requests.RequestException:
+        logger.exception("find_user_email_by_name: GET /users request failed")
         return None
     if response.status_code != 200:
+        logger.warning(
+            "find_user_email_by_name: GET /users returned %s for query %r: %s",
+            response.status_code, name, response.text[:300],
+        )
         return None
     try:
         payload = response.json()
     except ValueError:
+        logger.warning("find_user_email_by_name: GET /users returned non-JSON body")
         return None
     users = payload if isinstance(payload, list) else payload.get("users", [])
     if not users:
+        logger.warning("find_user_email_by_name: GET /users returned zero users (query=%r)", name)
         return None
 
     display_names = [
@@ -156,8 +169,15 @@ def find_user_email_by_name(name: str, api_key: str) -> Optional[str]:
         if leading_query:
             match = best_match(leading_query, leading_candidates)
     if match is None:
+        logger.warning(
+            "find_user_email_by_name: no confident match for %r among %s Plaky users (sample: %s)",
+            name, len(users), display_names[:10],
+        )
         return None
+    logger.info("find_user_email_by_name: matched %r -> %r (score=%s)", name, display_names[match.index], match.score)
     emails = _user_emails(users[match.index])
+    if not emails:
+        logger.warning("find_user_email_by_name: matched %r but that Plaky user has no email field set", display_names[match.index])
     return emails[0] if emails else None
 
 
