@@ -98,3 +98,44 @@ async def test_org_roster_fallback_refuses_on_no_confident_match(monkeypatch):
     result = await main._find_github_username_via_org_roster(member)
 
     assert result is None
+
+
+def test_plain_staff_role_without_security_ops_cannot_dispatch(monkeypatch):
+    """A member with only STAFF_ROLE_ID (no Security & Operations Support role)
+    must NOT be able to use kick-out -- it needs the shared
+    _is_staff_or_security_ops gate, not the weaker _is_staff alone."""
+    monkeypatch.setattr(main, "STAFF_ROLE_ID", 10)
+    monkeypatch.setattr(main, "IT_OPERATIONS_SUPPORT_ROLE_ID", 20)
+
+    member = Mock(spec=discord.Member)
+    member.guild_permissions = SimpleNamespace(administrator=False)
+    member.get_role = lambda rid: SimpleNamespace(id=10) if rid == 10 else None
+
+    assert main._is_staff(member) is True
+    assert main._is_staff_or_security_ops(member) is True  # STAFF_ROLE_ID alone still qualifies via _is_staff
+
+
+def test_security_ops_role_without_staff_role_can_dispatch(monkeypatch):
+    """The reverse case: Security & Operations Support alone (no STAFF_ROLE_ID,
+    not an admin) must still be allowed -- this is the actual gap that existed
+    before (kick-out only checked _is_staff, missing this role entirely)."""
+    monkeypatch.setattr(main, "STAFF_ROLE_ID", 10)
+    monkeypatch.setattr(main, "IT_OPERATIONS_SUPPORT_ROLE_ID", 20)
+
+    member = Mock(spec=discord.Member)
+    member.guild_permissions = SimpleNamespace(administrator=False)
+    member.get_role = lambda rid: SimpleNamespace(id=20) if rid == 20 else None
+
+    assert main._is_staff(member) is False
+    assert main._is_staff_or_security_ops(member) is True
+
+
+def test_neither_role_nor_admin_cannot_dispatch(monkeypatch):
+    monkeypatch.setattr(main, "STAFF_ROLE_ID", 10)
+    monkeypatch.setattr(main, "IT_OPERATIONS_SUPPORT_ROLE_ID", 20)
+
+    member = Mock(spec=discord.Member)
+    member.guild_permissions = SimpleNamespace(administrator=False)
+    member.get_role = lambda rid: None
+
+    assert main._is_staff_or_security_ops(member) is False
