@@ -27,7 +27,7 @@ from github_discussion import GitHubDiscussionError, create_github_discussion
 from meetings import setup_meeting_features
 from onboarding import ApprovalView
 from member_email_store import load_member_email, save_member_email
-from pr_staleness_store import find_discord_id_by_email, load_pr_staleness, save_pr_staleness
+from pr_staleness_store import claim_pr_staleness_1month, find_discord_id_by_email, load_pr_staleness, save_pr_staleness
 from plaky import create_task, find_user_email, get_tasks
 from state_store import load_last_online_at, save_last_online_at
 
@@ -87,7 +87,7 @@ KICK_OUT_COMMAND_RE = re.compile(r"^\s*kick\s*(?:out)?\s+(.+)$", re.IGNORECASE)
 # PR staleness escalation: 2 weeks -> #qa-support-team (one-time, includes the
 # assigned QA reviewer), 2.5 weeks -> recurring DM to the author AND, separately,
 # to any assigned QA reviewer who hasn't reviewed yet (cadence tightens with
-# age), 1 month -> #announcements (public, one-time -- never repeats no matter
+# age), 2.5 months -> #announcements (public, one-time -- never repeats no matter
 # how much older the PR gets).
 # Env-overridable, defaulting to the IDs actually in use.
 PR_STALE_QA_CHANNEL_ID = _int_env("PR_STALE_QA_CHANNEL_ID") or 1438705614649032755  # #qa-support-team
@@ -105,7 +105,8 @@ PR_STALE_EXCLUDED_AUTHORS_PER_REPO = {"diva": {"jrb00013"}}
 PR_STALE_2WEEK_DAYS = 14
 PR_STALE_2_5WEEK_DAYS = 17.5  # when the recurring author/QA-reviewer DMs start
 PR_STALE_3WEEK_DAYS = 21
-PR_STALE_1MONTH_DAYS = 30
+PR_STALE_DM_DAILY_DAYS = 30  # 1 month+ -> DM cadence tightens to daily
+PR_STALE_ANNOUNCE_DAYS = 75  # 2.5 months -> one-time public #announcements post
 PR_STALE_SCAN_INTERVAL_SECONDS = 6 * 60 * 60  # 6 hours -- PR age changes slowly
 
 
@@ -113,7 +114,7 @@ def _pr_stale_dm_cadence_days(age_days: float) -> float:
     """How often to re-nag (author or assigned QA reviewer) once a PR has
     crossed the 2-week mark: weekly at first, every 3 days past 3 weeks,
     daily once it's a month+ old."""
-    if age_days >= PR_STALE_1MONTH_DAYS:
+    if age_days >= PR_STALE_DM_DAILY_DAYS:
         return 1.0
     if age_days >= PR_STALE_3WEEK_DAYS:
         return 3.0
@@ -761,7 +762,7 @@ async def _post_pr_staleness_1month(pr: dict, member: Optional[discord.Member]) 
     if channel is None:
         return
     embed = discord.Embed(
-        title="PR open over 1 month",
+        title="PR open over 2.5 months",
         description=f"[#{number} in {repo}]({url})\n\n{title}",
         color=discord.Color.red(),
     )
@@ -798,7 +799,7 @@ async def _scan_stale_prs(guild: discord.Guild) -> None:
       independently of whether it's their PR -- a separate DM thread from the
       author's.
 
-    #announcements at 1 month is the only one-time-forever tier -- it never
+    #announcements at 2.5 months is the only one-time-forever tier -- it never
     repeats no matter how much older the PR gets.
     """
     if not GITHUB_ORG or not GITHUB_PAT:
@@ -867,9 +868,12 @@ async def _scan_stale_prs(guild: discord.Guild) -> None:
             if reviewer_state_changed:
                 await save_pr_staleness(pr["repo"], pr["number"], reviewer_dm_state=reviewer_dm_state)
 
-        if age_days >= PR_STALE_1MONTH_DAYS and not state["notified_1month"]:
-            await _post_pr_staleness_1month(pr, member)
-            await save_pr_staleness(pr["repo"], pr["number"], notified_1month=True)
+        if age_days >= PR_STALE_ANNOUNCE_DAYS and not state["notified_1month"]:
+            # Atomically claim the one-time announcement slot before posting --
+            # two overlapping scan loops (e.g. during a Render redeploy) must
+            # never both read notified_1month=False and both post.
+            if await claim_pr_staleness_1month(pr["repo"], pr["number"]):
+                await _post_pr_staleness_1month(pr, member)
 
 
 async def _pr_staleness_scan_loop() -> None:

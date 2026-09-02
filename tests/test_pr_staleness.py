@@ -272,9 +272,9 @@ async def test_qa_reviewer_not_dmed_once_they_have_reviewed(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_1month_announcement_fires_once_and_never_again(monkeypatch):
-    """Explicit requirement: the #announcements 1-month tier must never repeat,
-    unlike the recurring author/reviewer DMs."""
-    pr = _pr(days_old=40)
+    """Explicit requirement: the #announcements tier (now 2.5 months / 75 days)
+    must never repeat, unlike the recurring author/reviewer DMs."""
+    pr = _pr(days_old=80)
     member = _member(id_=9)
     _scan_common_mocks(monkeypatch, pr, member=member, qa_reviewers=[])
     saved_state, fake_load, fake_save = _make_state_store()
@@ -284,16 +284,67 @@ async def test_1month_announcement_fires_once_and_never_again(monkeypatch):
     monkeypatch.setattr(main, "_dm_pr_staleness_nudge", AsyncMock())
     announce_mock = AsyncMock()
     monkeypatch.setattr(main, "_post_pr_staleness_1month", announce_mock)
+    claim_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(main, "claim_pr_staleness_1month", claim_mock)
 
     await main._scan_stale_prs(SimpleNamespace(get_member=lambda uid: None))
     announce_mock.assert_awaited_once()
 
-    # Even after fast-forwarding well past any DM cooldown, the announcement never re-fires.
+    # Even after fast-forwarding well past any DM cooldown, the announcement never re-fires
+    # -- the in-memory state also reflects notified_1month=True now, same as a real gateway would.
     key = (pr["repo"], pr["number"])
+    saved_state[key]["notified_1month"] = True
     saved_state[key]["last_author_dm_at"] = (datetime.now(timezone.utc) - timedelta(days=100)).isoformat()
     announce_mock.reset_mock()
+    claim_mock.reset_mock()
     await main._scan_stale_prs(SimpleNamespace(get_member=lambda uid: None))
     announce_mock.assert_not_awaited()
+    claim_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_1month_announcement_not_posted_if_claim_denied(monkeypatch):
+    """If the gateway's atomic claim says another caller already claimed this
+    PR's announcement slot (claimed=False), Norozo must not post -- this is
+    the actual fix for the observed double-post (two overlapping scan loops
+    racing on a blind read-then-write)."""
+    pr = _pr(days_old=80)
+    member = _member(id_=10)
+    _scan_common_mocks(monkeypatch, pr, member=member, qa_reviewers=[])
+    _, fake_load, fake_save = _make_state_store()
+    monkeypatch.setattr(main, "load_pr_staleness", fake_load)
+    monkeypatch.setattr(main, "save_pr_staleness", fake_save)
+    monkeypatch.setattr(main, "_post_pr_staleness_qa_channel", AsyncMock())
+    monkeypatch.setattr(main, "_dm_pr_staleness_nudge", AsyncMock())
+    announce_mock = AsyncMock()
+    monkeypatch.setattr(main, "_post_pr_staleness_1month", announce_mock)
+    monkeypatch.setattr(main, "claim_pr_staleness_1month", AsyncMock(return_value=False))
+
+    await main._scan_stale_prs(SimpleNamespace(get_member=lambda uid: None))
+
+    announce_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_announcement_does_not_fire_before_2_5_months(monkeypatch):
+    """A 40-day-old PR (past the old 1-month threshold, but well under the new
+    2.5-month/75-day one) must not trigger the #announcements tier."""
+    pr = _pr(days_old=40)
+    member = _member(id_=11)
+    _scan_common_mocks(monkeypatch, pr, member=member, qa_reviewers=[])
+    monkeypatch.setattr(main, "load_pr_staleness", AsyncMock(return_value=_default_state()))
+    monkeypatch.setattr(main, "save_pr_staleness", AsyncMock())
+    monkeypatch.setattr(main, "_post_pr_staleness_qa_channel", AsyncMock())
+    monkeypatch.setattr(main, "_dm_pr_staleness_nudge", AsyncMock())
+    announce_mock = AsyncMock()
+    monkeypatch.setattr(main, "_post_pr_staleness_1month", announce_mock)
+    claim_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(main, "claim_pr_staleness_1month", claim_mock)
+
+    await main._scan_stale_prs(SimpleNamespace(get_member=lambda uid: None))
+
+    announce_mock.assert_not_awaited()
+    claim_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
