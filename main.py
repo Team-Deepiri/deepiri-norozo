@@ -782,6 +782,14 @@ async def _forward_announcement_to_platform(message: discord.Message) -> None:
         return
     title = format_discussion_title(resolve_discord_mentions(message, message.content or ""))
     body = format_discussion_body(message)
+    # Embed color (e.g. the PR-staleness 1-month red alert) doesn't live in
+    # message.content -- pull it off the first embed so the web page can show
+    # the same color bar Discord shows, instead of flattening everything to plain text.
+    color_hex = None
+    if message.embeds:
+        embed_color = message.embeds[0].color
+        if embed_color is not None:
+            color_hex = f"#{embed_color.value:06x}"
     payload = {
         "source": "discord",
         "discord_message_id": str(message.id),
@@ -791,6 +799,7 @@ async def _forward_announcement_to_platform(message: discord.Message) -> None:
         "title": title,
         "body": body,
         "content": message.content or "",
+        "color": color_hex,
         "timestamp": message.created_at.isoformat() if hasattr(message, "created_at") else "",
         "jump_url": getattr(message, "jump_url", ""),
     }
