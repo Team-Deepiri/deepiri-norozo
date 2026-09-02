@@ -61,8 +61,10 @@ so this doesn't meaningfully increase API volume.
 ## Env vars
 
 - `QA_ROLE_ID` -- already exists (GitHub-team sync), now doubles as "who
-  counts as QA for staleness pings". Defaults to `1436492938229186603` if
-  unset, so nothing to add in Render unless you want to override it.
-- `PR_STALE_QA_CHANNEL_ID` / `PR_STALE_ANNOUNCE_CHANNEL_ID` -- unchanged,
-  already default to the real channel IDs (1438705614649032755 /
-  1436509524818395156), which is why they've worked without being set.
+  counts as QA for staleness pings". No default -- must be set explicitly
+  (Render: `QA_ROLE_ID=1436492938229186603`), otherwise no reviewer ever
+  matches and only the author gets DMed.
+- `PR_STALE_QA_CHANNEL_ID` -- unchanged, already defaults to the real channel
+  ID (1438705614649032755), which is why it's worked without being set.
+- The 1-month #announcements post reuses the existing `ANNOUNCEMENTS_CHANNEL_ID`
+  / `DISCORD_CHANNEL_ID` env var rather than its own separate one.
