@@ -64,7 +64,10 @@ async def test_maybe_auto_assign_ipca_roles_assigns_when_missing(monkeypatch):
     author.get_role = Mock(return_value=None)
     author.add_roles = AsyncMock()
 
-    thread = SimpleNamespace(send=AsyncMock(), edit=AsyncMock(), id=555)
+    thread = Mock(spec=discord.Thread)
+    thread.id = 555
+    thread.send = AsyncMock()
+    thread.edit = AsyncMock()
     channel = SimpleNamespace(id=100, parent_id=None, send=AsyncMock())
 
     message = Mock(spec=discord.Message)
