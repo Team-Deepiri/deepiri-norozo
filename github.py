@@ -219,6 +219,40 @@ def list_open_prs(github_org: str, github_pat: str) -> list:
     return prs
 
 
+def get_pull_request(repo_full_name: str, number: int, github_pat: str) -> Optional[Dict[str, Any]]:
+    """Full PR object -- the Search API used by list_open_prs doesn't include
+    requested_reviewers, needed for the PR-staleness QA-assignment lookup."""
+    if not github_pat or not repo_full_name or not number:
+        return None
+    headers = {
+        "Authorization": f"Bearer {github_pat}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    url = f"{GITHUB_API_BASE}/repos/{repo_full_name}/pulls/{number}"
+    response = _request_with_rate_limit_retry("GET", url, headers=headers)
+    if response.status_code != 200:
+        return None
+    return response.json()
+
+
+def get_pull_request_reviews(repo_full_name: str, number: int, github_pat: str) -> list:
+    """Submitted reviews for a PR -- used to tell whether an assigned QA
+    reviewer has already weighed in (any state counts) before nagging them."""
+    if not github_pat or not repo_full_name or not number:
+        return []
+    headers = {
+        "Authorization": f"Bearer {github_pat}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    url = f"{GITHUB_API_BASE}/repos/{repo_full_name}/pulls/{number}/reviews"
+    response = _request_with_rate_limit_retry("GET", url, headers=headers)
+    if response.status_code != 200:
+        return []
+    return response.json()
+
+
 def list_org_members(github_org: str, github_pat: str) -> list:
     """Full org roster (paginated), for fuzzy-matching a Discord name against
     when there's no explicit mapping and #github-profiles has nothing for them.

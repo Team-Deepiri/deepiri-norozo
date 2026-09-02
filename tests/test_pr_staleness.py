@@ -1,6 +1,6 @@
 """PR staleness escalation: identity resolution (GitHub PR author -> Discord
-member) and the three-tier scan logic, especially idempotency -- a tier must
-fire exactly once per PR, never re-fire on a later scan."""
+member), the one-time 2-week/1-month tiers, and the recurring author/QA-reviewer
+DM cooldown cadence (weekly -> every 3 days at 3 weeks -> daily at 1 month+)."""
 
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -31,7 +31,37 @@ def _member(id_=1, display_name="Ricco"):
     m.display_name = display_name
     m.mention = f"<@{id_}>"
     m.send = AsyncMock()
+    m.get_role = Mock(return_value=None)
     return m
+
+
+def _default_state(**overrides):
+    state = {
+        "notified_2week": False,
+        "notified_1month": False,
+        "resolved_discord_id": None,
+        "last_author_dm_at": None,
+        "reviewer_dm_state": {},
+    }
+    state.update(overrides)
+    return state
+
+
+def _make_state_store():
+    """In-memory fake of load_pr_staleness/save_pr_staleness for scan tests."""
+    saved_state = {}
+
+    async def fake_load(repo, number):
+        return dict(saved_state.get((repo, number), _default_state()))
+
+    async def fake_save(repo, number, **kwargs):
+        current = saved_state.setdefault((repo, number), _default_state())
+        for k, v in kwargs.items():
+            if v is not None:
+                current[k] = v
+        return True
+
+    return saved_state, fake_load, fake_save
 
 
 @pytest.mark.asyncio
@@ -95,48 +125,175 @@ async def test_no_confident_match_returns_none(monkeypatch):
     assert result is None
 
 
-@pytest.mark.asyncio
-async def test_scan_fires_each_tier_exactly_once(monkeypatch):
-    """A 40-day-old PR should fire all three tiers on first scan, and none of
-    them again on a second scan once they're recorded as notified."""
-    pr = _pr(days_old=40)
+def test_dm_cadence_tightens_with_age():
+    assert main._pr_stale_dm_cadence_days(14) == 7
+    assert main._pr_stale_dm_cadence_days(20) == 7
+    assert main._pr_stale_dm_cadence_days(21) == 3
+    assert main._pr_stale_dm_cadence_days(29) == 3
+    assert main._pr_stale_dm_cadence_days(30) == 1
+    assert main._pr_stale_dm_cadence_days(90) == 1
+
+
+def _scan_common_mocks(monkeypatch, pr, *, member=None, qa_reviewers=None):
     monkeypatch.setattr(main, "GITHUB_ORG", "Team-Deepiri")
     monkeypatch.setattr(main, "GITHUB_PAT", "fake")
     monkeypatch.setattr(main, "list_open_prs", lambda org, pat: [pr])
-    monkeypatch.setattr(main, "_resolve_discord_member_for_github_login", AsyncMock(return_value=None))
+    monkeypatch.setattr(main, "_resolve_discord_member_for_github_login", AsyncMock(return_value=member))
+    monkeypatch.setattr(main, "_resolve_pr_qa_reviewers", AsyncMock(return_value=qa_reviewers or []))
+    monkeypatch.setattr(main, "_pr_already_reviewed_by", AsyncMock(return_value=False))
 
-    saved_state = {}
 
-    async def fake_load(repo, number):
-        return saved_state.get((repo, number), {
-            "notified_2week": False, "notified_2_5week": False, "notified_1month": False, "resolved_discord_id": None,
-        })
-
-    async def fake_save(repo, number, **kwargs):
-        current = saved_state.setdefault((repo, number), {
-            "notified_2week": False, "notified_2_5week": False, "notified_1month": False, "resolved_discord_id": None,
-        })
-        for k, v in kwargs.items():
-            if v is not None:
-                current[k] = v
-        return True
-
+@pytest.mark.asyncio
+async def test_2week_qa_channel_fires_once_with_no_qa_assigned(monkeypatch):
+    pr = _pr(days_old=15)
+    _scan_common_mocks(monkeypatch, pr, qa_reviewers=[])
+    saved_state, fake_load, fake_save = _make_state_store()
     monkeypatch.setattr(main, "load_pr_staleness", fake_load)
     monkeypatch.setattr(main, "save_pr_staleness", fake_save)
+    qa_post = AsyncMock()
+    monkeypatch.setattr(main, "_post_pr_staleness_qa_channel", qa_post)
+    monkeypatch.setattr(main, "_dm_pr_staleness_nudge", AsyncMock())
 
-    post_mock = AsyncMock()
-    monkeypatch.setattr(main, "_post_pr_staleness_tier", post_mock)
+    await main._scan_stale_prs(SimpleNamespace(get_member=lambda uid: None))
 
-    guild = SimpleNamespace()
+    qa_post.assert_awaited_once_with(pr, [])
+    assert saved_state[(pr["repo"], pr["number"])]["notified_2week"] is True
+
+    qa_post.reset_mock()
+    await main._scan_stale_prs(SimpleNamespace(get_member=lambda uid: None))
+    qa_post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_2week_qa_channel_includes_assigned_qa(monkeypatch):
+    pr = _pr(days_old=15)
+    qa_member = _member(id_=7, display_name="QA Person")
+    _scan_common_mocks(monkeypatch, pr, qa_reviewers=[("qalogin", qa_member)])
+    _, fake_load, fake_save = _make_state_store()
+    monkeypatch.setattr(main, "load_pr_staleness", fake_load)
+    monkeypatch.setattr(main, "save_pr_staleness", fake_save)
+    qa_post = AsyncMock()
+    monkeypatch.setattr(main, "_post_pr_staleness_qa_channel", qa_post)
+    monkeypatch.setattr(main, "_dm_pr_staleness_nudge", AsyncMock())
+
+    await main._scan_stale_prs(SimpleNamespace(get_member=lambda uid: None))
+
+    qa_post.assert_awaited_once_with(pr, [("qalogin", qa_member)])
+
+
+@pytest.mark.asyncio
+async def test_author_dm_starts_at_2_5_weeks_and_recurs_on_cooldown(monkeypatch):
+    """An 18-day-old PR (past the 2.5-week DM start) should DM the author; a
+    second scan the same day should not re-DM (cooldown not elapsed), but once
+    the cooldown window has passed it should DM again -- this is the core
+    behavior change from v1's one-time 2.5-week DM."""
+    pr = _pr(days_old=18)
+    member = _member(id_=55)
+    guild = SimpleNamespace(get_member=lambda uid: None)
+    _scan_common_mocks(monkeypatch, pr, member=member, qa_reviewers=[])
+    saved_state, fake_load, fake_save = _make_state_store()
+    monkeypatch.setattr(main, "load_pr_staleness", fake_load)
+    monkeypatch.setattr(main, "save_pr_staleness", fake_save)
+    monkeypatch.setattr(main, "_post_pr_staleness_qa_channel", AsyncMock())
+    dm_mock = AsyncMock()
+    monkeypatch.setattr(main, "_dm_pr_staleness_nudge", dm_mock)
 
     await main._scan_stale_prs(guild)
-    assert post_mock.await_count == 3
-    fired_tiers_first = {call.args[1] for call in post_mock.await_args_list}
-    assert fired_tiers_first == {"2week", "2_5week", "1month"}
+    dm_mock.assert_awaited_once_with(member, pr, as_reviewer=False)
 
-    post_mock.reset_mock()
+    # Same day again -- cooldown (7 days at this age) not elapsed, no re-DM.
+    dm_mock.reset_mock()
     await main._scan_stale_prs(guild)
-    post_mock.assert_not_awaited()
+    dm_mock.assert_not_awaited()
+
+    # Fast-forward the recorded last DM past the 7-day cooldown -- should DM again.
+    key = (pr["repo"], pr["number"])
+    saved_state[key]["last_author_dm_at"] = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
+    await main._scan_stale_prs(guild)
+    dm_mock.assert_awaited_once_with(member, pr, as_reviewer=False)
+
+
+@pytest.mark.asyncio
+async def test_author_dm_does_not_start_before_2_5_weeks(monkeypatch):
+    """At exactly 2 weeks (only the QA-channel tier), the author should not be
+    DMed yet -- that starts at 2.5 weeks."""
+    pr = _pr(days_old=15)
+    member = _member(id_=56)
+    _scan_common_mocks(monkeypatch, pr, member=member, qa_reviewers=[])
+    _, fake_load, fake_save = _make_state_store()
+    monkeypatch.setattr(main, "load_pr_staleness", fake_load)
+    monkeypatch.setattr(main, "save_pr_staleness", fake_save)
+    monkeypatch.setattr(main, "_post_pr_staleness_qa_channel", AsyncMock())
+    dm_mock = AsyncMock()
+    monkeypatch.setattr(main, "_dm_pr_staleness_nudge", dm_mock)
+
+    await main._scan_stale_prs(SimpleNamespace(get_member=lambda uid: None))
+
+    dm_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_qa_reviewer_gets_dmed_when_not_yet_reviewed(monkeypatch):
+    pr = _pr(days_old=18)
+    author = _member(id_=1, display_name="Author")
+    reviewer = _member(id_=2, display_name="Reviewer")
+    _scan_common_mocks(monkeypatch, pr, member=author, qa_reviewers=[("reviewerlogin", reviewer)])
+    monkeypatch.setattr(main, "_pr_already_reviewed_by", AsyncMock(return_value=False))
+    _, fake_load, fake_save = _make_state_store()
+    monkeypatch.setattr(main, "load_pr_staleness", fake_load)
+    monkeypatch.setattr(main, "save_pr_staleness", fake_save)
+    monkeypatch.setattr(main, "_post_pr_staleness_qa_channel", AsyncMock())
+    dm_mock = AsyncMock()
+    monkeypatch.setattr(main, "_dm_pr_staleness_nudge", dm_mock)
+
+    await main._scan_stale_prs(SimpleNamespace(get_member=lambda uid: None))
+
+    dm_mock.assert_any_await(reviewer, pr, as_reviewer=True)
+
+
+@pytest.mark.asyncio
+async def test_qa_reviewer_not_dmed_once_they_have_reviewed(monkeypatch):
+    pr = _pr(days_old=18)
+    reviewer = _member(id_=2, display_name="Reviewer")
+    _scan_common_mocks(monkeypatch, pr, member=None, qa_reviewers=[("reviewerlogin", reviewer)])
+    monkeypatch.setattr(main, "_pr_already_reviewed_by", AsyncMock(return_value=True))
+    _, fake_load, fake_save = _make_state_store()
+    monkeypatch.setattr(main, "load_pr_staleness", fake_load)
+    monkeypatch.setattr(main, "save_pr_staleness", fake_save)
+    monkeypatch.setattr(main, "_post_pr_staleness_qa_channel", AsyncMock())
+    dm_mock = AsyncMock()
+    monkeypatch.setattr(main, "_dm_pr_staleness_nudge", dm_mock)
+
+    await main._scan_stale_prs(SimpleNamespace(get_member=lambda uid: None))
+
+    for call in dm_mock.await_args_list:
+        assert call.args[0] is not reviewer
+
+
+@pytest.mark.asyncio
+async def test_1month_announcement_fires_once_and_never_again(monkeypatch):
+    """Explicit requirement: the #announcements 1-month tier must never repeat,
+    unlike the recurring author/reviewer DMs."""
+    pr = _pr(days_old=40)
+    member = _member(id_=9)
+    _scan_common_mocks(monkeypatch, pr, member=member, qa_reviewers=[])
+    saved_state, fake_load, fake_save = _make_state_store()
+    monkeypatch.setattr(main, "load_pr_staleness", fake_load)
+    monkeypatch.setattr(main, "save_pr_staleness", fake_save)
+    monkeypatch.setattr(main, "_post_pr_staleness_qa_channel", AsyncMock())
+    monkeypatch.setattr(main, "_dm_pr_staleness_nudge", AsyncMock())
+    announce_mock = AsyncMock()
+    monkeypatch.setattr(main, "_post_pr_staleness_1month", announce_mock)
+
+    await main._scan_stale_prs(SimpleNamespace(get_member=lambda uid: None))
+    announce_mock.assert_awaited_once()
+
+    # Even after fast-forwarding well past any DM cooldown, the announcement never re-fires.
+    key = (pr["repo"], pr["number"])
+    saved_state[key]["last_author_dm_at"] = (datetime.now(timezone.utc) - timedelta(days=100)).isoformat()
+    announce_mock.reset_mock()
+    await main._scan_stale_prs(SimpleNamespace(get_member=lambda uid: None))
+    announce_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -147,12 +304,12 @@ async def test_scan_skips_bot_and_draft_prs(monkeypatch):
     monkeypatch.setattr(main, "GITHUB_PAT", "fake")
     monkeypatch.setattr(main, "list_open_prs", lambda org, pat: [bot_pr, draft_pr])
     monkeypatch.setattr(main, "load_pr_staleness", AsyncMock())
-    post_mock = AsyncMock()
-    monkeypatch.setattr(main, "_post_pr_staleness_tier", post_mock)
+    qa_post = AsyncMock()
+    monkeypatch.setattr(main, "_post_pr_staleness_qa_channel", qa_post)
 
-    await main._scan_stale_prs(SimpleNamespace())
+    await main._scan_stale_prs(SimpleNamespace(get_member=lambda uid: None))
 
-    post_mock.assert_not_awaited()
+    qa_post.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -162,12 +319,48 @@ async def test_scan_does_not_fire_tiers_not_yet_reached(monkeypatch):
     monkeypatch.setattr(main, "GITHUB_ORG", "Team-Deepiri")
     monkeypatch.setattr(main, "GITHUB_PAT", "fake")
     monkeypatch.setattr(main, "list_open_prs", lambda org, pat: [pr])
-    monkeypatch.setattr(main, "load_pr_staleness", AsyncMock(return_value={
-        "notified_2week": False, "notified_2_5week": False, "notified_1month": False, "resolved_discord_id": None,
-    }))
-    post_mock = AsyncMock()
-    monkeypatch.setattr(main, "_post_pr_staleness_tier", post_mock)
+    monkeypatch.setattr(main, "load_pr_staleness", AsyncMock(return_value=_default_state()))
+    qa_post = AsyncMock()
+    monkeypatch.setattr(main, "_post_pr_staleness_qa_channel", qa_post)
+    dm_mock = AsyncMock()
+    monkeypatch.setattr(main, "_dm_pr_staleness_nudge", dm_mock)
 
-    await main._scan_stale_prs(SimpleNamespace())
+    await main._scan_stale_prs(SimpleNamespace(get_member=lambda uid: None))
 
-    post_mock.assert_not_awaited()
+    qa_post.assert_not_awaited()
+    dm_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resolve_pr_qa_reviewers_filters_by_role(monkeypatch):
+    qa_member = _member(id_=1)
+    qa_member.get_role = Mock(side_effect=lambda rid: object() if rid == main.QA_ROLE_ID else None)
+    non_qa_member = _member(id_=2)
+    non_qa_member.get_role = Mock(return_value=None)
+
+    monkeypatch.setattr(
+        main, "get_pull_request",
+        lambda repo, number, pat: {"requested_reviewers": [{"login": "qaguy"}, {"login": "randomguy"}]},
+    )
+
+    async def fake_resolve(login, guild):
+        return {"qaguy": qa_member, "randomguy": non_qa_member}.get(login)
+
+    monkeypatch.setattr(main, "_resolve_discord_member_for_github_login", fake_resolve)
+
+    pr = _pr()
+    result = await main._resolve_pr_qa_reviewers(pr, SimpleNamespace())
+
+    assert result == [("qaguy", qa_member)]
+
+
+@pytest.mark.asyncio
+async def test_pr_already_reviewed_by_checks_review_authors(monkeypatch):
+    monkeypatch.setattr(
+        main, "get_pull_request_reviews",
+        lambda repo, number, pat: [{"user": {"login": "SomeReviewer"}, "state": "APPROVED"}],
+    )
+    pr = _pr()
+
+    assert await main._pr_already_reviewed_by(pr, "somereviewer") is True
+    assert await main._pr_already_reviewed_by(pr, "nobody") is False
