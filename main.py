@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 
 from bot import format_discussion_body, format_discussion_title, resolve_discord_mentions
 from emailer import send_email
-from github import add_user_to_team, get_user_profile, invite_user, is_org_member, list_open_prs, list_org_members, remove_user_from_org, remove_user_from_team
+from github import add_user_to_team, get_pull_request, get_pull_request_reviews, get_user_profile, invite_user, is_org_member, list_open_prs, list_org_members, remove_user_from_org, remove_user_from_team
 from identity_match import best_match
 from github_discussion import GitHubDiscussionError, create_github_discussion
 from meetings import setup_meeting_features
@@ -70,7 +70,7 @@ STAFF_ROLE_ID = _int_env("STAFF_ROLE_ID")
 SUPPORT_SESSIONS_CHANNEL_ID = _int_env("SUPPORT_SESSIONS_CHANNEL_ID")  # #support-tickets 1435722355723993088
 GITHUB_PROFILES_CHANNEL_ID = _int_env("GITHUB_PROFILES_CHANNEL_ID")  # #github-profiles 1435086187822845982
 IT_OPERATIONS_SUPPORT_ROLE_ID = _int_env("IT_OPERATIONS_SUPPORT_ROLE_ID") or _int_env("SUPPORT_TEAM_ROLE_ID")
-QA_ROLE_ID = _int_env("QA_ROLE_ID")
+QA_ROLE_ID = _int_env("QA_ROLE_ID") or 1436492938229186603  # "QA" Discord role -- also gates PR-staleness QA reviewer pings
 ANNOUNCEMENTS_CHANNEL_ID = _int_env("DISCORD_CHANNEL_ID") or _int_env("ANNOUNCEMENTS_CHANNEL_ID")  # #announcements 1436509524818395156
 ANNOUNCEMENTS_CHANNEL_NAME = os.getenv("DISCORD_CHANNEL_NAME", "announcements")
 
@@ -84,15 +84,30 @@ KICK_OUT_COMMAND_CHANNEL_IDS = {
 }
 KICK_OUT_COMMAND_RE = re.compile(r"^\s*kick\s*(?:out)?\s+(.+)$", re.IGNORECASE)
 
-# PR staleness escalation: 2 weeks -> #qa-support-team, 2.5 weeks -> DM the
-# author, 1 month -> #announcements (public, by then it's earned the visibility).
+# PR staleness escalation: 2 weeks -> #qa-support-team (one-time, includes the
+# assigned QA reviewer), 2.5 weeks -> recurring DM to the author AND, separately,
+# to any assigned QA reviewer who hasn't reviewed yet (cadence tightens with
+# age), 1 month -> #announcements (public, one-time -- never repeats no matter
+# how much older the PR gets).
 # Env-overridable, defaulting to the IDs actually in use.
 PR_STALE_QA_CHANNEL_ID = _int_env("PR_STALE_QA_CHANNEL_ID") or 1438705614649032755  # #qa-support-team
 PR_STALE_ANNOUNCE_CHANNEL_ID = _int_env("PR_STALE_ANNOUNCE_CHANNEL_ID") or 1436509524818395156  # #announcements
 PR_STALE_2WEEK_DAYS = 14
-PR_STALE_2_5WEEK_DAYS = 17.5
+PR_STALE_2_5WEEK_DAYS = 17.5  # when the recurring author/QA-reviewer DMs start
+PR_STALE_3WEEK_DAYS = 21
 PR_STALE_1MONTH_DAYS = 30
 PR_STALE_SCAN_INTERVAL_SECONDS = 6 * 60 * 60  # 6 hours -- PR age changes slowly
+
+
+def _pr_stale_dm_cadence_days(age_days: float) -> float:
+    """How often to re-nag (author or assigned QA reviewer) once a PR has
+    crossed the 2-week mark: weekly at first, every 3 days past 3 weeks,
+    daily once it's a month+ old."""
+    if age_days >= PR_STALE_1MONTH_DAYS:
+        return 1.0
+    if age_days >= PR_STALE_3WEEK_DAYS:
+        return 3.0
+    return 7.0
 
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "0.0.0.0")
 WEBHOOK_PORT = int(os.getenv("PORT") or os.getenv("WEBHOOK_PORT", "8080"))
@@ -668,50 +683,114 @@ async def _resolve_discord_member_for_github_login(login: str, guild: discord.Gu
     return None
 
 
-async def _post_pr_staleness_tier(pr: dict, tier: str, member: Optional[discord.Member]) -> None:
-    """Fire one escalation tier for one PR. Best-effort throughout -- a failure
-    posting to one channel/DM must not prevent the tier from being recorded
-    (recording anyway avoids retry-storming a channel the bot lacks permission
-    to post in on every scan)."""
-    age_days = tier
-    repo, number, title, url = pr["repo"], pr["number"], pr["title"], pr["html_url"]
+async def _resolve_pr_qa_reviewers(pr: dict, guild: discord.Guild) -> list:
+    """Requested reviewers on the PR who hold the QA Discord role, resolved via
+    the same GitHub->Discord identity chain used for the author. Returns a list
+    of (github_login, discord.Member) pairs -- only those that both resolve to
+    a Discord member AND hold QA_ROLE_ID count as "assigned QA" for staleness
+    purposes."""
+    full_pr = await asyncio.to_thread(get_pull_request, pr["repo"], pr["number"], GITHUB_PAT)
+    if not full_pr:
+        return []
+    requested = full_pr.get("requested_reviewers") or []
+    logins = [r.get("login") for r in requested if r.get("login")]
+    resolved = []
+    for login in logins:
+        member = await _resolve_discord_member_for_github_login(login, guild)
+        if member is not None and member.get_role(QA_ROLE_ID) is not None:
+            resolved.append((login, member))
+    return resolved
 
-    if tier == "2week":
-        channel = await _channel_from_id(PR_STALE_QA_CHANNEL_ID)
-        if channel is not None:
-            try:
-                await channel.send(f"PR #{number} in {repo} (\"{title}\") has been open 2 weeks: {url}")
-            except Exception:
-                logger.exception("Failed to post 2-week PR staleness notice for %s#%s", repo, number)
-    elif tier == "2_5week":
-        if member is not None:
-            try:
-                await member.send(
-                    f"Hey — your PR #{number} in {repo} (\"{title}\") has been open about 2.5 weeks. "
-                    f"No pressure, just a nudge to take a look when you get a chance: {url}"
-                )
-            except Exception:
-                logger.exception("Failed to DM 2.5-week PR staleness notice to %s for %s#%s", member.id, repo, number)
-    elif tier == "1month":
-        channel = await _channel_from_id(PR_STALE_ANNOUNCE_CHANNEL_ID)
-        if channel is not None:
-            embed = discord.Embed(
-                title="PR open over 1 month",
-                description=f"[#{number} in {repo}]({url})\n\n{title}",
-                color=discord.Color.red(),
-            )
-            mention = member.mention if member is not None else None
-            try:
-                await channel.send(content=mention, embed=embed)
-            except Exception:
-                logger.exception("Failed to post 1-month PR staleness notice for %s#%s", repo, number)
-    _ = age_days  # tier name doubles as a label; no separate age needed here
+
+async def _pr_already_reviewed_by(pr: dict, login: str) -> bool:
+    """Any submitted review (approve/request-changes/comment) counts as
+    "weighed in" -- they're off the nag list regardless of the review outcome."""
+    reviews = await asyncio.to_thread(get_pull_request_reviews, pr["repo"], pr["number"], GITHUB_PAT)
+    login_lower = login.strip().lower()
+    return any((r.get("user") or {}).get("login", "").strip().lower() == login_lower for r in reviews)
+
+
+async def _post_pr_staleness_qa_channel(pr: dict, qa_reviewers: list) -> None:
+    repo, number, title, url = pr["repo"], pr["number"], pr["title"], pr["html_url"]
+    channel = await _channel_from_id(PR_STALE_QA_CHANNEL_ID)
+    if channel is None:
+        return
+    if qa_reviewers:
+        assigned = ", ".join(member.mention for _login, member in qa_reviewers)
+    else:
+        assigned = "No QA assigned"
+    try:
+        await channel.send(
+            f"PR #{number} in {repo} (\"{title}\") has been open 2 weeks: {url}\nAssigned QA: {assigned}"
+        )
+    except Exception:
+        logger.exception("Failed to post 2-week PR staleness notice for %s#%s", repo, number)
+
+
+async def _dm_pr_staleness_nudge(member: discord.Member, pr: dict, *, as_reviewer: bool) -> None:
+    repo, number, title, url = pr["repo"], pr["number"], pr["title"], pr["html_url"]
+    if as_reviewer:
+        text = (
+            f"Hey — you're assigned as QA on PR #{number} in {repo} (\"{title}\") and it hasn't been "
+            f"reviewed yet from your end. Take a look when you get a chance: {url}"
+        )
+    else:
+        text = (
+            f"Hey — your PR #{number} in {repo} (\"{title}\") is still open. "
+            f"No pressure, just a nudge to take a look when you get a chance: {url}"
+        )
+    try:
+        await member.send(text)
+    except Exception:
+        logger.exception("Failed to DM PR staleness nudge to %s for %s#%s", member.id, repo, number)
+
+
+async def _post_pr_staleness_1month(pr: dict, member: Optional[discord.Member]) -> None:
+    repo, number, title, url = pr["repo"], pr["number"], pr["title"], pr["html_url"]
+    channel = await _channel_from_id(PR_STALE_ANNOUNCE_CHANNEL_ID)
+    if channel is None:
+        return
+    embed = discord.Embed(
+        title="PR open over 1 month",
+        description=f"[#{number} in {repo}]({url})\n\n{title}",
+        color=discord.Color.red(),
+    )
+    mention = member.mention if member is not None else None
+    try:
+        await channel.send(content=mention, embed=embed)
+    except Exception:
+        logger.exception("Failed to post 1-month PR staleness notice for %s#%s", repo, number)
+
+
+def _cooldown_elapsed(last_sent_iso: Optional[str], now: datetime, cadence_days: float) -> bool:
+    if not last_sent_iso:
+        return True
+    try:
+        last_sent = datetime.fromisoformat(last_sent_iso.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    return (now - last_sent).total_seconds() / 86400.0 >= cadence_days
 
 
 async def _scan_stale_prs(guild: discord.Guild) -> None:
-    """Runs periodically: every open PR org-wide, escalating through three
-    tiers exactly once each. Bot-authored and draft PRs are skipped entirely --
-    a bot has no Discord identity, and a draft isn't yet asking for review."""
+    """Runs periodically over every open PR org-wide. Bot-authored and draft
+    PRs are skipped entirely -- a bot has no Discord identity, and a draft
+    isn't yet asking for review.
+
+    Three independent things happen as a PR ages:
+    - At 2 weeks: #qa-support-team gets posted once (includes assigned QA, or
+      "No QA assigned").
+    - At 2.5 weeks: the author starts getting DMed on a cadence that tightens
+      with age (weekly -> every 3 days at 3 weeks -> daily at 1 month+), not
+      just once.
+    - Also from 2.5 weeks: any requested reviewer holding the QA role who
+      hasn't reviewed yet gets the same recurring DM on the same cadence,
+      independently of whether it's their PR -- a separate DM thread from the
+      author's.
+
+    #announcements at 1 month is the only one-time-forever tier -- it never
+    repeats no matter how much older the PR gets.
+    """
     if not GITHUB_ORG or not GITHUB_PAT:
         logger.warning("PR staleness scan skipped: GITHUB_ORG or GITHUB_PAT not configured")
         return
@@ -734,6 +813,8 @@ async def _scan_stale_prs(guild: discord.Guild) -> None:
         except ValueError:
             continue
         age_days = (now - created_at).total_seconds() / 86400.0
+        if age_days < PR_STALE_2WEEK_DAYS:
+            continue
 
         state = await load_pr_staleness(pr["repo"], pr["number"])
         member = None
@@ -742,24 +823,37 @@ async def _scan_stale_prs(guild: discord.Guild) -> None:
                 member = guild.get_member(int(state["resolved_discord_id"]))
             except ValueError:
                 member = None
-
-        needs_identity = (
-            (age_days >= PR_STALE_2_5WEEK_DAYS and not state["notified_2_5week"])
-            or (age_days >= PR_STALE_1MONTH_DAYS and not state["notified_1month"])
-        )
-        if member is None and needs_identity and author_login:
+        if member is None and author_login:
             member = await _resolve_discord_member_for_github_login(author_login, guild)
             if member is not None:
                 await save_pr_staleness(pr["repo"], pr["number"], resolved_discord_id=str(member.id))
 
-        if age_days >= PR_STALE_2WEEK_DAYS and not state["notified_2week"]:
-            await _post_pr_staleness_tier(pr, "2week", member)
+        qa_reviewers = await _resolve_pr_qa_reviewers(pr, guild)
+
+        if not state["notified_2week"]:
+            await _post_pr_staleness_qa_channel(pr, qa_reviewers)
             await save_pr_staleness(pr["repo"], pr["number"], notified_2week=True)
-        if age_days >= PR_STALE_2_5WEEK_DAYS and not state["notified_2_5week"]:
-            await _post_pr_staleness_tier(pr, "2_5week", member)
-            await save_pr_staleness(pr["repo"], pr["number"], notified_2_5week=True)
+
+        if age_days >= PR_STALE_2_5WEEK_DAYS:
+            cadence = _pr_stale_dm_cadence_days(age_days)
+            if member is not None and _cooldown_elapsed(state["last_author_dm_at"], now, cadence):
+                await _dm_pr_staleness_nudge(member, pr, as_reviewer=False)
+                await save_pr_staleness(pr["repo"], pr["number"], last_author_dm_at=now.isoformat())
+
+            reviewer_dm_state = dict(state["reviewer_dm_state"])
+            reviewer_state_changed = False
+            for login, reviewer_member in qa_reviewers:
+                if await _pr_already_reviewed_by(pr, login):
+                    continue
+                if _cooldown_elapsed(reviewer_dm_state.get(login), now, cadence):
+                    await _dm_pr_staleness_nudge(reviewer_member, pr, as_reviewer=True)
+                    reviewer_dm_state[login] = now.isoformat()
+                    reviewer_state_changed = True
+            if reviewer_state_changed:
+                await save_pr_staleness(pr["repo"], pr["number"], reviewer_dm_state=reviewer_dm_state)
+
         if age_days >= PR_STALE_1MONTH_DAYS and not state["notified_1month"]:
-            await _post_pr_staleness_tier(pr, "1month", member)
+            await _post_pr_staleness_1month(pr, member)
             await save_pr_staleness(pr["repo"], pr["number"], notified_1month=True)
 
 

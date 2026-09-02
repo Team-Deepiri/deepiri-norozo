@@ -40,14 +40,16 @@ def _secret() -> Optional[str]:
 
 
 async def load_pr_staleness(repo: str, pr_number: int) -> dict:
-    """Returns {notified_2week, notified_2_5week, notified_1month, resolved_discord_id}
-    -- all False/None if nothing's been recorded yet, or on any failure (fail
-    open toward re-checking rather than silently never notifying at all)."""
+    """Returns {notified_2week, notified_1month, resolved_discord_id,
+    last_author_dm_at, reviewer_dm_state} -- all False/None/{} if nothing's
+    been recorded yet, or on any failure (fail open toward re-checking rather
+    than silently never notifying at all)."""
     default = {
         "notified_2week": False,
-        "notified_2_5week": False,
         "notified_1month": False,
         "resolved_discord_id": None,
+        "last_author_dm_at": None,
+        "reviewer_dm_state": {},
     }
     url = _pr_staleness_url()
     secret = _secret()
@@ -66,9 +68,10 @@ async def load_pr_staleness(repo: str, pr_number: int) -> dict:
         data = resp.json()
         return {
             "notified_2week": bool(data.get("notified2Week")),
-            "notified_2_5week": bool(data.get("notified2_5Week")),
             "notified_1month": bool(data.get("notified1Month")),
             "resolved_discord_id": data.get("resolvedDiscordId"),
+            "last_author_dm_at": data.get("lastAuthorDmAt"),
+            "reviewer_dm_state": data.get("reviewerDmState") or {},
         }
     except Exception:
         logger.exception("Failed to load PR staleness state for %s#%s", repo, pr_number)
@@ -80,9 +83,10 @@ async def save_pr_staleness(
     pr_number: int,
     *,
     notified_2week: Optional[bool] = None,
-    notified_2_5week: Optional[bool] = None,
     notified_1month: Optional[bool] = None,
     resolved_discord_id: Optional[str] = None,
+    last_author_dm_at: Optional[str] = None,
+    reviewer_dm_state: Optional[dict] = None,
 ) -> bool:
     url = _pr_staleness_url()
     secret = _secret()
@@ -92,9 +96,10 @@ async def save_pr_staleness(
         "repo": repo,
         "pr_number": pr_number,
         "notified_2week": notified_2week,
-        "notified_2_5week": notified_2_5week,
         "notified_1month": notified_1month,
         "resolved_discord_id": resolved_discord_id,
+        "last_author_dm_at": last_author_dm_at,
+        "reviewer_dm_state": reviewer_dm_state,
     }
     raw = json.dumps(body).encode("utf-8")
     signature = hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()
