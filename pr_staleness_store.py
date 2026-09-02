@@ -39,6 +39,39 @@ def _secret() -> Optional[str]:
     return secret or None
 
 
+def _pr_staleness_claim_url() -> Optional[str]:
+    base = _pr_staleness_url()
+    return f"{base}/claim-1month" if base else None
+
+
+async def claim_pr_staleness_1month(repo: str, pr_number: int) -> bool:
+    """Atomically claims the one-time #announcements slot for a PR -- returns
+    True only for the single caller that transitions notified_1month from
+    false to true (a conditional UPDATE on the gateway's side), so two
+    overlapping scan loops (e.g. during a Render redeploy) can never both post
+    the same PR's 1-month announcement. Fails closed: any error means "don't
+    post" rather than risking a duplicate."""
+    url = _pr_staleness_claim_url()
+    secret = _secret()
+    if not url or not secret:
+        return False
+    body = {"repo": repo, "pr_number": pr_number}
+    raw = json.dumps(body).encode("utf-8")
+    signature = hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                url,
+                content=raw,
+                headers={"Content-Type": "application/json", "X-Norozo-Signature": f"sha256={signature}"},
+            )
+            resp.raise_for_status()
+        return bool(resp.json().get("claimed"))
+    except Exception:
+        logger.exception("Failed to claim PR staleness 1-month announcement for %s#%s", repo, pr_number)
+        return False
+
+
 async def load_pr_staleness(repo: str, pr_number: int) -> dict:
     """Returns {notified_2week, notified_1month, resolved_discord_id,
     last_author_dm_at, reviewer_dm_state} -- all False/None/{} if nothing's
