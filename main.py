@@ -836,11 +836,12 @@ def _is_staff(member: discord.Member) -> bool:
     return member.get_role(STAFF_ROLE_ID) is not None or member.guild_permissions.administrator
 
 
-def _can_dispatch_ipca_signed(member: discord.Member) -> bool:
-    """/ipca-signed grants DEV Team + Available roles on approval — restrict who can
-    even open that approval request to admins and Security & Operations Support, so a
-    member can't just self-serve the escalation path (the normal path is the automatic
-    IPCA-message detection in support tickets, not this command)."""
+def _is_staff_or_security_ops(member: discord.Member) -> bool:
+    """Shared gate for anything sensitive enough to require admins or Security &
+    Operations Support specifically -- /ipca-signed (grants DEV Team + Available
+    roles on approval) and the "kick out <name>" command (Discord kick + GitHub
+    org removal) both use this, so a plain STAFF_ROLE_ID member without the
+    security/ops role can't self-serve either escalation path."""
     if _is_staff(member):
         return True
     return IT_OPERATIONS_SUPPORT_ROLE_ID is not None and member.get_role(IT_OPERATIONS_SUPPORT_ROLE_ID) is not None
@@ -1510,7 +1511,7 @@ async def _maybe_handle_kick_out_command(message: discord.Message) -> bool:
     match = KICK_OUT_COMMAND_RE.match(message.content or "")
     if not match:
         return False
-    if not isinstance(message.author, discord.Member) or not _is_staff(message.author):
+    if not isinstance(message.author, discord.Member) or not _is_staff_or_security_ops(message.author):
         return False
 
     target = _resolve_kick_target(message, match.group(1))
@@ -1588,7 +1589,7 @@ async def _maybe_handle_kick_out_command(message: discord.Message) -> bool:
 
 
 async def handle_ipca_signed(interaction: discord.Interaction, github_username: str) -> None:
-    if not isinstance(interaction.user, discord.Member) or not _can_dispatch_ipca_signed(interaction.user):
+    if not isinstance(interaction.user, discord.Member) or not _is_staff_or_security_ops(interaction.user):
         await interaction.response.send_message(
             "Only Admins or Security & Operations Support can run this command. "
             "Roles are normally granted automatically when you sign the IPCA in your support ticket.",
