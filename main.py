@@ -19,7 +19,7 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
-from bot import format_discussion_body, format_discussion_title
+from bot import format_discussion_body, format_discussion_title, resolve_discord_mentions
 from emailer import send_email
 from github import add_user_to_team, get_user_profile, invite_user, is_org_member, list_org_members, remove_user_from_org, remove_user_from_team
 from identity_match import best_match
@@ -307,7 +307,7 @@ async def _maybe_auto_assign_ipca_roles(message: discord.Message) -> bool:
         return False
     if message.author.get_role(DEV_TEAM_ROLE_ID) and message.author.get_role(AVAILABLE_ROLE_ID):
         try:
-            target_channel = message.thread or message.channel
+            target_channel = await _resolve_reply_channel(message)
             await target_channel.send(f"{message.author.mention} You already have access.")
         except Exception:
             logger.exception("Failed to post IPCA already-has-access reply for %s", message.author.id)
@@ -324,19 +324,24 @@ async def _maybe_auto_assign_ipca_roles(message: discord.Message) -> bool:
     try:
         # support-tickets uses Discord's auto-thread feature: the triggering
         # message lives in the parent channel and spawns a same-id companion
-        # thread. message.reply() posts back into the parent channel, not the
-        # thread — so post into message.thread when this message started one.
-        target_channel = message.thread or message.channel
+        # thread as a SIDE EFFECT that can land after on_message already fired.
+        # Re-resolve fresh rather than trusting message.thread captured at
+        # handler-start -- same race _resolve_reply_channel exists to handle
+        # for the kick-out command.
+        target_channel = await _resolve_reply_channel(message)
         await target_channel.send(f"{message.author.mention} We gave you access to the rest of the Discord.")
     except Exception:
         logger.exception("Failed to post IPCA access confirmation reply for %s", message.author.id)
 
-    ticket_thread = message.thread if message.thread else (message.channel if isinstance(message.channel, discord.Thread) else None)
-    if ticket_thread is not None:
+    # Resolve again (not reuse target_channel) -- more real async time has
+    # passed since the send above, during which the companion thread may have
+    # only just been created.
+    ticket_thread = await _resolve_reply_channel(message)
+    if isinstance(ticket_thread, discord.Thread):
         try:
             await ticket_thread.edit(archived=True, locked=False, reason="IPCA signed — ticket resolved")
         except Exception:
-            logger.exception("Failed to archive IPCA ticket thread %s", getattr(ticket_thread, "id", "?"))
+            logger.exception("Failed to archive IPCA ticket thread %s", ticket_thread.id)
 
     return True
 
@@ -595,7 +600,7 @@ async def _forward_announcement_to_platform(message: discord.Message) -> None:
     if not PLATFORM_ANNOUNCEMENTS_SECRET:
         logger.error("Announcement forward disabled: PLATFORM_ANNOUNCEMENTS_WEBHOOK_SECRET is not configured")
         return
-    title = format_discussion_title(message.content)
+    title = format_discussion_title(resolve_discord_mentions(message, message.content or ""))
     body = format_discussion_body(message)
     payload = {
         "source": "discord",
@@ -815,7 +820,7 @@ async def on_message(message: discord.Message) -> None:
 
     await notify_support_team_for_message(message)
     if _is_announcements_channel(message.channel):
-        title = format_discussion_title(message.content)
+        title = format_discussion_title(resolve_discord_mentions(message, message.content or ""))
         body = format_discussion_body(message)
         try:
             await create_github_discussion(title, body)
@@ -1284,6 +1289,37 @@ async def _maybe_handle_onboarding_dm(message: discord.Message) -> bool:
     return False
 
 
+async def _resolve_reply_channel(message: discord.Message):
+    """support-tickets uses Discord's auto-thread feature: the triggering message
+    lives in the parent channel and spawns a same-id companion thread as a SIDE
+    EFFECT that can land after on_message already fired. message.thread captured
+    once at handler-start can still be None even though the thread exists by the
+    time a handler is ready to reply — real async work (role checks, kicks,
+    GitHub calls, email resolution) happens in between. Re-check fresh every
+    time a reply is about to be sent instead of trusting a value cached earlier.
+    Shared by both the IPCA auto-assign flow and the kick-out command — both
+    hit this exact race, since both can fire on the message that itself spawns
+    the companion thread.
+    """
+    if message.thread is not None:
+        return message.thread
+    # A reply sent directly inside an already-open thread (not a message that
+    # spawns a new companion thread) has message.channel be the Thread itself --
+    # nothing left to resolve.
+    if isinstance(message.channel, discord.Thread):
+        return message.channel
+    cached = message.channel.get_thread(message.id) if hasattr(message.channel, "get_thread") else None
+    if cached is not None:
+        return cached
+    try:
+        fresh = await message.channel.fetch_message(message.id)
+        if fresh.thread is not None:
+            return fresh.thread
+    except Exception:
+        pass
+    return message.channel
+
+
 async def _maybe_handle_kick_out_command(message: discord.Message) -> bool:
     """Staff saying 'kick out <name>' (or 'kick <name>') in #support-tickets,
     #admin-terminal, or #it-kick-list removes the member from Discord AND the
@@ -1297,36 +1333,15 @@ async def _maybe_handle_kick_out_command(message: discord.Message) -> bool:
     if not isinstance(message.author, discord.Member) or not _is_staff(message.author):
         return False
 
-    async def _reply_channel():
-        # support-tickets uses Discord's auto-thread feature: the triggering
-        # message lives in the parent channel and spawns a same-id companion
-        # thread as a SIDE EFFECT that can land after on_message already fired —
-        # message.thread captured once at handler-start can still be None even
-        # though the thread exists by the time we're ready to reply (kick +
-        # GitHub removal + email resolution all take real time first). Re-check
-        # fresh every time instead of trusting a value cached at the top.
-        if message.thread is not None:
-            return message.thread
-        cached = message.channel.get_thread(message.id) if hasattr(message.channel, "get_thread") else None
-        if cached is not None:
-            return cached
-        try:
-            fresh = await message.channel.fetch_message(message.id)
-            if fresh.thread is not None:
-                return fresh.thread
-        except Exception:
-            pass
-        return message.channel
-
     target = _resolve_kick_target(message, match.group(1))
     if target is None:
-        await (await _reply_channel()).send(f"{message.author.mention} Couldn't find that member to kick.")
+        await (await _resolve_reply_channel(message)).send(f"{message.author.mention} Couldn't find that member to kick.")
         return True
     if target.id == message.author.id:
-        await (await _reply_channel()).send(f"{message.author.mention} You cannot kick yourself.")
+        await (await _resolve_reply_channel(message)).send(f"{message.author.mention} You cannot kick yourself.")
         return True
     if target.guild_permissions.administrator or (STAFF_ROLE_ID is not None and target.get_role(STAFF_ROLE_ID) is not None):
-        await (await _reply_channel()).send(f"{message.author.mention} Cannot kick an Admin/staff member this way.")
+        await (await _resolve_reply_channel(message)).send(f"{message.author.mention} Cannot kick an Admin/staff member this way.")
         return True
 
     reason = f"Kicked by {message.author} via kick-out command in #{getattr(message.channel, 'name', message.channel.id)}"[:512]
@@ -1352,11 +1367,11 @@ async def _maybe_handle_kick_out_command(message: discord.Message) -> bool:
         await target.kick(reason=reason)
     except discord.Forbidden:
         discord_ok = False
-        await (await _reply_channel()).send(f"{message.author.mention} I don't have permission to kick {target.mention} (check my role position).")
+        await (await _resolve_reply_channel(message)).send(f"{message.author.mention} I don't have permission to kick {target.mention} (check my role position).")
     except Exception:
         discord_ok = False
         logger.exception("Failed to kick member %s via kick-out command", target.id)
-        await (await _reply_channel()).send(f"{message.author.mention} Failed to kick {target.mention} from Discord.")
+        await (await _resolve_reply_channel(message)).send(f"{message.author.mention} Failed to kick {target.mention} from Discord.")
 
     github_ok = False
     github_note = "no mapped GitHub username, skipped"
@@ -1372,7 +1387,8 @@ async def _maybe_handle_kick_out_command(message: discord.Message) -> bool:
         f"{'✅' if github_ok else '⚠️'} GitHub org removal: {github_note}\n"
         f"📧 Termination notice: {notice_outcome}"
     )
-    await (await _reply_channel()).send(summary)
+    summary_channel = await _resolve_reply_channel(message)
+    await summary_channel.send(summary)
     if STAFF_CHANNEL_ID:
         log_channel = await _channel_from_id(STAFF_CHANNEL_ID)
         if log_channel:
@@ -1380,6 +1396,14 @@ async def _maybe_handle_kick_out_command(message: discord.Message) -> bool:
                 await log_channel.send(f"{message.author.mention} kicked {target} ({target.id}) via kick-out command.\n{summary}")
             except Exception:
                 pass
+
+    # Same as IPCA's resolve-and-archive: the kick-out ticket is now handled,
+    # close it out the way a human staffer would rather than leaving it open.
+    if isinstance(summary_channel, discord.Thread):
+        try:
+            await summary_channel.edit(archived=True, locked=False, reason="Kick-out resolved")
+        except Exception:
+            logger.exception("Failed to archive kick-out ticket thread %s", summary_channel.id)
     return True
 
 
@@ -1971,11 +1995,21 @@ def _create_and_register_bot() -> DeepiriBot:
 
     @new_bot.event  # type: ignore[attr-defined]
     async def on_member_join(member: discord.Member) -> None:  # type: ignore[no-redef]
+        # This channel post and the DM below are independent -- a permission
+        # failure on one (confirmed happening: bot lacks Send Messages in
+        # SERVER_COM_CHANNEL_ID) must never take down the other. Previously
+        # unguarded, so a 403 here silently killed the whole handler before it
+        # ever reached the DM containing the actual onboarding questionnaire.
         welcome_channel = await _channel_from_id(SERVER_COM_CHANNEL_ID)
         if welcome_channel:
-            await welcome_channel.send(
-                f"Welcome {member.mention}! Please sign the IPCA first, then run /github-invite-request in the support tickets channel to request a GitHub invite."
-            )
+            try:
+                await welcome_channel.send(
+                    f"Welcome {member.mention}! Please sign the IPCA first, then run /github-invite-request in the support tickets channel to request a GitHub invite."
+                )
+            except discord.Forbidden:
+                logger.warning("Missing permission to post welcome message in channel %s", SERVER_COM_CHANNEL_ID)
+            except Exception:
+                logger.exception("Failed to post welcome message for %s", member.id)
         try:
             await member.send(
                 "Welcome to Deepiri. Before joining the DEV team, please sign the IPCA. "
@@ -2035,7 +2069,7 @@ def _create_and_register_bot() -> DeepiriBot:
             return
         await _maybe_auto_assign_ipca_roles(message)
         if _is_announcements_channel(message.channel):
-            title = format_discussion_title(message.content)
+            title = format_discussion_title(resolve_discord_mentions(message, message.content or ""))
             body = format_discussion_body(message)
             try:
                 await create_github_discussion(title, body)
