@@ -7,6 +7,7 @@ import os
 import random
 import re
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
@@ -19,11 +20,15 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 from bot import format_discussion_body, format_discussion_title
-from github import add_user_to_team, invite_user, remove_user_from_org, remove_user_from_team
+from emailer import send_email
+from github import add_user_to_team, get_user_profile, invite_user, is_org_member, list_org_members, remove_user_from_org, remove_user_from_team
+from identity_match import best_match
 from github_discussion import GitHubDiscussionError, create_github_discussion
 from meetings import setup_meeting_features
 from onboarding import ApprovalView
-from plaky import create_task, get_tasks
+from member_email_store import load_member_email, save_member_email
+from plaky import create_task, find_user_email, get_tasks
+from state_store import load_last_online_at, save_last_online_at
 
 
 load_dotenv()
@@ -68,6 +73,16 @@ QA_ROLE_ID = _int_env("QA_ROLE_ID")
 ANNOUNCEMENTS_CHANNEL_ID = _int_env("DISCORD_CHANNEL_ID") or _int_env("ANNOUNCEMENTS_CHANNEL_ID")  # #announcements 1436509524818395156
 ANNOUNCEMENTS_CHANNEL_NAME = os.getenv("DISCORD_CHANNEL_NAME", "announcements")
 
+# Channels where staff can say "kick out <name>" to remove someone from both
+# Discord and the GitHub org in one shot. Env-overridable, defaulting to the IDs
+# actually in use so this works without extra Render config.
+ADMIN_TERMINAL_CHANNEL_ID = _int_env("ADMIN_TERMINAL_CHANNEL_ID") or 1437210346975924347  # #admin-terminal
+IT_KICK_LIST_CHANNEL_ID = _int_env("IT_KICK_LIST_CHANNEL_ID") or 1494803547957760000  # #it-kick-list
+KICK_OUT_COMMAND_CHANNEL_IDS = {
+    cid for cid in (SUPPORT_SESSIONS_CHANNEL_ID, ADMIN_TERMINAL_CHANNEL_ID, IT_KICK_LIST_CHANNEL_ID) if cid is not None
+}
+KICK_OUT_COMMAND_RE = re.compile(r"^\s*kick\s*(?:out)?\s+(.+)$", re.IGNORECASE)
+
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "0.0.0.0")
 WEBHOOK_PORT = int(os.getenv("PORT") or os.getenv("WEBHOOK_PORT", "8080"))
 
@@ -97,6 +112,42 @@ URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 PR_URL_RE = re.compile(r"https?://(?:www\.)?github\.com/[^\s]+/[^\s]+/pull/(\d+)", re.IGNORECASE)
 PLAKY_URL_RE = re.compile(r"https?://(?:www\.)?app\.plaky\.com/\S+", re.IGNORECASE)
 GITHUB_USERNAME_RE = re.compile(r"^[A-Za-z\d](?:[A-Za-z\d-]{0,37}[A-Za-z\d])?$")
+EMAIL_SEARCH_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+
+# New-member onboarding: DM asks for email + role, each reply classified
+# independently (no conversation state to track/lose on a restart). IT/Security &
+# Operations Support is excluded by name before any fuzzy scoring runs -- it has
+# elevated permissions and must never be self-assignable through this flow.
+# Matched by fuzzy confidence against the known real name rather than requiring a
+# role ID to be configured -- same "look it up live" approach as the categories
+# below, and it still catches a renamed/differently-cased role since it's a
+# similarity match, not an exact string.
+_IT_ROLE_WORD_RE = re.compile(r"\bit\b", re.IGNORECASE)
+_ELEVATED_ROLE_REFERENCE_NAME = "Security & Operations Support"
+_ELEVATED_ROLE_EXCLUDE_MIN_SCORE = 0.75
+
+
+def _is_elevated_role(role_name: str) -> bool:
+    if _IT_ROLE_WORD_RE.search(role_name):
+        return True
+    match = best_match(role_name, [_ELEVATED_ROLE_REFERENCE_NAME], min_score=_ELEVATED_ROLE_EXCLUDE_MIN_SCORE)
+    return match is not None
+
+_ROLE_CATEGORY_PATTERNS = [
+    ("AI Engineer", [re.compile(r"\bai\b", re.IGNORECASE)], False),
+    ("ML Engineer", [re.compile(r"\bml\b", re.IGNORECASE), re.compile(r"\bmachine\s+learning\b", re.IGNORECASE)], False),
+    ("Data Engineer", [re.compile(r"\bdata\b", re.IGNORECASE)], False),
+    ("Cloud/Infra/Security Engineer", [re.compile(r"\b(cloud|infra(structure)?|security)\b", re.IGNORECASE)], True),
+    ("Frontend Engineer", [re.compile(r"\bfront[-\s]?end\b", re.IGNORECASE)], False),
+    ("Fullstack Engineer", [re.compile(r"\bfull[-\s]?stack\b", re.IGNORECASE)], False),
+    ("Backend Engineer", [re.compile(r"\bback[-\s]?end\b", re.IGNORECASE)], False),
+]
+_ENGINEER_WORD_RE = re.compile(r"\bengineer\b", re.IGNORECASE)
+_ROLE_ATTEMPT_HINT_RE = re.compile(
+    r"\b(ai|ml|data|cloud|infra|infrastructure|security|frontend|front-end|front end|"
+    r"fullstack|full-stack|full stack|backend|back-end|back end|engineer|developer|dev|role|team|it)\b",
+    re.IGNORECASE,
+)
 GITHUB_RESERVED_PATHS = {
     "about",
     "account",
@@ -385,6 +436,77 @@ def _get_github_username_for_member(member: discord.Member) -> Optional[str]:
             # Only use if single word
             if " " not in candidate.strip():
                 return candidate.strip().lower()
+    return None
+
+
+async def _find_github_username_in_profiles_channel(member: discord.Member) -> Optional[str]:
+    """Fallback when there's no explicit mapping and the name-guess heuristic fails:
+    scan #github-profiles for a message *authored by this exact member* containing
+    their GitHub profile link (that's what the channel is for — no fuzzy name
+    matching needed, just match by author.id), then verify the extracted username
+    is an actual member of GITHUB_ORG before trusting it — a stale/wrong link
+    shouldn't silently pass through into a destructive op like org removal.
+    """
+    if GITHUB_PROFILES_CHANNEL_ID is None:
+        logger.warning("#github-profiles scan for %s skipped: GITHUB_PROFILES_CHANNEL_ID not configured", member.id)
+        return None
+    channel = await _channel_from_id(GITHUB_PROFILES_CHANNEL_ID)
+    if channel is None:
+        logger.warning("#github-profiles scan for %s skipped: could not resolve channel %s", member.id, GITHUB_PROFILES_CHANNEL_ID)
+        return None
+    scanned = 0
+    messages_from_author = 0
+    try:
+        async for msg in channel.history(limit=1000):
+            scanned += 1
+            if msg.author.id != member.id:
+                continue
+            messages_from_author += 1
+            candidate = _extract_github_profile_username(msg.content or "")
+            if not candidate:
+                logger.info("#github-profiles: message from %s has no extractable GitHub link: %r", member.id, msg.content[:200])
+                continue
+            if not await asyncio.to_thread(is_org_member, candidate, GITHUB_ORG, GITHUB_PAT):
+                logger.warning("Found GitHub link %s for %s in #github-profiles but they're not in %s", candidate, member.id, GITHUB_ORG)
+                continue
+            logger.info("#github-profiles: matched %s -> %s after scanning %s messages", member.id, candidate, scanned)
+            _remember_github_username(member.id, candidate)
+            return candidate
+    except Exception:
+        logger.exception("Failed scanning #github-profiles for member %s", member.id)
+        return None
+    logger.warning(
+        "#github-profiles: scanned %s messages, found %s from member %s, no usable GitHub link",
+        scanned, messages_from_author, member.id,
+    )
+    return None
+
+
+async def _find_github_username_via_org_roster(member: discord.Member) -> Optional[str]:
+    """Last resort: fuzzy-match the Discord name against the full GitHub org
+    member list. GitHub logins are often nothing like a real name, but they
+    sometimes genuinely overlap -- a Discord handle like "mahlaka." can be a
+    truncated form of the GitHub login "samimahlaka" (SequenceMatcher ratio
+    ~0.78 there, comfortably above best_match's threshold). Every candidate
+    here is already a confirmed org member by construction, so no separate
+    is_org_member re-check is needed the way the other two sources require.
+    """
+    if not GITHUB_ORG or not GITHUB_PAT:
+        logger.warning("Org roster fallback for %s skipped: GITHUB_ORG or GITHUB_PAT not configured", member.id)
+        return None
+    usernames = await asyncio.to_thread(list_org_members, GITHUB_ORG, GITHUB_PAT)
+    if not usernames:
+        logger.warning("Org roster fallback for %s: list_org_members returned nothing", member.id)
+        return None
+    for candidate_name in (member.display_name, str(getattr(member, "global_name", "") or ""), str(member.name)):
+        if not candidate_name:
+            continue
+        match = best_match(candidate_name, usernames)
+        if match is not None:
+            logger.info("Org roster fallback: matched %s (query %r) -> %s", member.id, candidate_name, usernames[match.index])
+            _remember_github_username(member.id, usernames[match.index])
+            return usernames[match.index]
+    logger.warning("Org roster fallback for %s: no confident match among %s org members", member.id, len(usernames))
     return None
 
 
@@ -1248,6 +1370,135 @@ async def platform_announcement_handler(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+_ALERT_SEVERITY_COLORS = {
+    "critical": discord.Color.dark_red(),
+    "error": discord.Color.red(),
+    "warning": discord.Color.orange(),
+    "info": discord.Color.blue(),
+}
+
+# Fallback "how to handle this" guidance when the sender doesn't provide its own
+# `steps`/`runbook` — so #it-notifications alerts are never just a bare "something
+# broke" with no next action.
+_DEFAULT_ALERT_STEPS = {
+    "critical": (
+        "1. You were DMed for this one — acknowledge in #it-notifications so others know it's being worked.\n"
+        "2. Check the service on the VM: `docker ps` / `docker logs <container>` for the named service.\n"
+        "3. If it's Postgres/Redis, check `docker logs deepiri-postgres-platform` / `deepiri-redis` first — most other services depend on them.\n"
+        "4. If the container is down, `docker compose up -d --no-deps <service>`; if it's crash-looping, check recent deploys/config changes.\n"
+        "5. Once resolved, confirm the 'recovered' alert lands here before standing down."
+    ),
+    "warning": (
+        "1. No page yet — this is a first-failure or a rejected/unauthorized request, not confirmed down.\n"
+        "2. If it's a service health check: watch for either a 'recovered' or an escalation to critical.\n"
+        "3. If it's a rejected webhook signature: check whether it's expected traffic (e.g. a rotated secret) vs. a probe — repeated rejections from the same source are worth investigating.\n"
+        "4. No action needed unless this repeats or escalates."
+    ),
+    "info": (
+        "Informational — no action needed. Health summaries and recoveries land here so the channel stays a complete log."
+    ),
+}
+
+
+async def _get_primary_guild() -> Optional[discord.Guild]:
+    """This bot only ever operates in one guild; there's no GUILD_ID env var, so
+    resolve it via any well-known channel instead."""
+    for candidate_channel_id in (STAFF_CHANNEL_ID, SUPPORT_SESSIONS_CHANNEL_ID, ANNOUNCEMENTS_CHANNEL_ID):
+        channel = await _channel_from_id(candidate_channel_id)
+        if channel is not None and getattr(channel, "guild", None) is not None:
+            return channel.guild
+    return None
+
+
+async def _dm_role_members(role_id: int, embed: discord.Embed) -> int:
+    """Critical alerts don't wait for someone to be looking at #it-notifications —
+    DM every member holding the given role (Security & Operations Support) directly.
+    Best-effort per member: one blocked-DMs member shouldn't stop the rest."""
+    guild = await _get_primary_guild()
+    if guild is None:
+        logger.warning("Could not resolve a guild to DM role %s for a critical alert", role_id)
+        return 0
+
+    role = guild.get_role(role_id)
+    if role is None:
+        logger.warning("Role %s not found in guild %s; cannot DM for critical alert", role_id, guild.id)
+        return 0
+
+    sent = 0
+    for member in role.members:
+        if member.bot:
+            continue
+        try:
+            await member.send(embed=embed)
+            sent += 1
+        except Exception:
+            logger.warning("Could not DM %s (%s) for critical alert", member, member.id)
+    return sent
+
+
+async def platform_alert_handler(request: web.Request) -> web.Response:
+    """Inbound webhook for platform.deepiri.com system/security notifications
+    (auth failures, webhook signature rejections, backend errors, etc.) -> posted
+    into #it-notifications (STAFF_CHANNEL_ID). Same signed-webhook scheme as the
+    announcements bridge — shares ANNOUNCEMENTS_INBOUND_SECRET since it's the same
+    trust boundary (platform.deepiri.com talking to Norozo).
+    """
+    raw_body = await request.read()
+
+    if not ANNOUNCEMENTS_INBOUND_SECRET:
+        logger.error("Platform alert webhook disabled: ANNOUNCEMENTS_INBOUND_SECRET is not configured")
+        return web.json_response({"ok": False, "message": "Webhook authentication is not configured"}, status=503)
+
+    sig_header = (
+        request.headers.get("X-Norozo-Signature")
+        or request.headers.get("X-Platform-Signature")
+        or ""
+    )
+    if not sig_header or not _is_valid_announcement_signature(raw_body, sig_header, ANNOUNCEMENTS_INBOUND_SECRET):
+        return web.json_response({"ok": False, "message": "Missing or invalid signature"}, status=401)
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except Exception:
+        return web.json_response({"ok": False, "message": "Invalid JSON"}, status=400)
+
+    title = str(payload.get("title") or "Platform Alert").strip()[:256]
+    message_text = str(payload.get("message") or payload.get("body") or "").strip()
+    service = str(payload.get("service") or "platform.deepiri.com").strip()
+    severity = str(payload.get("severity") or "info").strip().lower()
+    steps = str(payload.get("steps") or payload.get("runbook") or "").strip()
+    if not message_text:
+        return web.json_response({"ok": False, "message": "Missing message/body"}, status=400)
+
+    if STAFF_CHANNEL_ID is None:
+        return web.json_response({"ok": False, "message": "STAFF_CHANNEL_ID not configured"}, status=500)
+    channel = await _channel_from_id(STAFF_CHANNEL_ID)
+    if not channel:
+        return web.json_response({"ok": False, "message": "it-notifications channel not found"}, status=500)
+
+    embed = discord.Embed(
+        title=title,
+        description=message_text[:4000],
+        color=_ALERT_SEVERITY_COLORS.get(severity, discord.Color.blue()),
+    )
+    if not steps:
+        steps = _DEFAULT_ALERT_STEPS.get(severity, _DEFAULT_ALERT_STEPS["warning"])
+    embed.add_field(name="How to handle", value=steps[:1024], inline=False)
+    embed.set_footer(text=f"{service} • {severity.upper()}")
+
+    try:
+        await channel.send(embed=embed)
+    except Exception:
+        logger.exception("Failed to post platform alert to Discord")
+        return web.json_response({"ok": False, "message": "Failed to post to Discord"}, status=500)
+
+    dm_count = 0
+    if severity == "critical" and IT_OPERATIONS_SUPPORT_ROLE_ID is not None:
+        dm_count = await _dm_role_members(IT_OPERATIONS_SUPPORT_ROLE_ID, embed)
+
+    return web.json_response({"ok": True, "dmed": dm_count})
+
+
 async def health_handler(_: web.Request) -> web.Response:
     announcement_webhook_ready = bool(ANNOUNCEMENTS_INBOUND_SECRET)
     return web.json_response(
@@ -1266,6 +1517,8 @@ async def start_webhook_server() -> None:
     app.router.add_post("/announcements/webhook", platform_announcement_handler)
     app.router.add_post("/platform/announcements", platform_announcement_handler)
     app.router.add_post("/webhooks/platform-announcements", platform_announcement_handler)
+    app.router.add_post("/alerts/webhook", platform_alert_handler)
+    app.router.add_post("/webhooks/platform-alerts", platform_alert_handler)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -1315,6 +1568,8 @@ def _create_and_register_bot() -> DeepiriBot:
         except Exception:
             logger.exception("Failed to start meeting loop")
         asyncio.create_task(_sweep_open_support_threads_for_ipca(new_bot))
+        asyncio.create_task(_catch_up_since_last_online(new_bot))
+        asyncio.create_task(_heartbeat_last_online())
 
     @new_bot.event  # type: ignore[attr-defined]
     async def on_member_join(member: discord.Member) -> None:  # type: ignore[no-redef]
@@ -1326,7 +1581,10 @@ def _create_and_register_bot() -> DeepiriBot:
         try:
             await member.send(
                 "Welcome to Deepiri. Before joining the DEV team, please sign the IPCA. "
-                "After signing, run /github-invite-request in the support tickets channel so IT/staff can approve your GitHub invite."
+                "After signing, run /github-invite-request in the support tickets channel so IT/staff can approve your GitHub invite.\n\n"
+                "Also, reply here with your email so we can keep it on file, your GitHub profile link, "
+                "and which team you're on: AI, ML, Data, Cloud/Infra/Security Engineer, Frontend, Fullstack, or Backend. "
+                "You can send these as separate messages, in any order."
             )
         except discord.Forbidden:
             pass
@@ -1368,8 +1626,15 @@ def _create_and_register_bot() -> DeepiriBot:
     async def on_message(message: discord.Message) -> None:  # type: ignore[no-redef]
         if message.author.bot:
             return
+        if message.guild is None:
+            await _maybe_handle_onboarding_dm(message)
+            await new_bot.process_commands(message)
+            return
         content = message.content or ""
         await notify_support_team_for_message(message)
+        if await _maybe_handle_kick_out_command(message):
+            await new_bot.process_commands(message)
+            return
         await _maybe_auto_assign_ipca_roles(message)
         if _is_announcements_channel(message.channel):
             title = format_discussion_title(message.content)

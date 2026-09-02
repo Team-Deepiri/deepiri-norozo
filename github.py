@@ -69,6 +69,34 @@ def _get_user_id(username: str, github_pat: str) -> Dict[str, Any]:
     return {"ok": True, "user_id": payload.get("id")}
 
 
+def get_user_profile(username: str, github_pat: str) -> Dict[str, Optional[str]]:
+    """GitHub's `name` field is the account holder's real display name (e.g. login
+    "jrb00013" -> name "Joe Black") -- a much stronger signal to feed into a Plaky
+    name lookup than the raw GitHub login or a Discord handle, since it's the
+    person's own self-reported name rather than an arbitrary account identifier.
+    `email` is only populated if the user made it public on their profile, so
+    both fields are best-effort, not guaranteed.
+    """
+    if not username or not github_pat:
+        return {"email": None, "name": None}
+    headers = {
+        "Authorization": f"Bearer {github_pat}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    url = f"{GITHUB_API_BASE}/users/{username}"
+    response = _request_with_rate_limit_retry("GET", url, headers=headers)
+    if response.status_code != 200:
+        return {"email": None, "name": None}
+    payload = response.json()
+    return {"email": payload.get("email") or None, "name": payload.get("name") or None}
+
+
+def get_user_email(username: str, github_pat: str) -> Optional[str]:
+    """Thin wrapper over get_user_profile for callers that only need the email."""
+    return get_user_profile(username, github_pat).get("email")
+
+
 def add_user_to_team(username: str, github_org: str, github_pat: str, team_slug: str) -> Dict[str, Any]:
     """Add a GitHub user to a team in the configured org by username."""
     normalized_org = _normalize_org_name(github_org)
@@ -129,6 +157,52 @@ def add_user_to_team(username: str, github_org: str, github_pat: str, team_slug:
         "status": response.status_code,
         "message": f"GitHub team assignment failed ({response.status_code}): {response.text[:200]}",
     }
+
+
+def is_org_member(username: str, github_org: str, github_pat: str) -> bool:
+    """Check the actual org roster rather than trusting a guessed/extracted username —
+    GET /orgs/{org}/members/{username} returns 204 if they're a member, 404 otherwise."""
+    normalized_org = _normalize_org_name(github_org)
+    if not github_pat or not normalized_org or not username:
+        return False
+    headers = {
+        "Authorization": f"Bearer {github_pat}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    url = f"{GITHUB_API_BASE}/orgs/{normalized_org}/members/{username}"
+    response = _request_with_rate_limit_retry("GET", url, headers=headers)
+    return response.status_code == 204
+
+
+def list_org_members(github_org: str, github_pat: str) -> list:
+    """Full org roster (paginated), for fuzzy-matching a Discord name against
+    when there's no explicit mapping and #github-profiles has nothing for them.
+    Last-resort source -- GitHub logins are often nothing like a real name, but
+    when they overlap (a shortened Discord handle vs a fuller GitHub login) it's
+    worth trying rather than giving up."""
+    normalized_org = _normalize_org_name(github_org)
+    if not github_pat or not normalized_org:
+        return []
+    headers = {
+        "Authorization": f"Bearer {github_pat}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    usernames: list = []
+    url = f"{GITHUB_API_BASE}/orgs/{normalized_org}/members?per_page=100"
+    while url:
+        response = _request_with_rate_limit_retry("GET", url, headers=headers)
+        if response.status_code != 200:
+            break
+        usernames.extend(u.get("login") for u in response.json() if u.get("login"))
+        next_url = None
+        link_header = response.headers.get("Link", "")
+        for part in link_header.split(","):
+            if 'rel="next"' in part:
+                next_url = part[part.find("<") + 1 : part.find(">")]
+        url = next_url
+    return usernames
 
 
 def remove_user_from_org(username: str, github_org: str, github_pat: str) -> Dict[str, Any]:
