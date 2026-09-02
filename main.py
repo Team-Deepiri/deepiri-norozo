@@ -21,12 +21,13 @@ from dotenv import load_dotenv
 
 from bot import format_discussion_body, format_discussion_title, resolve_discord_mentions
 from emailer import send_email
-from github import add_user_to_team, get_user_profile, invite_user, is_org_member, list_org_members, remove_user_from_org, remove_user_from_team
+from github import add_user_to_team, get_user_profile, invite_user, is_org_member, list_open_prs, list_org_members, remove_user_from_org, remove_user_from_team
 from identity_match import best_match
 from github_discussion import GitHubDiscussionError, create_github_discussion
 from meetings import setup_meeting_features
 from onboarding import ApprovalView
 from member_email_store import load_member_email, save_member_email
+from pr_staleness_store import find_discord_id_by_email, load_pr_staleness, save_pr_staleness
 from plaky import create_task, find_user_email, get_tasks
 from state_store import load_last_online_at, save_last_online_at
 
@@ -82,6 +83,16 @@ KICK_OUT_COMMAND_CHANNEL_IDS = {
     cid for cid in (SUPPORT_SESSIONS_CHANNEL_ID, ADMIN_TERMINAL_CHANNEL_ID, IT_KICK_LIST_CHANNEL_ID) if cid is not None
 }
 KICK_OUT_COMMAND_RE = re.compile(r"^\s*kick\s*(?:out)?\s+(.+)$", re.IGNORECASE)
+
+# PR staleness escalation: 2 weeks -> #qa-support-team, 2.5 weeks -> DM the
+# author, 1 month -> #announcements (public, by then it's earned the visibility).
+# Env-overridable, defaulting to the IDs actually in use.
+PR_STALE_QA_CHANNEL_ID = _int_env("PR_STALE_QA_CHANNEL_ID") or 1438705614649032755  # #qa-support-team
+PR_STALE_ANNOUNCE_CHANNEL_ID = _int_env("PR_STALE_ANNOUNCE_CHANNEL_ID") or 1436509524818395156  # #announcements
+PR_STALE_2WEEK_DAYS = 14
+PR_STALE_2_5WEEK_DAYS = 17.5
+PR_STALE_1MONTH_DAYS = 30
+PR_STALE_SCAN_INTERVAL_SECONDS = 6 * 60 * 60  # 6 hours -- PR age changes slowly
 
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "0.0.0.0")
 WEBHOOK_PORT = int(os.getenv("PORT") or os.getenv("WEBHOOK_PORT", "8080"))
@@ -592,6 +603,175 @@ async def _find_github_username_via_org_roster(member: discord.Member) -> Option
             return usernames[match.index]
     logger.warning("Org roster fallback for %s: no confident match among %s org members", member.id, len(usernames))
     return None
+
+
+async def _resolve_discord_member_for_github_login(login: str, guild: discord.Guild) -> Optional[discord.Member]:
+    """Reverse direction of the GitHub<->Discord identity chain used everywhere
+    else this session (kick-out resolves Discord->GitHub; this resolves
+    GitHub->Discord for PR staleness pings), going through Plaky as an
+    intermediate hop for more context when GitHub/Discord alone aren't enough:
+
+    1. Reverse-check the persisted github_username_map -- if some discord_id
+       already maps to this login (built by kick-out's resolution + the
+       onboarding DM's github-link capture), done instantly.
+    2. GitHub's real display name fuzzy-matched against current guild members'
+       display_name/global_name/name (identity_match.best_match, same
+       refuse-rather-than-guess philosophy as everywhere else).
+    3. Plaky hop: find_user_email([login, real_name], ...) -- if Plaky has this
+       person under a self-reported email, reverse-look that email up against
+       member_emails (self-reported at onboarding) to land on a discord_id
+       directly.
+
+    Persists a successful match back into the github_username_map so this
+    resolves instantly next time. Returns None (never guesses) if nothing
+    confident is found anywhere in the chain.
+    """
+    if not login:
+        return None
+
+    mapping = _load_github_username_map()
+    login_lower = login.strip().lower()
+    for discord_id_str, mapped_login in mapping.items():
+        if mapped_login.strip().lower() == login_lower:
+            member = guild.get_member(int(discord_id_str))
+            if member is not None:
+                return member
+
+    profile = await asyncio.to_thread(get_user_profile, login, GITHUB_PAT) if GITHUB_PAT else {"name": None, "email": None}
+    real_name = profile.get("name")
+
+    if real_name:
+        candidate_members = list(guild.members)
+        candidate_names = [m.display_name for m in candidate_members]
+        match = best_match(real_name, candidate_names)
+        if match is not None:
+            member = candidate_members[match.index]
+            _remember_github_username(member.id, login)
+            logger.info("PR staleness identity: matched GitHub %s (name %r) -> Discord %s via name fuzzy match", login, real_name, member.id)
+            return member
+
+    if PLAKY_API_KEY:
+        plaky_email = await asyncio.to_thread(find_user_email, [n for n in (real_name, login) if n], PLAKY_API_KEY)
+        if plaky_email:
+            discord_id_str = await find_discord_id_by_email(plaky_email)
+            if discord_id_str:
+                try:
+                    member = guild.get_member(int(discord_id_str))
+                except ValueError:
+                    member = None
+                if member is not None:
+                    _remember_github_username(member.id, login)
+                    logger.info("PR staleness identity: matched GitHub %s -> Plaky email %s -> Discord %s", login, plaky_email, member.id)
+                    return member
+
+    logger.warning("PR staleness identity: could not resolve GitHub login %s to any Discord member", login)
+    return None
+
+
+async def _post_pr_staleness_tier(pr: dict, tier: str, member: Optional[discord.Member]) -> None:
+    """Fire one escalation tier for one PR. Best-effort throughout -- a failure
+    posting to one channel/DM must not prevent the tier from being recorded
+    (recording anyway avoids retry-storming a channel the bot lacks permission
+    to post in on every scan)."""
+    age_days = tier
+    repo, number, title, url = pr["repo"], pr["number"], pr["title"], pr["html_url"]
+
+    if tier == "2week":
+        channel = await _channel_from_id(PR_STALE_QA_CHANNEL_ID)
+        if channel is not None:
+            try:
+                await channel.send(f"PR #{number} in {repo} (\"{title}\") has been open 2 weeks: {url}")
+            except Exception:
+                logger.exception("Failed to post 2-week PR staleness notice for %s#%s", repo, number)
+    elif tier == "2_5week":
+        if member is not None:
+            try:
+                await member.send(
+                    f"Hey — your PR #{number} in {repo} (\"{title}\") has been open about 2.5 weeks. "
+                    f"No pressure, just a nudge to take a look when you get a chance: {url}"
+                )
+            except Exception:
+                logger.exception("Failed to DM 2.5-week PR staleness notice to %s for %s#%s", member.id, repo, number)
+    elif tier == "1month":
+        channel = await _channel_from_id(PR_STALE_ANNOUNCE_CHANNEL_ID)
+        if channel is not None:
+            embed = discord.Embed(
+                title="PR open over 1 month",
+                description=f"[#{number} in {repo}]({url})\n\n{title}",
+                color=discord.Color.red(),
+            )
+            mention = member.mention if member is not None else None
+            try:
+                await channel.send(content=mention, embed=embed)
+            except Exception:
+                logger.exception("Failed to post 1-month PR staleness notice for %s#%s", repo, number)
+    _ = age_days  # tier name doubles as a label; no separate age needed here
+
+
+async def _scan_stale_prs(guild: discord.Guild) -> None:
+    """Runs periodically: every open PR org-wide, escalating through three
+    tiers exactly once each. Bot-authored and draft PRs are skipped entirely --
+    a bot has no Discord identity, and a draft isn't yet asking for review."""
+    if not GITHUB_ORG or not GITHUB_PAT:
+        logger.warning("PR staleness scan skipped: GITHUB_ORG or GITHUB_PAT not configured")
+        return
+    prs = await asyncio.to_thread(list_open_prs, GITHUB_ORG, GITHUB_PAT)
+    if not prs:
+        return
+
+    now = datetime.now(timezone.utc)
+    for pr in prs:
+        if pr.get("draft"):
+            continue
+        author_login = pr.get("author_login") or ""
+        if author_login.endswith("[bot]"):
+            continue
+        created_at_raw = pr.get("created_at")
+        if not created_at_raw:
+            continue
+        try:
+            created_at = datetime.fromisoformat(created_at_raw.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        age_days = (now - created_at).total_seconds() / 86400.0
+
+        state = await load_pr_staleness(pr["repo"], pr["number"])
+        member = None
+        if state["resolved_discord_id"]:
+            try:
+                member = guild.get_member(int(state["resolved_discord_id"]))
+            except ValueError:
+                member = None
+
+        needs_identity = (
+            (age_days >= PR_STALE_2_5WEEK_DAYS and not state["notified_2_5week"])
+            or (age_days >= PR_STALE_1MONTH_DAYS and not state["notified_1month"])
+        )
+        if member is None and needs_identity and author_login:
+            member = await _resolve_discord_member_for_github_login(author_login, guild)
+            if member is not None:
+                await save_pr_staleness(pr["repo"], pr["number"], resolved_discord_id=str(member.id))
+
+        if age_days >= PR_STALE_2WEEK_DAYS and not state["notified_2week"]:
+            await _post_pr_staleness_tier(pr, "2week", member)
+            await save_pr_staleness(pr["repo"], pr["number"], notified_2week=True)
+        if age_days >= PR_STALE_2_5WEEK_DAYS and not state["notified_2_5week"]:
+            await _post_pr_staleness_tier(pr, "2_5week", member)
+            await save_pr_staleness(pr["repo"], pr["number"], notified_2_5week=True)
+        if age_days >= PR_STALE_1MONTH_DAYS and not state["notified_1month"]:
+            await _post_pr_staleness_tier(pr, "1month", member)
+            await save_pr_staleness(pr["repo"], pr["number"], notified_1month=True)
+
+
+async def _pr_staleness_scan_loop() -> None:
+    while True:
+        try:
+            guild = await _get_primary_guild()
+            if guild is not None:
+                await _scan_stale_prs(guild)
+        except Exception:
+            logger.exception("PR staleness scan iteration failed")
+        await asyncio.sleep(PR_STALE_SCAN_INTERVAL_SECONDS)
 
 
 async def _forward_announcement_to_platform(message: discord.Message) -> None:
@@ -1992,6 +2172,7 @@ def _create_and_register_bot() -> DeepiriBot:
             logger.exception("Failed to start meeting loop")
         asyncio.create_task(_catch_up_since_last_online(new_bot))
         asyncio.create_task(_heartbeat_last_online())
+        asyncio.create_task(_pr_staleness_scan_loop())
 
     @new_bot.event  # type: ignore[attr-defined]
     async def on_member_join(member: discord.Member) -> None:  # type: ignore[no-redef]
