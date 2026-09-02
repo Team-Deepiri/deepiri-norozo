@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 from datetime import timezone
 from typing import Awaitable, Callable
 
@@ -38,6 +39,25 @@ def _bool_env(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def resolve_discord_mentions(message: discord.Message, text: str) -> str:
+    """Replace raw Discord mention syntax (<@id>, <@&roleid>, <#channelid>) with
+    readable @name/#channel-name text. Anything that consumes message content
+    outside a real Discord client -- the platform.deepiri.com web page, a GitHub
+    Discussion body -- has no way to resolve a bare snowflake ID back into a
+    name on its own; discord.py already resolved these into message.mentions/
+    role_mentions/channel_mentions for free, so use that instead of a raw ID.
+    """
+    for user in getattr(message, "mentions", None) or []:
+        name = getattr(user, "display_name", None) or getattr(user, "name", None) or str(user.id)
+        text = re.sub(rf"<@!?{user.id}>", f"@{name}", text)
+    for role in getattr(message, "role_mentions", None) or []:
+        text = re.sub(rf"<@&{role.id}>", f"@{role.name}", text)
+    for channel in getattr(message, "channel_mentions", None) or []:
+        name = getattr(channel, "name", None) or str(channel.id)
+        text = re.sub(rf"<#{channel.id}>", f"#{name}", text)
+    return text
+
+
 def format_discussion_title(message_content: str) -> str:
     text = (message_content or "").strip()
     if not text:
@@ -56,6 +76,7 @@ def format_discussion_body(message: discord.Message) -> str:
 
     author = f"{message.author}"
     content = (message.content or "").strip()
+    content = resolve_discord_mentions(message, content)
     if not content and message.attachments:
         content = "\n".join(attachment.url for attachment in message.attachments)
 
