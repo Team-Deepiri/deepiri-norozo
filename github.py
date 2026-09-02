@@ -1,6 +1,6 @@
 import logging
 import time
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 from typing import Any, Dict, Optional
 
 import requests
@@ -173,6 +173,50 @@ def is_org_member(username: str, github_org: str, github_pat: str) -> bool:
     url = f"{GITHUB_API_BASE}/orgs/{normalized_org}/members/{username}"
     response = _request_with_rate_limit_retry("GET", url, headers=headers)
     return response.status_code == 204
+
+
+def list_open_prs(github_org: str, github_pat: str) -> list:
+    """All open PRs across the whole org via the Search API in a single
+    paginated query, rather than enumerating every repo and listing each one's
+    PRs individually -- far fewer requests against the rate limit for an org
+    with many repos and few open PRs at any given time.
+    """
+    normalized_org = _normalize_org_name(github_org)
+    if not github_pat or not normalized_org:
+        return []
+    headers = {
+        "Authorization": f"Bearer {github_pat}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    prs: list = []
+    page = 1
+    while page <= 10:  # safety cap: 10 pages * 100 = 1000 open PRs, far more than expected
+        query = urlencode({"q": f"org:{normalized_org} is:pr is:open", "per_page": 100, "page": page})
+        url = f"{GITHUB_API_BASE}/search/issues?{query}"
+        response = _request_with_rate_limit_retry("GET", url, headers=headers)
+        if response.status_code != 200:
+            break
+        payload = response.json()
+        items = payload.get("items", [])
+        if not items:
+            break
+        for item in items:
+            repo_url = item.get("repository_url", "")
+            repo_full_name = "/".join(repo_url.rstrip("/").split("/")[-2:]) if repo_url else ""
+            prs.append({
+                "repo": repo_full_name,
+                "number": item.get("number"),
+                "title": item.get("title"),
+                "html_url": item.get("html_url"),
+                "created_at": item.get("created_at"),
+                "author_login": (item.get("user") or {}).get("login"),
+                "draft": item.get("draft", False),
+            })
+        if len(items) < 100:
+            break
+        page += 1
+    return prs
 
 
 def list_org_members(github_org: str, github_pat: str) -> list:
