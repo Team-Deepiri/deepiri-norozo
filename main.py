@@ -93,6 +93,15 @@ KICK_OUT_COMMAND_RE = re.compile(r"^\s*kick\s*(?:out)?\s+(.+)$", re.IGNORECASE)
 PR_STALE_QA_CHANNEL_ID = _int_env("PR_STALE_QA_CHANNEL_ID") or 1438705614649032755  # #qa-support-team
 # 1-month tier posts to the same #announcements channel used everywhere else --
 # no separate env var, just reuse ANNOUNCEMENTS_CHANNEL_ID.
+# Repos that never count toward staleness at all, for anyone -- demo/scratch
+# repos and the org's .github repo (community-health-file config, not a real
+# project repo). Matched case-insensitively against just the repo name (after
+# the "org/").
+PR_STALE_EXCLUDED_REPOS = {"deepiri-demo", ".github"}
+# Narrower exclusion: specific authors excluded only within specific repos --
+# no QA-channel post, no DM, no reminder of any kind for these, but other
+# authors' PRs in the same repo are still tracked normally.
+PR_STALE_EXCLUDED_AUTHORS_PER_REPO = {"diva": {"jrb00013"}}
 PR_STALE_2WEEK_DAYS = 14
 PR_STALE_2_5WEEK_DAYS = 17.5  # when the recurring author/QA-reviewer DMs start
 PR_STALE_3WEEK_DAYS = 21
@@ -801,9 +810,14 @@ async def _scan_stale_prs(guild: discord.Guild) -> None:
 
     now = datetime.now(timezone.utc)
     for pr in prs:
+        repo_name = (pr.get("repo") or "").split("/")[-1].strip().lower()
+        author_login = pr.get("author_login") or ""
+        if repo_name in PR_STALE_EXCLUDED_REPOS:
+            continue
+        if author_login.strip().lower() in PR_STALE_EXCLUDED_AUTHORS_PER_REPO.get(repo_name, set()):
+            continue
         if pr.get("draft"):
             continue
-        author_login = pr.get("author_login") or ""
         if author_login.endswith("[bot]"):
             continue
         created_at_raw = pr.get("created_at")

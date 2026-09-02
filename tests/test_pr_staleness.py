@@ -313,6 +313,45 @@ async def test_scan_skips_bot_and_draft_prs(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_scan_skips_excluded_repos_for_everyone(monkeypatch):
+    """deepiri-demo and .github never count toward staleness for any author."""
+    demo_pr = _pr(repo="Team-Deepiri/deepiri-demo", number=1, days_old=40, author="anyone")
+    github_pr = _pr(repo="Team-Deepiri/.github", number=2, days_old=40, author="anyone")
+    monkeypatch.setattr(main, "GITHUB_ORG", "Team-Deepiri")
+    monkeypatch.setattr(main, "GITHUB_PAT", "fake")
+    monkeypatch.setattr(main, "list_open_prs", lambda org, pat: [demo_pr, github_pr])
+    monkeypatch.setattr(main, "load_pr_staleness", AsyncMock())
+    qa_post = AsyncMock()
+    monkeypatch.setattr(main, "_post_pr_staleness_qa_channel", qa_post)
+
+    await main._scan_stale_prs(SimpleNamespace(get_member=lambda uid: None))
+
+    qa_post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_scan_skips_jrb00013_in_diva_only(monkeypatch):
+    """jrb00013's PRs in diva are excluded, but other authors' PRs in diva
+    (and jrb00013's PRs in other repos) are still tracked normally."""
+    excluded = _pr(repo="Team-Deepiri/diva", number=1, days_old=15, author="jrb00013")
+    other_author_in_diva = _pr(repo="Team-Deepiri/diva", number=2, days_old=15, author="someoneelse")
+    jrb_in_other_repo = _pr(repo="Team-Deepiri/foo", number=3, days_old=15, author="jrb00013")
+    monkeypatch.setattr(main, "GITHUB_ORG", "Team-Deepiri")
+    monkeypatch.setattr(main, "GITHUB_PAT", "fake")
+    monkeypatch.setattr(main, "list_open_prs", lambda org, pat: [excluded, other_author_in_diva, jrb_in_other_repo])
+    monkeypatch.setattr(main, "load_pr_staleness", AsyncMock(return_value=_default_state()))
+    monkeypatch.setattr(main, "_resolve_discord_member_for_github_login", AsyncMock(return_value=None))
+    monkeypatch.setattr(main, "_resolve_pr_qa_reviewers", AsyncMock(return_value=[]))
+    qa_post = AsyncMock()
+    monkeypatch.setattr(main, "_post_pr_staleness_qa_channel", qa_post)
+
+    await main._scan_stale_prs(SimpleNamespace(get_member=lambda uid: None))
+
+    posted_for = {call.args[0]["number"] for call in qa_post.await_args_list}
+    assert posted_for == {2, 3}
+
+
+@pytest.mark.asyncio
 async def test_scan_does_not_fire_tiers_not_yet_reached(monkeypatch):
     """A PR only 10 days old shouldn't fire any tier at all."""
     pr = _pr(days_old=10)
