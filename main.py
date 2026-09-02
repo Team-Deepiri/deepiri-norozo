@@ -2212,8 +2212,13 @@ async def platform_alert_handler(request: web.Request) -> web.Response:
     embed.add_field(name="How to handle", value=steps[:1024], inline=False)
     embed.set_footer(text=f"{service} • {severity.upper()}")
 
+    # Critical/urgent alerts @ the Security & Operations Support role directly in
+    # the channel post (not just the individual DMs below) so it's visible to
+    # anyone watching #it-notifications, not only the people who got DMed.
+    role_mention = f"<@&{IT_OPERATIONS_SUPPORT_ROLE_ID}>" if severity == "critical" and IT_OPERATIONS_SUPPORT_ROLE_ID is not None else None
+
     try:
-        await channel.send(embed=embed)
+        await channel.send(content=role_mention, embed=embed)
     except Exception:
         logger.exception("Failed to post platform alert to Discord")
         return web.json_response({"ok": False, "message": "Failed to post to Discord"}, status=500)
