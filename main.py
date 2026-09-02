@@ -70,7 +70,7 @@ STAFF_ROLE_ID = _int_env("STAFF_ROLE_ID")
 SUPPORT_SESSIONS_CHANNEL_ID = _int_env("SUPPORT_SESSIONS_CHANNEL_ID")  # #support-tickets 1435722355723993088
 GITHUB_PROFILES_CHANNEL_ID = _int_env("GITHUB_PROFILES_CHANNEL_ID")  # #github-profiles 1435086187822845982
 IT_OPERATIONS_SUPPORT_ROLE_ID = _int_env("IT_OPERATIONS_SUPPORT_ROLE_ID") or _int_env("SUPPORT_TEAM_ROLE_ID")
-QA_ROLE_ID = _int_env("QA_ROLE_ID") or 1436492938229186603  # "QA" Discord role -- also gates PR-staleness QA reviewer pings
+QA_ROLE_ID = _int_env("QA_ROLE_ID")  # "QA" Discord role -- also gates PR-staleness QA reviewer pings; must be set explicitly
 ANNOUNCEMENTS_CHANNEL_ID = _int_env("DISCORD_CHANNEL_ID") or _int_env("ANNOUNCEMENTS_CHANNEL_ID")  # #announcements 1436509524818395156
 ANNOUNCEMENTS_CHANNEL_NAME = os.getenv("DISCORD_CHANNEL_NAME", "announcements")
 
@@ -91,7 +91,8 @@ KICK_OUT_COMMAND_RE = re.compile(r"^\s*kick\s*(?:out)?\s+(.+)$", re.IGNORECASE)
 # how much older the PR gets).
 # Env-overridable, defaulting to the IDs actually in use.
 PR_STALE_QA_CHANNEL_ID = _int_env("PR_STALE_QA_CHANNEL_ID") or 1438705614649032755  # #qa-support-team
-PR_STALE_ANNOUNCE_CHANNEL_ID = _int_env("PR_STALE_ANNOUNCE_CHANNEL_ID") or 1436509524818395156  # #announcements
+# 1-month tier posts to the same #announcements channel used everywhere else --
+# no separate env var, just reuse ANNOUNCEMENTS_CHANNEL_ID.
 PR_STALE_2WEEK_DAYS = 14
 PR_STALE_2_5WEEK_DAYS = 17.5  # when the recurring author/QA-reviewer DMs start
 PR_STALE_3WEEK_DAYS = 21
@@ -747,7 +748,7 @@ async def _dm_pr_staleness_nudge(member: discord.Member, pr: dict, *, as_reviewe
 
 async def _post_pr_staleness_1month(pr: dict, member: Optional[discord.Member]) -> None:
     repo, number, title, url = pr["repo"], pr["number"], pr["title"], pr["html_url"]
-    channel = await _channel_from_id(PR_STALE_ANNOUNCE_CHANNEL_ID)
+    channel = await _channel_from_id(ANNOUNCEMENTS_CHANNEL_ID)
     if channel is None:
         return
     embed = discord.Embed(
