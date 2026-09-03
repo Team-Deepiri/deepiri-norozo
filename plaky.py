@@ -30,6 +30,14 @@ def _leading_name_token(s: str) -> str:
     return m.group(0) if m else ""
 
 
+def _looks_like_account_handle(s: str) -> bool:
+    """True for strings shaped like a Discord/GitHub handle ('wren.h._83898',
+    'joeblack101') rather than a clean human-typed name ('Joe Black') -- a
+    digit, dot, or underscore is never part of a real name but is a normal
+    part of these account handles' random suffixes."""
+    return bool(re.search(r"[\d._]", s or ""))
+
+
 def _request_with_rate_limit_retry(method: str, url: str, headers: Dict[str, str], json: Optional[Dict[str, Any]] = None, params: Optional[Dict[str, Any]] = None, retries: int = 2) -> requests.Response:
     """Perform an HTTP request and retry on 429 using Retry-After when available."""
     for attempt in range(retries + 1):
@@ -188,7 +196,6 @@ def find_user_email(names: List[str], api_key: str, known_emails: Optional[List[
         str(user.get("name") or user.get("displayName") or user.get("username") or "")
         for user in users
     ]
-    leading_candidates = None  # computed lazily, shared across all query names
 
     best = None
     best_query = None
@@ -201,16 +208,26 @@ def find_user_email(names: List[str], api_key: str, known_emails: Optional[List[
         # Discord/GitHub account handles aren't clean human-typed names
         # ("wren.h._83898") -- they carry random suffixes that make every token
         # required to line up, which kills an otherwise-unique first-name match.
-        # Retry on just the leading name token from both sides. Still goes
-        # through best_match's ambiguity refusal, so two people sharing a first
-        # name still won't get guessed at.
-        leading_query = _leading_name_token(name)
-        if leading_query:
-            if leading_candidates is None:
-                leading_candidates = [_leading_name_token(n) for n in display_names]
-            m2 = best_match(leading_query, leading_candidates)
-            if m2 is not None and (best is None or m2.score > best.score):
-                best, best_query = m2, leading_query
+        # Retry on just the leading name token -- but ONLY when the query
+        # itself is handle-shaped (has digits/dots/underscores beyond a clean
+        # name); a name that's already clean gets no benefit from this and
+        # only picks up risk. Match against the FULL candidate names, not a
+        # second list pre-reduced to leading tokens on both sides -- reducing
+        # both sides collapses genuinely different candidates into duplicate
+        # strings (e.g. "Joe Black" and real Plaky user "Joe H" both become
+        # bare "Joe"), which then compare as an exact match (score 1.0) and
+        # can beat a real, far more specific match (an actual incident: this
+        # spurious 1.0 beat a legitimate 0.95 containment match on the
+        # person's real GitHub-handle-shaped Plaky entry). Matching the
+        # reduced query against full names keeps every candidate's
+        # distinguishing surname/initial intact for best_match's own
+        # token/ambiguity logic to use.
+        if _looks_like_account_handle(name):
+            leading_query = _leading_name_token(name)
+            if leading_query:
+                m2 = best_match(leading_query, display_names)
+                if m2 is not None and (best is None or m2.score > best.score):
+                    best, best_query = m2, leading_query
 
     if best is None:
         logger.warning(
