@@ -1552,15 +1552,32 @@ async def _send_offboarding_notice(
         logger.info("Termination notice: trying Plaky lookup for %s with candidates %s", target.id, candidates)
         email = await asyncio.to_thread(find_user_email, candidates, PLAKY_API_KEY)
 
+    email_fail_reason = None
     if email:
-        sent = await asyncio.to_thread(send_email, email, subject, body)
+        sent, email_fail_reason = await asyncio.to_thread(send_email, email, subject, body)
         if sent:
             return f"emailed to {email}"
-        logger.warning("Termination email to %s failed to send; falling back to DM for %s", email, target.id)
+        logger.warning("Termination email to %s failed to send (%s); falling back to DM for %s", email, email_fail_reason, target.id)
+        # A credentials failure isn't specific to this one person -- it silently
+        # breaks every future termination/retirement email until someone fixes
+        # SMTP_PASSWORD, so this deserves a channel alert now rather than only
+        # a per-kick "failed" note that's easy to shrug off as a one-off.
+        if email_fail_reason and "credentials" in email_fail_reason.lower() and STAFF_CHANNEL_ID:
+            alert_channel = await _channel_from_id(STAFF_CHANNEL_ID)
+            if alert_channel is not None:
+                try:
+                    await alert_channel.send(
+                        f"⚠️ Offboarding email to {email} failed: {email_fail_reason}. "
+                        "This will keep failing for every future kick-out/retirement until SMTP_PASSWORD is refreshed."
+                    )
+                except Exception:
+                    logger.exception("Failed to post SMTP credentials alert to #it-notifications")
 
     try:
         await target.send(f"**{subject}**\n\n{body}")
-        return "no email found — sent via Discord DM" if not email else "email send failed — sent via Discord DM instead"
+        if not email:
+            return "no email found — sent via Discord DM"
+        return f"email send failed ({email_fail_reason}) — sent via Discord DM instead"
     except Exception:
         logger.exception("Failed to DM termination notice to %s", target.id)
         return "could not deliver notice via email or DM"
@@ -1727,19 +1744,28 @@ async def _resolve_reply_channel(message: discord.Message):
 
 
 async def _close_ticket_thread(channel) -> None:
-    """Closes a resolved support-ticket thread. Norozo directly calling
-    thread.edit(archived=True) has never actually closed a ticket in practice
-    (Needle, the ticketing bot that owns these threads, manages their
-    open/closed lifecycle itself and doesn't treat a bare Discord-API archive
-    as "closed" in its own bookkeeping) -- so instead this sends the same
-    "/close" text Needle listens for, same as a human typing it in the
-    thread."""
+    """Closes a resolved support-ticket thread via Discord's own archive API.
+
+    A prior version of this sent the literal text "/close" into the thread,
+    on the assumption that Needle (the ticketing bot) listened for it as a
+    text command -- it doesn't. Discord slash commands only fire through the
+    real interaction system when a human picks one from the command menu; a
+    bot posting the string "/close" is just a plain message, never an actual
+    command invocation, and no application can intercept it as one. There is
+    no supported way for one bot to invoke another bot's slash command, so
+    the only real lever Norozo has is the Discord API archive/lock call
+    itself -- if that doesn't satisfy Needle's own bookkeeping, that needs a
+    real integration with Needle (a shared DB, its own webhook, etc.), not a
+    fake command string.
+    """
     if not isinstance(channel, discord.Thread):
         return
     try:
-        await channel.send("/close")
+        await channel.edit(archived=True, locked=False, reason="Ticket resolved")
+    except discord.Forbidden:
+        logger.error("No permission to archive ticket thread %s (check Manage Threads)", channel.id)
     except Exception:
-        logger.exception("Failed to send /close to ticket thread %s", channel.id)
+        logger.exception("Failed to archive ticket thread %s", channel.id)
 
 
 async def _maybe_handle_kick_out_command(message: discord.Message) -> bool:

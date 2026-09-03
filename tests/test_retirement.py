@@ -164,22 +164,38 @@ async def test_confirm_button_executes_offboarding_and_closes_ticket(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_close_ticket_thread_sends_slash_close_for_needle(monkeypatch):
+async def test_close_ticket_thread_archives_via_discord_api(monkeypatch):
+    """Posting the literal text "/close" never triggers Needle's actual slash
+    command -- Discord only fires slash commands through a real interaction,
+    never from a bot posting matching text. The only real lever Norozo has is
+    the Discord archive API itself."""
     thread = Mock(spec=discord.Thread)
-    thread.send = AsyncMock()
+    thread.id = 123
+    thread.edit = AsyncMock()
 
     await main._close_ticket_thread(thread)
 
-    thread.send.assert_awaited_once_with("/close")
+    thread.edit.assert_awaited_once_with(archived=True, locked=False, reason="Ticket resolved")
+
+
+@pytest.mark.asyncio
+async def test_close_ticket_thread_logs_on_missing_permission(monkeypatch):
+    thread = Mock(spec=discord.Thread)
+    thread.id = 123
+    thread.edit = AsyncMock(side_effect=discord.Forbidden(Mock(status=403), "missing permissions"))
+
+    await main._close_ticket_thread(thread)  # must not raise
+
+    thread.edit.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_close_ticket_thread_noop_for_non_thread(monkeypatch):
-    channel = SimpleNamespace(send=AsyncMock())
+    channel = SimpleNamespace(edit=AsyncMock())
 
     await main._close_ticket_thread(channel)
 
-    channel.send.assert_not_awaited()
+    channel.edit.assert_not_awaited()
 
 
 @pytest.mark.asyncio

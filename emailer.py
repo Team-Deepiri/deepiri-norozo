@@ -91,14 +91,20 @@ def _open_smtp_connection() -> smtplib.SMTP:
     return server
 
 
-def send_email(to_email: str, subject: str, body: str) -> bool:
+def send_email(to_email: str, subject: str, body: str) -> tuple:
     """Best-effort synchronous send — call via asyncio.to_thread from async code.
-    Returns False (never raises) on any failure so callers can fall back cleanly."""
+    Returns (True, None) on success or (False, short_reason) on any failure
+    (never raises) so callers can fall back cleanly AND surface *why* it
+    failed -- e.g. "Gmail rejected credentials (535)" vs a generic network
+    timeout are very different problems requiring very different fixes, and
+    burying that distinction in a log line nobody's watching means the same
+    root cause (an expired app password, say) silently recurs on every send
+    until someone happens to go dig through Render logs."""
     if not is_configured():
         logger.error("Cannot send email: SMTP_USERNAME/SMTP_PASSWORD not configured")
-        return False
+        return False, "SMTP not configured"
     if not to_email:
-        return False
+        return False, "no recipient address"
 
     msg = EmailMessage()
     msg["Subject"] = subject
@@ -111,7 +117,13 @@ def send_email(to_email: str, subject: str, body: str) -> bool:
             server.starttls()
             server.login(SMTP_USERNAME, SMTP_PASSWORD)
             server.send_message(msg)
-        return True
-    except Exception:
+        return True, None
+    except smtplib.SMTPAuthenticationError as e:
         logger.exception("Failed to send email to %s", to_email)
-        return False
+        return False, f"Gmail rejected credentials ({e.smtp_code}) -- SMTP_PASSWORD likely expired/revoked, needs a fresh App Password"
+    except (smtplib.SMTPException, OSError) as e:
+        logger.exception("Failed to send email to %s", to_email)
+        return False, f"{type(e).__name__}: {e}"
+    except Exception as e:
+        logger.exception("Failed to send email to %s", to_email)
+        return False, f"{type(e).__name__}: {e}"
