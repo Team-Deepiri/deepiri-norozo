@@ -139,3 +139,24 @@ def test_identical_edit_distance_pairs_cannot_be_distinguished_by_ratio_alone():
 def test_short_unrelated_names_do_not_match():
     assert best_match("sara", ["Mara", "Someone Else"]) is None
     assert best_match("sean", ["John", "Someone Else"]) is None
+
+
+def test_real_incident_first_name_plus_bare_initial_does_not_match_unrelated_full_name():
+    """The actual incident this fix addresses: a termination-notice lookup
+    for GitHub real name "Joe Black" incorrectly matched a Plaky roster entry
+    shaped "Joe H<surname>" at 0.9 confidence via a bare-initial shortcut
+    ("H" treated as if it could only mean that one person's specific
+    surname) -- sent a real offboarding email to a completely unrelated
+    person. A bare initial is compatible with dozens of surnames in any real
+    roster and must not stand in for a full token match."""
+    assert best_match("joe h", ["Joe Hauer", "Someone Else"]) is None
+    assert best_match("joe black", ["Joe Hauer", "Someone Else"]) is None
+
+
+def test_full_name_typo_still_matches_via_ratio_fallback():
+    """Must not overcorrect: a genuine full "First Last" typo (not an
+    abbreviated initial) still matches through the whole-string ratio
+    comparison, unaffected by removing the bare-initial shortcut."""
+    m = best_match("jordan runyan", ["Jordan Runyon", "Someone Else"])
+    assert m is not None
+    assert m.index == 0

@@ -90,10 +90,19 @@ def _score_one(query: str, candidate: str) -> tuple:
     if len(q) >= 2 and q in v_tokens:
         return 0.93, f"first-name match in {candidate!r}"
 
-    if multi_token and all(
-        any(t == vt or (len(t) == 1 and vt.startswith(t)) or (len(vt) == 1 and t.startswith(vt)) for vt in v_tokens)
-        for t in q_tokens
-    ):
+    # Exact token match only -- no longer accepts a bare initial ("H") as
+    # standing in for any full token starting with that letter ("Hauer",
+    # "Harrison", "Henderson", ...). That shortcut was a real false-positive
+    # incident: "Joe Black" (github_real_name candidate) vs a Plaky roster
+    # entry shaped like "Joe H<something>" scored 0.9 -- confident-looking,
+    # but a bare initial is compatible with dozens of unrelated surnames in
+    # any real-size roster, and best_match's ambiguity check only catches the
+    # collision when a second same-shaped candidate happens to also be
+    # present, not when it's the only person with that first name + initial.
+    # An abbreviated "Firstname L." query still gets a chance via the
+    # whole-string ratio comparison below (gated at 0.82), which is far more
+    # conservative since it also weighs the overall length difference.
+    if multi_token and all(t in v_tokens for t in q_tokens):
         return 0.9, f"all parts of {query!r} match {candidate!r}"
 
     if not multi_token:
