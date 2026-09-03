@@ -87,8 +87,10 @@ async def test_maybe_auto_assign_ipca_roles_assigns_when_missing(monkeypatch):
     # thread (message.thread), not back in the parent channel via reply().
     assert "We gave you access to the rest of the Discord." in thread.send.call_args_list[0].args[0]
     channel.send.assert_not_awaited()
-    # Ticket resolved -> the companion thread gets archived (closed).
-    thread.edit.assert_awaited_once_with(archived=True, locked=False, reason="Ticket resolved")
+    # _close_ticket_thread is currently a no-op (see test_retirement.py) --
+    # archiving broke the ticket's UX in production, so nothing should touch
+    # the thread's archived/locked state here.
+    thread.edit.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -158,7 +160,7 @@ async def test_maybe_auto_assign_ipca_roles_archives_current_thread_when_message
     assigned = await main._maybe_auto_assign_ipca_roles(message)
 
     assert assigned is True
-    thread_channel.edit.assert_awaited_once_with(archived=True, locked=False, reason="Ticket resolved")
+    thread_channel.edit.assert_not_awaited()
 
 
 @pytest.mark.asyncio
