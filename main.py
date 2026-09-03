@@ -1744,28 +1744,95 @@ async def _resolve_reply_channel(message: discord.Message):
 
 
 async def _close_ticket_thread(channel) -> None:
-    """Closes a resolved support-ticket thread via Discord's own archive API.
+    """Intentionally a no-op for now -- both things tried so far have caused
+    a real production problem:
 
-    A prior version of this sent the literal text "/close" into the thread,
-    on the assumption that Needle (the ticketing bot) listened for it as a
-    text command -- it doesn't. Discord slash commands only fire through the
-    real interaction system when a human picks one from the command menu; a
-    bot posting the string "/close" is just a plain message, never an actual
-    command invocation, and no application can intercept it as one. There is
-    no supported way for one bot to invoke another bot's slash command, so
-    the only real lever Norozo has is the Discord API archive/lock call
-    itself -- if that doesn't satisfy Needle's own bookkeeping, that needs a
-    real integration with Needle (a shared DB, its own webhook, etc.), not a
-    fake command string.
+    1. Posting the literal text "/close" -- Needle never runs it, since
+       Discord slash commands only fire through the real interaction system
+       (a human picking it from the command menu), never from a bot posting
+       matching text. There's no supported way for one bot to invoke another
+       bot's slash command.
+    2. Discord's own thread.edit(archived=True) -- archiving a thread hides
+       it from the sidebar entirely (Discord's default UI only shows
+       archived threads if you dig into "Archived Threads"), so from a
+       user's perspective the ticket just vanishes/stops responding right
+       after being helped, even though it's technically still postable
+       (posting to an unlocked archived thread auto-unarchives it). Reported
+       live: "its not responding in the ticket anymore" right after IPCA
+       auto-assign archived it.
+
+    Needle owns these threads' actual lifecycle; Norozo has no working lever
+    to close one through Needle without knowing its real mechanism (its own
+    ticket-panel button, a reaction it listens for, a REST API, etc.). See
+    _probe_needle_ticket_thread() -- gathering that real data (message
+    content/embeds/component custom_ids from Needle's own posts) is the next
+    step before trying another guess. Until then: leave the thread as-is and
+    let a human close it via Needle's real UI when they're done.
     """
-    if not isinstance(channel, discord.Thread):
-        return
+    return
+
+
+PROBE_NEEDLE_COMMAND_RE = re.compile(r"^\s*probe\s+needle\s*$", re.IGNORECASE)
+
+
+async def _maybe_handle_probe_needle_command(message: discord.Message) -> bool:
+    """Staff-only diagnostic: "probe needle" typed in a ticket thread dumps
+    every bot-authored message in that thread -- content, embed titles/
+    descriptions/fields, and every button/select component's label + style +
+    custom_id -- to whoever ran it, via DM. This is how to actually find out
+    what Needle expects to close a ticket (a button on its own ticket-panel
+    message, a reaction, particular text, ...) instead of guessing again:
+    real observed data from Needle's own posts, not another assumption.
+    """
+    if message.guild is None or not isinstance(message.channel, discord.Thread):
+        return False
+    if not PROBE_NEEDLE_COMMAND_RE.match(message.content or ""):
+        return False
+    if not isinstance(message.author, discord.Member) or not _is_staff_or_security_ops(message.author):
+        return False
+
+    thread = message.channel
+    lines = [f"**Needle probe -- #{thread.name} ({thread.id})**\n"]
+    found_any = False
     try:
-        await channel.edit(archived=True, locked=False, reason="Ticket resolved")
-    except discord.Forbidden:
-        logger.error("No permission to archive ticket thread %s (check Manage Threads)", channel.id)
+        async for msg in thread.history(limit=200, oldest_first=True):
+            if not msg.author.bot:
+                continue
+            found_any = True
+            lines.append(f"--- message {msg.id} by {msg.author} ({msg.author.id}) ---")
+            if msg.content:
+                lines.append(f"content: {msg.content[:500]!r}")
+            for embed in msg.embeds:
+                lines.append(f"embed: title={embed.title!r} description={(embed.description or '')[:300]!r}")
+                for field in embed.fields:
+                    lines.append(f"  field: name={field.name!r} value={(field.value or '')[:200]!r}")
+            for row in msg.components:
+                for child in getattr(row, "children", []):
+                    lines.append(
+                        f"component: type={type(child).__name__} label={getattr(child, 'label', None)!r} "
+                        f"style={getattr(child, 'style', None)!r} custom_id={getattr(child, 'custom_id', None)!r} "
+                        f"url={getattr(child, 'url', None)!r}"
+                    )
+            reactions = [(str(r.emoji), r.count) for r in msg.reactions]
+            if reactions:
+                lines.append(f"reactions: {reactions}")
     except Exception:
-        logger.exception("Failed to archive ticket thread %s", channel.id)
+        logger.exception("Failed to probe ticket thread %s for Needle diagnostics", thread.id)
+        lines.append("(error scanning thread history -- see Norozo logs)")
+
+    if not found_any:
+        lines.append("(no bot-authored messages found in this thread)")
+
+    dump = "\n".join(lines)
+    try:
+        for chunk_start in range(0, len(dump), 1900):
+            await message.author.send(f"```\n{dump[chunk_start:chunk_start + 1900]}\n```")
+    except discord.Forbidden:
+        await thread.send(f"{message.author.mention} Couldn't DM you the probe results -- check your DM settings.")
+        return True
+
+    await thread.send(f"{message.author.mention} Sent you the Needle probe results via DM.")
+    return True
 
 
 async def _maybe_handle_kick_out_command(message: discord.Message) -> bool:
@@ -2653,6 +2720,9 @@ def _create_and_register_bot() -> DeepiriBot:
             return
         content = message.content or ""
         await notify_support_team_for_message(message)
+        if await _maybe_handle_probe_needle_command(message):
+            await new_bot.process_commands(message)
+            return
         if await _maybe_handle_kick_out_command(message):
             await new_bot.process_commands(message)
             return
