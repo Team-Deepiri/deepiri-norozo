@@ -1744,32 +1744,29 @@ async def _resolve_reply_channel(message: discord.Message):
 
 
 async def _close_ticket_thread(channel) -> None:
-    """Intentionally a no-op for now -- both things tried so far have caused
-    a real production problem:
+    """Closes a resolved support-ticket thread via Discord's own archive API.
 
-    1. Posting the literal text "/close" -- Needle never runs it, since
-       Discord slash commands only fire through the real interaction system
-       (a human picking it from the command menu), never from a bot posting
-       matching text. There's no supported way for one bot to invoke another
-       bot's slash command.
-    2. Discord's own thread.edit(archived=True) -- archiving a thread hides
-       it from the sidebar entirely (Discord's default UI only shows
-       archived threads if you dig into "Archived Threads"), so from a
-       user's perspective the ticket just vanishes/stops responding right
-       after being helped, even though it's technically still postable
-       (posting to an unlocked archived thread auto-unarchives it). Reported
-       live: "its not responding in the ticket anymore" right after IPCA
-       auto-assign archived it.
+    Confirmed correct via "probe needle" against a real ticket: Needle's own
+    ticket-panel message has an "Archive thread" button (custom_id="close",
+    ButtonStyle.success) -- there's no separate Needle-internal close
+    mechanism to reverse-engineer, that button's whole job is exactly the
+    Discord archive call this makes. (A "/close" text command, tried
+    earlier, was never it -- Discord slash commands only fire through a real
+    user interaction, and there's no supported way for one bot to invoke
+    another bot's slash command or press a button on another bot's message.)
 
-    Needle owns these threads' actual lifecycle; Norozo has no working lever
-    to close one through Needle without knowing its real mechanism (its own
-    ticket-panel button, a reaction it listens for, a REST API, etc.). See
-    _probe_needle_ticket_thread() -- gathering that real data (message
-    content/embeds/component custom_ids from Needle's own posts) is the next
-    step before trying another guess. Until then: leave the thread as-is and
-    let a human close it via Needle's real UI when they're done.
+    Archiving does hide the thread from the sidebar unless "Archived
+    Threads" is expanded -- that's expected once a ticket is actually
+    closed, the same as clicking Needle's own button would do, not a bug.
     """
-    return
+    if not isinstance(channel, discord.Thread):
+        return
+    try:
+        await channel.edit(archived=True, locked=False, reason="Ticket resolved")
+    except discord.Forbidden:
+        logger.error("No permission to archive ticket thread %s (check Manage Threads)", channel.id)
+    except Exception:
+        logger.exception("Failed to archive ticket thread %s", channel.id)
 
 
 PROBE_NEEDLE_COMMAND_RE = re.compile(r"^\s*probe\s+needle\s*$", re.IGNORECASE)
