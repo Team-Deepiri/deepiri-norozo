@@ -2585,6 +2585,68 @@ async def health_handler(_: web.Request) -> web.Response:
     )
 
 
+async def test_email_debug_handler(request: web.Request) -> web.Response:
+    """Debug-only: exercises the exact same identity-resolution + email-send
+    path as kick-out/retirement (_send_offboarding_notice), for one Discord
+    member, WITHOUT kicking them from Discord or removing them from the
+    GitHub org. Signed the same way as the other inbound webhooks so this
+    can't be hit by anyone who doesn't already have the shared secret.
+    """
+    raw_body = await request.read()
+    if not ANNOUNCEMENTS_INBOUND_SECRET:
+        return web.json_response({"ok": False, "message": "Webhook authentication is not configured"}, status=503)
+    sig_header = request.headers.get("X-Norozo-Signature") or request.headers.get("X-Platform-Signature") or ""
+    if not sig_header or not _is_valid_announcement_signature(raw_body, sig_header, ANNOUNCEMENTS_INBOUND_SECRET):
+        return web.json_response({"ok": False, "message": "Missing or invalid signature"}, status=401)
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except Exception:
+        return web.json_response({"ok": False, "message": "Invalid JSON"}, status=400)
+
+    discord_id_raw = payload.get("discord_id")
+    if not discord_id_raw:
+        return web.json_response({"ok": False, "message": "discord_id is required"}, status=400)
+    try:
+        discord_id = int(discord_id_raw)
+    except ValueError:
+        return web.json_response({"ok": False, "message": "discord_id must be numeric"}, status=400)
+
+    guild = await _get_primary_guild()
+    if guild is None:
+        return web.json_response({"ok": False, "message": "Could not resolve the primary guild"}, status=500)
+
+    member = guild.get_member(discord_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(discord_id)
+        except discord.NotFound:
+            member = None
+    if member is None:
+        return web.json_response({"ok": False, "message": f"No member {discord_id} found in guild"}, status=404)
+
+    github_username = _get_github_username_for_member(member)
+    if github_username and GITHUB_ORG and GITHUB_PAT and not await asyncio.to_thread(is_org_member, github_username, GITHUB_ORG, GITHUB_PAT):
+        github_username = None
+    if not github_username:
+        github_username = await _find_github_username_in_profiles_channel(member)
+    if not github_username:
+        github_username = await _find_github_username_via_org_roster(member)
+
+    outcome = await _send_offboarding_notice(
+        member,
+        github_username,
+        subject="Norozo Test Email",
+        body=(
+            f"Hi {member.display_name},\n\n"
+            "This is a test email from Norozo to confirm SMTP delivery is working. "
+            "No action needed -- you have not been removed from Discord or GitHub.\n\n"
+            "-- Deepiri"
+        ),
+    )
+    return web.json_response({"ok": True, "discord_id": discord_id, "github_username": github_username, "outcome": outcome})
+
+
 async def start_webhook_server() -> None:
     app = web.Application()
     app.router.add_get("/health", health_handler)
@@ -2594,6 +2656,7 @@ async def start_webhook_server() -> None:
     app.router.add_post("/webhooks/platform-announcements", platform_announcement_handler)
     app.router.add_post("/alerts/webhook", platform_alert_handler)
     app.router.add_post("/webhooks/platform-alerts", platform_alert_handler)
+    app.router.add_post("/debug/test-email", test_email_debug_handler)
 
     runner = web.AppRunner(app)
     await runner.setup()
