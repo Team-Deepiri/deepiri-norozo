@@ -545,6 +545,45 @@ def _remember_github_username(discord_id: int, github_username: str) -> None:
     _save_github_username_map(mapping)
 
 
+_LOOKS_LIKE_REAL_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z.'-]*\s+[A-Za-z][A-Za-z.'-]*$")
+
+
+async def _remember_identity(discord_id: int, github_username: str, member: Optional[discord.Member] = None) -> None:
+    """Persists the discord_id<->github_username mapping AND opportunistically
+    caches their real name, whichever path just resolved this identity --
+    a self-reported GitHub link at onboarding, a #github-profiles scan match,
+    an org-roster fuzzy match, or a PR-staleness reverse lookup. This is the
+    dynamic identity cache growing itself: every successful resolution feeds
+    it, not just the one at onboarding, so it fills in for members who joined
+    before this existed too.
+
+    Prefers GitHub's public profile name (a genuine "real name" field), but
+    falls back to the Discord global_name/display_name when GitHub has none
+    set AND that name is actually "First Last"-shaped -- Discord's own
+    display name is frequently someone's real name too, and a name this
+    specific is a far better identity-search candidate than the raw handle,
+    even without GitHub confirming it.
+    """
+    _remember_github_username(discord_id, github_username)
+    real_name = None
+    if GITHUB_PAT:
+        try:
+            profile = await asyncio.to_thread(get_user_profile, github_username, GITHUB_PAT)
+            real_name = profile.get("name")
+        except Exception:
+            logger.exception("Failed to fetch GitHub profile for %s (%s)", discord_id, github_username)
+    if not real_name and member is not None:
+        for candidate in (str(getattr(member, "global_name", "") or ""), str(getattr(member, "display_name", "") or "")):
+            if candidate and _LOOKS_LIKE_REAL_NAME_RE.match(candidate.strip()):
+                real_name = candidate.strip()
+                break
+    if real_name:
+        try:
+            await save_member_real_name(discord_id, real_name, github_username)
+        except Exception:
+            logger.exception("Failed to cache real name for %s (%s)", discord_id, github_username)
+
+
 def _get_github_username_for_member(member: discord.Member) -> Optional[str]:
     """Return an explicitly mapped username, or a best-effort name-based guess.
 
@@ -595,7 +634,7 @@ async def _find_github_username_in_profiles_channel(member: discord.Member) -> O
                 logger.warning("Found GitHub link %s for %s in #github-profiles but they're not in %s", candidate, member.id, GITHUB_ORG)
                 continue
             logger.info("#github-profiles: matched %s -> %s after scanning %s messages", member.id, candidate, scanned)
-            _remember_github_username(member.id, candidate)
+            await _remember_identity(member.id, candidate, member)
             return candidate
     except Exception:
         logger.exception("Failed scanning #github-profiles for member %s", member.id)
@@ -629,7 +668,7 @@ async def _find_github_username_via_org_roster(member: discord.Member) -> Option
         match = best_match(candidate_name, usernames)
         if match is not None:
             logger.info("Org roster fallback: matched %s (query %r) -> %s", member.id, candidate_name, usernames[match.index])
-            _remember_github_username(member.id, usernames[match.index])
+            await _remember_identity(member.id, usernames[match.index], member)
             return usernames[match.index]
     logger.warning("Org roster fallback for %s: no confident match among %s org members", member.id, len(usernames))
     return None
@@ -676,7 +715,7 @@ async def _resolve_discord_member_for_github_login(login: str, guild: discord.Gu
         match = best_match(real_name, candidate_names)
         if match is not None:
             member = candidate_members[match.index]
-            _remember_github_username(member.id, login)
+            await _remember_identity(member.id, login, member)
             logger.info("PR staleness identity: matched GitHub %s (name %r) -> Discord %s via name fuzzy match", login, real_name, member.id)
             return member
 
@@ -690,7 +729,7 @@ async def _resolve_discord_member_for_github_login(login: str, guild: discord.Gu
                 except ValueError:
                     member = None
                 if member is not None:
-                    _remember_github_username(member.id, login)
+                    await _remember_identity(member.id, login, member)
                     logger.info("PR staleness identity: matched GitHub %s -> Plaky email %s -> Discord %s", login, plaky_email, member.id)
                     return member
 
@@ -1189,7 +1228,7 @@ async def handle_github_invite_request(interaction: discord.Interaction, github_
 
     # Remember mapping for future role->team sync
     try:
-        _remember_github_username(interaction.user.id, normalized_username)
+        await _remember_identity(interaction.user.id, normalized_username, interaction.user if isinstance(interaction.user, discord.Member) else None)
     except Exception:
         logger.exception(
             "Failed to remember GitHub username %s for Discord user %s",
@@ -1595,21 +1634,17 @@ async def _maybe_handle_onboarding_dm(message: discord.Message) -> bool:
     # contains "github.com" too, which is exactly the pattern CodeQL flags.)
     github_username = _extract_github_profile_username(content) if URL_RE.search(content) else None
     if github_username:
-        _remember_github_username(message.author.id, github_username)
-        # Capture their real name right now, while it's a certain, self-reported
-        # signal -- not a fuzzy guess later. This is the entire "dynamic alias
-        # table": no one hand-types a nickname mapping, it's just recorded the
-        # moment it's known, so a kick-out for a stylized handle months later
-        # ("daev1005") is a cache hit on the real name ("David Li") instead of
-        # a string-similarity gamble on the handle itself.
-        if GITHUB_PAT:
-            try:
-                profile = await asyncio.to_thread(get_user_profile, github_username, GITHUB_PAT)
-                real_name = profile.get("name")
-                if real_name:
-                    await save_member_real_name(message.author.id, real_name, github_username)
-            except Exception:
-                logger.exception("Failed to fetch/cache real name for %s (%s)", message.author.id, github_username)
+        # _remember_identity captures their real name right now too, while
+        # it's a certain, self-reported signal -- not a fuzzy guess later.
+        # This is the dynamic alias table: no one hand-types a nickname
+        # mapping, it's recorded the moment it's known, so a kick-out for a
+        # stylized handle months later is a cache hit on the real name
+        # instead of a string-similarity gamble on the handle itself. Same
+        # helper also runs from every other place a GitHub username gets
+        # resolved (org-roster fuzzy match, #github-profiles scan, PR-staleness
+        # reverse lookup), so this fills in for members who joined before it
+        # existed too, not just fresh onboarding.
+        await _remember_identity(message.author.id, github_username, message.author)
         await message.channel.send(f"Got it — linked your GitHub as **{github_username}**.")
         return True
 
@@ -1958,7 +1993,7 @@ async def handle_ipca_signed(interaction: discord.Interaction, github_username: 
     normalized = _extract_github_profile_username(github_username) if github_username else None
     if normalized:
         try:
-            _remember_github_username(interaction.user.id, normalized)
+            await _remember_identity(interaction.user.id, normalized, interaction.user if isinstance(interaction.user, discord.Member) else None)
         except Exception:
             logger.exception(
                 "Failed to remember GitHub username %s for Discord user %s",

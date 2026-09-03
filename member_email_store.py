@@ -6,9 +6,9 @@ This is the "dynamic nickname alias table" -- built automatically as a
 byproduct of things Norozo already does (onboarding capturing a self-reported
 email or GitHub link), never hand-curated. The moment someone links their own
 GitHub profile, their real name gets fetched and cached here immediately --
-so a later kick-out/retirement lookup for a stylized handle like "daev1005"
+so a later kick-out/retirement lookup for a stylized handle like "wrenx1005"
 doesn't need to fuzzy-match a nickname to a real name at all; it's an exact
-cache hit on "David Li", captured the day they onboarded, independent of
+cache hit on "Taylor Chen", captured the day they onboarded, independent of
 whatever GitHub-username resolution succeeds or fails at kick time.
 """
 

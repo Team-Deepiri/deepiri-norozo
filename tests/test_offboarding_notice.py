@@ -11,24 +11,24 @@ import pytest
 import main
 
 
-def _target(id_=1, display_name="daev1005"):
+def _target(id_=1, display_name="wrenx1005"):
     return SimpleNamespace(
         id=id_,
         display_name=display_name,
-        global_name="daev",
-        name="daev1005",
+        global_name="wrenx",
+        name="wrenx1005",
         send=AsyncMock(),
     )
 
 
 @pytest.mark.asyncio
 async def test_cached_real_name_used_without_needing_github_username(monkeypatch):
-    """The exact daev1005 scenario: no github_username resolves at kick time,
+    """The exact wrenx1005 scenario: no github_username resolves at kick time,
     but a real name was cached at onboarding -- that cached name alone should
     still get tried against Plaky instead of just the bare Discord handle."""
     monkeypatch.setattr(
         main, "load_member_profile",
-        AsyncMock(return_value={"email": None, "real_name": "David Li", "github_username": None}),
+        AsyncMock(return_value={"email": None, "real_name": "Taylor Chen", "github_username": None}),
     )
     monkeypatch.setattr(main, "PLAKY_API_KEY", "fake-key")
     # find_user_email is sync (called via asyncio.to_thread) in main.py
@@ -36,7 +36,7 @@ async def test_cached_real_name_used_without_needing_github_username(monkeypatch
 
     def fake_find_user_email(candidates, key):
         find_calls["candidates"] = candidates
-        return "lidavid206@gmail.com"
+        return "chentaylor206@example.com"
 
     monkeypatch.setattr(main, "find_user_email", fake_find_user_email)
     monkeypatch.setattr(main, "send_email", lambda *a, **k: True)
@@ -44,8 +44,8 @@ async def test_cached_real_name_used_without_needing_github_username(monkeypatch
     target = _target()
     result = await main._send_offboarding_notice(target, None, subject="Subject", body="Body")
 
-    assert result == "emailed to lidavid206@gmail.com"
-    assert "David Li" in find_calls["candidates"]
+    assert result == "emailed to chentaylor206@example.com"
+    assert "Taylor Chen" in find_calls["candidates"]
 
 
 @pytest.mark.asyncio
@@ -69,10 +69,10 @@ async def test_cached_email_short_circuits_everything_else(monkeypatch):
 async def test_cached_github_username_used_when_none_passed_in(monkeypatch):
     monkeypatch.setattr(
         main, "load_member_profile",
-        AsyncMock(return_value={"email": None, "real_name": None, "github_username": "daev1005"}),
+        AsyncMock(return_value={"email": None, "real_name": None, "github_username": "wrenx1005"}),
     )
     monkeypatch.setattr(main, "GITHUB_PAT", "fake-pat")
-    monkeypatch.setattr(main, "get_user_profile", lambda username, pat: {"name": "David Li", "email": "david@example.com"})
+    monkeypatch.setattr(main, "get_user_profile", lambda username, pat: {"name": "Taylor Chen", "email": "david@example.com"})
     monkeypatch.setattr(main, "send_email", lambda *a, **k: True)
 
     target = _target()
