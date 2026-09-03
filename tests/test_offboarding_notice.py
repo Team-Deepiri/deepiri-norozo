@@ -39,7 +39,7 @@ async def test_cached_real_name_used_without_needing_github_username(monkeypatch
         return "chentaylor206@example.com"
 
     monkeypatch.setattr(main, "find_user_email", fake_find_user_email)
-    monkeypatch.setattr(main, "send_email", lambda *a, **k: True)
+    monkeypatch.setattr(main, "send_email", lambda *a, **k: (True, None))
 
     target = _target()
     result = await main._send_offboarding_notice(target, None, subject="Subject", body="Body")
@@ -54,7 +54,7 @@ async def test_cached_email_short_circuits_everything_else(monkeypatch):
         main, "load_member_profile",
         AsyncMock(return_value={"email": "self-reported@example.com", "real_name": None, "github_username": None}),
     )
-    monkeypatch.setattr(main, "send_email", lambda *a, **k: True)
+    monkeypatch.setattr(main, "send_email", lambda *a, **k: (True, None))
     find_mock = AsyncMock()
     monkeypatch.setattr(main, "find_user_email", find_mock)
 
@@ -73,7 +73,7 @@ async def test_cached_github_username_used_when_none_passed_in(monkeypatch):
     )
     monkeypatch.setattr(main, "GITHUB_PAT", "fake-pat")
     monkeypatch.setattr(main, "get_user_profile", lambda username, pat: {"name": "Taylor Chen", "email": "david@example.com"})
-    monkeypatch.setattr(main, "send_email", lambda *a, **k: True)
+    monkeypatch.setattr(main, "send_email", lambda *a, **k: (True, None))
 
     target = _target()
     result = await main._send_offboarding_notice(target, None, subject="Subject", body="Body")

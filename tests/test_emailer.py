@@ -30,9 +30,10 @@ def test_send_email_uses_direct_smtp_when_no_proxy_configured(monkeypatch):
     fake_server.__exit__ = MagicMock(return_value=False)
 
     with patch("emailer.smtplib.SMTP", return_value=fake_server) as smtp_ctor:
-        result = emailer.send_email("to@example.com", "subject", "body")
+        sent, reason = emailer.send_email("to@example.com", "subject", "body")
 
-    assert result is True
+    assert sent is True
+    assert reason is None
     smtp_ctor.assert_called_once_with(emailer.SMTP_HOST, emailer.SMTP_PORT, timeout=20)
     fake_server.starttls.assert_called_once()
     fake_server.login.assert_called_once_with("user@example.com", "app-password")
@@ -49,9 +50,10 @@ def test_send_email_uses_proxied_smtp_when_proxy_configured(monkeypatch):
     fake_server.__exit__ = MagicMock(return_value=False)
 
     with patch("emailer._ProxiedSMTP", return_value=fake_server) as proxied_ctor:
-        result = emailer.send_email("to@example.com", "subject", "body")
+        sent, reason = emailer.send_email("to@example.com", "subject", "body")
 
-    assert result is True
+    assert sent is True
+    assert reason is None
     proxied_ctor.assert_called_once_with(
         proxy_host="1.2.3.4",
         proxy_port=8888,
@@ -67,7 +69,9 @@ def test_send_email_uses_proxied_smtp_when_proxy_configured(monkeypatch):
 def test_send_email_returns_false_without_credentials(monkeypatch):
     monkeypatch.setattr(emailer, "SMTP_USERNAME", "")
     monkeypatch.setattr(emailer, "SMTP_PASSWORD", "")
-    assert emailer.send_email("to@example.com", "subject", "body") is False
+    sent, reason = emailer.send_email("to@example.com", "subject", "body")
+    assert sent is False
+    assert reason == "SMTP not configured"
 
 
 def test_send_email_returns_false_on_send_exception(monkeypatch):
@@ -76,9 +80,35 @@ def test_send_email_returns_false_on_send_exception(monkeypatch):
     monkeypatch.setattr(emailer, "DISCORD_PROXY_URL", None)
 
     with patch("emailer.smtplib.SMTP", side_effect=OSError("Network is unreachable")):
-        result = emailer.send_email("to@example.com", "subject", "body")
+        sent, reason = emailer.send_email("to@example.com", "subject", "body")
 
-    assert result is False
+    assert sent is False
+    assert "Network is unreachable" in reason
+
+
+def test_send_email_surfaces_gmail_auth_failure_reason(monkeypatch):
+    """The actual daev1005/mahlaka incident: Gmail rejected the app password
+    with a 535 auth error. This must come back as a specific, actionable
+    reason -- not a generic "failed" -- since a credentials failure breaks
+    every future send until someone rotates SMTP_PASSWORD, unlike a one-off
+    network blip."""
+    import smtplib
+
+    monkeypatch.setattr(emailer, "SMTP_USERNAME", "user@example.com")
+    monkeypatch.setattr(emailer, "SMTP_PASSWORD", "stale-password")
+    monkeypatch.setattr(emailer, "DISCORD_PROXY_URL", None)
+
+    fake_server = MagicMock()
+    fake_server.__enter__ = MagicMock(return_value=fake_server)
+    fake_server.__exit__ = MagicMock(return_value=False)
+    fake_server.login.side_effect = smtplib.SMTPAuthenticationError(535, b"5.7.8 Username and Password not accepted")
+
+    with patch("emailer.smtplib.SMTP", return_value=fake_server):
+        sent, reason = emailer.send_email("to@example.com", "subject", "body")
+
+    assert sent is False
+    assert "credentials" in reason.lower()
+    assert "535" in reason
 
 
 def test_proxied_smtp_get_socket_raises_on_non_200_connect(monkeypatch):
