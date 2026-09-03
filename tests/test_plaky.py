@@ -122,6 +122,25 @@ def test_find_user_email_picks_best_scoring_candidate_not_first():
     assert email == "ricco@example.com"
 
 
+def test_find_user_email_does_not_collapse_shared_first_name_to_false_exact_match():
+    """Real incident: 'Joe Black' vs an unrelated Plaky roster entry 'Joe H' who
+    just happens to share a first name. The old leading-token retry reduced
+    BOTH sides to bare 'Joe', producing a spurious 1.0 exact match that beat
+    the correct 0.95 containment match on his real GitHub-handle-shaped entry
+    ('jrb00013' contained in 'Jrb00013wvu'). Must resolve to the correct person."""
+    users = [
+        {"name": "Deepiri Help Desk"},
+        {"name": "Jrb00013wvu", "email": "joeb@wvu.edu"},
+        {"name": "Huy Truong"},
+        {"name": "Salvatore.D"},
+        {"name": "Jordan R."},
+        {"name": "Joe H", "email": "wronghauer@gmail.com"},
+    ]
+    with patch("plaky._request_with_rate_limit_retry", return_value=_fake_response(users)):
+        email = find_user_email(["Joe Black", "jrb00013", "joe black", "joeblack101"], "fake-key")
+    assert email == "joeb@wvu.edu"
+
+
 def test_find_user_email_all_signals_real_ricco_case():
     """The actual case that motivated this: GitHub real name, GitHub login, and
     two different Discord identifiers thrown at Plaky together."""
