@@ -84,6 +84,12 @@ KICK_OUT_COMMAND_CHANNEL_IDS = {
 }
 KICK_OUT_COMMAND_RE = re.compile(r"^\s*kick\s*(?:out)?\s+(.+)$", re.IGNORECASE)
 
+# "@Someone is retiring" / "@Someone retiring as well" -- voluntary offboarding,
+# triggered by mentioning "retiring" anywhere in a message (staff-only, since it
+# leads to the same Discord kick + GitHub org removal as kick-out). Falls back
+# to the current thread's ticket creator when no @mention is present.
+RETIRING_TRIGGER_RE = re.compile(r"\bretiring\b", re.IGNORECASE)
+
 # PR staleness escalation: 2 weeks -> #qa-support-team (one-time, includes the
 # assigned QA reviewer), 2.5 weeks -> recurring DM to the author AND, separately,
 # to any assigned QA reviewer who hasn't reviewed yet (cadence tightens with
@@ -728,11 +734,13 @@ async def _post_pr_staleness_qa_channel(pr: dict, qa_reviewers: list) -> None:
         return
     if qa_reviewers:
         assigned = ", ".join(member.mention for _login, member in qa_reviewers)
+        cta = "Let's get this merged when you can!"
     else:
         assigned = "No QA assigned"
+        cta = "Let's get this assigned!"
     try:
         await channel.send(
-            f"PR #{number} in {repo} (\"{title}\") has been open 2 weeks: {url}\nAssigned QA: {assigned}"
+            f"PR #{number} in {repo} (\"{title}\") has been open 2 weeks: {url}\nAssigned QA: {assigned}\n{cta}"
         )
     except Exception:
         logger.exception("Failed to post 2-week PR staleness notice for %s#%s", repo, number)
@@ -1431,15 +1439,46 @@ def _termination_notice_text(display_name: str) -> str:
     )
 
 
-async def _send_termination_notice(target: discord.Member, github_username: Optional[str]) -> str:
-    """Resolve an email for the kicked member (self-reported at join -> GitHub
-    public email -> best-effort Plaky lookup -> Discord DM as last resort) and
-    send the termination notice. Returns a short human-readable outcome string
-    for the kick-out summary.
-    """
-    body = _termination_notice_text(target.display_name)
-    subject = "Notice of Termination — Deepiri Contributor Agreement"
+def _retirement_notice_text(display_name: str) -> str:
+    return (
+        f"Dear {display_name},\n\n"
+        "This confirms your retirement from the Deepiri project, effective immediately, "
+        "per your own request. Thank you for your contributions.\n\n"
+        "As with any departure, the following terms apply:\n"
+        "1. Cessation of Representation\n\n"
+        "Effective immediately, you may not represent yourself as:\n\n"
+        "    A current contributor to Deepiri\n\n"
+        "    Acting on behalf of Deepiri\n\n"
+        "    Affiliated with Deepiri in any ongoing capacity\n\n"
+        "You're welcome to update LinkedIn, résumés, and other public profiles to reflect "
+        "your past involvement -- any description of it must be accurate and must not imply "
+        "ongoing affiliation, authority, or endorsement.\n"
+        "2. Access and Assets\n\n"
+        "Your access to Deepiri systems, repositories, accounts, credentials, and internal "
+        "tools has been removed.\n\n"
+        "If you possess any materials that were explicitly designated as private and not "
+        "publicly released under Apache 2.0, those materials must be deleted or returned in "
+        "accordance with Sections 11 and 12 of the Deepiri Contributor and Intellectual "
+        "Property Agreement. This does not apply to publicly released open-source "
+        "repositories governed by Apache 2.0.\n"
+        "3. Continuing Obligations\n\n"
+        "All confidentiality provisions remain in effect with respect to any non-public "
+        "materials previously accessed.\n\n"
+        "Thanks again for everything you built here -- if you have questions, please submit "
+        "them in writing.\n\n"
+        "Sincerely,\n"
+        "Deepiri Management"
+    )
 
+
+async def _send_offboarding_notice(
+    target: discord.Member, github_username: Optional[str], *, subject: str, body: str
+) -> str:
+    """Resolve an email for the departing member (self-reported at join -> GitHub
+    public email -> best-effort Plaky lookup -> Discord DM as last resort) and
+    send the given notice. Returns a short human-readable outcome string for the
+    calling flow's summary. Shared by both the involuntary kick-out path
+    (termination notice) and the voluntary retirement path (retirement notice)."""
     email = await load_member_email(target.id)
     github_real_name = None
     if not email and github_username:
@@ -1480,6 +1519,15 @@ async def _send_termination_notice(target: discord.Member, github_username: Opti
     except Exception:
         logger.exception("Failed to DM termination notice to %s", target.id)
         return "could not deliver notice via email or DM"
+
+
+async def _send_termination_notice(target: discord.Member, github_username: Optional[str]) -> str:
+    return await _send_offboarding_notice(
+        target,
+        github_username,
+        subject="Notice of Termination — Deepiri Contributor Agreement",
+        body=_termination_notice_text(target.display_name),
+    )
 
 
 def _candidate_roles_by_category(guild: discord.Guild) -> "dict[str, discord.Role]":
@@ -1707,6 +1755,152 @@ async def _maybe_handle_kick_out_command(message: discord.Message) -> bool:
             await summary_channel.edit(archived=True, locked=False, reason="Kick-out resolved")
         except Exception:
             logger.exception("Failed to archive kick-out ticket thread %s", summary_channel.id)
+    return True
+
+
+async def _execute_retirement(target: discord.Member, guild: discord.Guild) -> str:
+    """Same underlying offboarding as kick-out (Discord kick + GitHub org
+    removal + notice), but framed as a voluntary retirement rather than a
+    termination. Returns a human-readable summary."""
+    github_username = _get_github_username_for_member(target)
+    if github_username and not await asyncio.to_thread(is_org_member, github_username, GITHUB_ORG, GITHUB_PAT):
+        github_username = None
+    if not github_username:
+        github_username = await _find_github_username_in_profiles_channel(target)
+    if not github_username:
+        github_username = await _find_github_username_via_org_roster(target)
+
+    notice_outcome = await _send_offboarding_notice(
+        target,
+        github_username,
+        subject="Retirement Confirmation — Deepiri",
+        body=_retirement_notice_text(target.display_name),
+    )
+
+    discord_ok = True
+    try:
+        await target.kick(reason=f"Voluntary retirement, confirmed by {target}")
+    except Exception:
+        discord_ok = False
+        logger.exception("Failed to kick retiring member %s", target.id)
+
+    github_ok = False
+    github_note = "no mapped GitHub username, skipped"
+    if github_username:
+        org_result = remove_user_from_org(username=github_username, github_org=GITHUB_ORG, github_pat=GITHUB_PAT)
+        github_ok = bool(org_result.get("ok"))
+        github_note = github_username if github_ok else f"{github_username} — {org_result.get('message')}"
+
+    return (
+        f"{'✅' if discord_ok else '⚠️'} Discord kick: {target} ({target.id})\n"
+        f"{'✅' if github_ok else '⚠️'} GitHub org removal: {github_note}\n"
+        f"📧 Retirement notice: {notice_outcome}"
+    )
+
+
+class RetirementConfirmView(discord.ui.View):
+    """Sent as a DM to the person named as retiring -- only they can confirm,
+    so a staff member naming someone else in chat can't force it through
+    without that person's own say-so."""
+
+    def __init__(self, target_id: int, origin_channel_id: Optional[int]):
+        super().__init__(timeout=24 * 60 * 60)
+        self.target_id = target_id
+        self.origin_channel_id = origin_channel_id
+
+    async def _disable(self, interaction: discord.Interaction) -> None:
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+        if interaction.message:
+            try:
+                await interaction.message.edit(view=self)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="Confirm Retirement", style=discord.ButtonStyle.danger, custom_id="retirement_confirm")
+    async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.user is None or interaction.user.id != self.target_id:
+            await interaction.response.send_message("This confirmation isn't yours to click.", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+        await self._disable(interaction)
+
+        guild = await _get_primary_guild()
+        member = guild.get_member(self.target_id) if guild else None
+        if member is None:
+            await interaction.followup.send("Couldn't find you in the server anymore -- nothing to do.")
+            return
+
+        summary = await _execute_retirement(member, guild)
+        await interaction.followup.send(f"Retirement confirmed. {summary}")
+
+        if self.origin_channel_id:
+            origin_channel = await _channel_from_id(self.origin_channel_id)
+            if origin_channel is not None:
+                try:
+                    await origin_channel.send(f"{member} confirmed their retirement.\n{summary}")
+                    if isinstance(origin_channel, discord.Thread):
+                        await origin_channel.edit(archived=True, locked=False, reason="Retirement resolved")
+                except Exception:
+                    logger.exception("Failed to post retirement summary to origin channel %s", self.origin_channel_id)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, custom_id="retirement_cancel")
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.user is None or interaction.user.id != self.target_id:
+            await interaction.response.send_message("This confirmation isn't yours to click.", ephemeral=True)
+            return
+        await interaction.response.send_message("No changes made.")
+        await self._disable(interaction)
+
+
+def _resolve_retirement_target(message: discord.Message) -> Optional[discord.Member]:
+    """@mention in the message wins; otherwise falls back to the current
+    ticket thread's creator (the member who opened it)."""
+    for mentioned in message.mentions:
+        if isinstance(mentioned, discord.Member) and not mentioned.bot:
+            return mentioned
+    if isinstance(message.channel, discord.Thread) and message.channel.owner_id:
+        guild = message.guild
+        if guild is not None:
+            owner = guild.get_member(message.channel.owner_id)
+            if owner is not None and not owner.bot:
+                return owner
+    return None
+
+
+async def _maybe_handle_retirement_announcement(message: discord.Message) -> bool:
+    """Staff saying "<@member> is retiring" (or just "retiring" in a ticket
+    thread, falling back to the ticket creator) DMs that person a confirmation
+    prompt -- only they can confirm, at which point it's the same offboarding
+    as kick-out (Discord kick + GitHub org removal), framed as a retirement
+    rather than a termination."""
+    if message.guild is None or not RETIRING_TRIGGER_RE.search(message.content or ""):
+        return False
+    if not isinstance(message.author, discord.Member) or not _is_staff_or_security_ops(message.author):
+        return False
+
+    target = _resolve_retirement_target(message)
+    reply_channel = await _resolve_reply_channel(message)
+    if target is None:
+        await reply_channel.send(
+            f"{message.author.mention} Couldn't tell who's retiring -- @ mention them, or say it in their ticket thread."
+        )
+        return True
+
+    view = RetirementConfirmView(target_id=target.id, origin_channel_id=reply_channel.id)
+    try:
+        await target.send(
+            f"**Are you sure you want to retire from Deepiri?**\n\n"
+            f"{message.author.display_name} said you're retiring in {getattr(message.channel, 'name', 'the server')}. "
+            "Click below to confirm -- this will remove your Discord access and GitHub org membership.",
+            view=view,
+        )
+    except discord.Forbidden:
+        await reply_channel.send(f"{message.author.mention} Couldn't DM {target.mention} to confirm -- they may have DMs disabled.")
+        return True
+
+    await reply_channel.send(f"{message.author.mention} Sent {target.mention} a retirement confirmation via DM.")
     return True
 
 
@@ -2374,6 +2568,9 @@ def _create_and_register_bot() -> DeepiriBot:
         content = message.content or ""
         await notify_support_team_for_message(message)
         if await _maybe_handle_kick_out_command(message):
+            await new_bot.process_commands(message)
+            return
+        if await _maybe_handle_retirement_announcement(message):
             await new_bot.process_commands(message)
             return
         await _maybe_auto_assign_ipca_roles(message)
