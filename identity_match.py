@@ -106,9 +106,18 @@ def _score_one(query: str, candidate: str) -> tuple:
         # Sevilla" scores 0.667 on raw ratio -- two different people who
         # happen to share a couple of letters), so it gets the same guard
         # rather than a laxer one just because fewer tokens were supplied.
-        ratio = _similar(q, v)
-        if ratio >= 0.82:
-            return ratio, f"{int(ratio * 100)}% similar to {candidate!r}"
+        # len(q) >= 4: below this, ratio/edit-distance stops being a usable
+        # signal at all -- "erik"/"eric" (same person, real typo) and
+        # "kyle"/"kyla" (different people) score *identically* on ratio,
+        # matched-char count, and edit distance (0.75 / 3 / 1, every one).
+        # No threshold here can tell them apart, so a query this short must
+        # go through the token loop's own guard (or another signal) instead
+        # of this whole-candidate check -- matching the length floor already
+        # applied there, which this check was inconsistently missing.
+        if len(q) >= 4:
+            ratio = _similar(q, v)
+            if ratio >= 0.82:
+                return ratio, f"{int(ratio * 100)}% similar to {candidate!r}"
         for token in v_tokens:
             if len(token) < 4 or len(q) < 4:
                 continue
