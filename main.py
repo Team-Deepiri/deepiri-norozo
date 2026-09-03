@@ -26,7 +26,7 @@ from identity_match import best_match
 from github_discussion import GitHubDiscussionError, create_github_discussion
 from meetings import setup_meeting_features
 from onboarding import ApprovalView
-from member_email_store import load_member_email, save_member_email
+from member_email_store import load_member_profile, save_member_email, save_member_real_name
 from pr_staleness_store import claim_pr_staleness_1month, find_discord_id_by_email, load_pr_staleness, save_pr_staleness
 from plaky import create_task, find_user_email, get_tasks
 from state_store import load_last_online_at, save_last_online_at
@@ -1477,24 +1477,32 @@ async def _send_offboarding_notice(
     send the given notice. Returns a short human-readable outcome string for the
     calling flow's summary. Shared by both the involuntary kick-out path
     (termination notice) and the voluntary retirement path (retirement notice)."""
-    email = await load_member_email(target.id)
-    github_real_name = None
+    # Check the dynamic identity cache first -- if this person ever self-reported
+    # a GitHub link, their real name was captured then, independent of whether
+    # github_username (resolved just now, possibly from a stylized handle that
+    # doesn't fuzzy-match anything) resolves at all this time.
+    cached_profile = await load_member_profile(target.id)
+    email = cached_profile["email"]
+    github_real_name = cached_profile["real_name"]
+    if not github_username:
+        github_username = cached_profile["github_username"]
+
     if not email and github_username:
         profile = await asyncio.to_thread(get_user_profile, github_username, GITHUB_PAT)
         email = profile.get("email")
-        github_real_name = profile.get("name")
+        github_real_name = github_real_name or profile.get("name")
         if not email:
             logger.info("Termination notice: no public GitHub email for %s (real name on profile: %r)", github_username, github_real_name)
     if not email and not PLAKY_API_KEY:
         logger.warning("Termination notice: PLAKY_API_KEY not configured, skipping Plaky lookup for %s", target.id)
     if not email and PLAKY_API_KEY:
         # Throw every known identifier at Plaky at once instead of trying one
-        # candidate and giving up: GitHub's real display name (e.g. login
-        # "riccorx" -> name "Ricardo Beale" -- the person's own self-reported
-        # real name, a far stronger signal than any account handle), the GitHub
-        # login itself, and every Discord identifier. find_user_email picks the
-        # single best-scoring match across all of them, not just the first
-        # candidate that happens to clear the threshold.
+        # candidate and giving up: the cached/fetched real display name (e.g.
+        # login "riccorx" -> name "Ricardo Beale" -- the person's own
+        # self-reported real name, a far stronger signal than any account
+        # handle), the GitHub login itself, and every Discord identifier.
+        # find_user_email picks the single best-scoring match across all of
+        # them, not just the first candidate that happens to clear the threshold.
         candidates = [
             github_real_name,
             github_username,
@@ -1588,6 +1596,20 @@ async def _maybe_handle_onboarding_dm(message: discord.Message) -> bool:
     github_username = _extract_github_profile_username(content) if URL_RE.search(content) else None
     if github_username:
         _remember_github_username(message.author.id, github_username)
+        # Capture their real name right now, while it's a certain, self-reported
+        # signal -- not a fuzzy guess later. This is the entire "dynamic alias
+        # table": no one hand-types a nickname mapping, it's just recorded the
+        # moment it's known, so a kick-out for a stylized handle months later
+        # ("daev1005") is a cache hit on the real name ("David Li") instead of
+        # a string-similarity gamble on the handle itself.
+        if GITHUB_PAT:
+            try:
+                profile = await asyncio.to_thread(get_user_profile, github_username, GITHUB_PAT)
+                real_name = profile.get("name")
+                if real_name:
+                    await save_member_real_name(message.author.id, real_name, github_username)
+            except Exception:
+                logger.exception("Failed to fetch/cache real name for %s (%s)", message.author.id, github_username)
         await message.channel.send(f"Got it — linked your GitHub as **{github_username}**.")
         return True
 

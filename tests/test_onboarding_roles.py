@@ -143,6 +143,7 @@ async def test_plain_role_word_is_not_swallowed_as_a_github_username(monkeypatch
 async def test_github_link_is_still_captured_as_username(monkeypatch):
     remember_mock = Mock()
     monkeypatch.setattr(main, "_remember_github_username", remember_mock)
+    monkeypatch.setattr(main, "GITHUB_PAT", None)
 
     author = SimpleNamespace(id=999, bot=False, __str__=lambda self: "tester#0")
     channel = SimpleNamespace(send=AsyncMock())
@@ -152,6 +153,46 @@ async def test_github_link_is_still_captured_as_username(monkeypatch):
 
     assert handled is True
     remember_mock.assert_called_once_with(999, "octocat")
+
+
+@pytest.mark.asyncio
+async def test_github_link_capture_also_caches_real_name(monkeypatch):
+    """This is the whole "dynamic alias table": the moment someone
+    self-reports their GitHub link, their real name is fetched and cached
+    immediately -- not left to be fuzzy-guessed from a stylized handle
+    ("daev1005") months later at kick-out time."""
+    monkeypatch.setattr(main, "_remember_github_username", Mock())
+    monkeypatch.setattr(main, "GITHUB_PAT", "fake-pat")
+    monkeypatch.setattr(main, "get_user_profile", lambda username, pat: {"name": "David Li", "email": None})
+    save_mock = AsyncMock()
+    monkeypatch.setattr(main, "save_member_real_name", save_mock)
+
+    author = SimpleNamespace(id=999, bot=False, __str__=lambda self: "tester#0")
+    channel = SimpleNamespace(send=AsyncMock())
+    message = SimpleNamespace(guild=None, author=author, content="https://github.com/daev1005", channel=channel)
+
+    handled = await main._maybe_handle_onboarding_dm(message)
+
+    assert handled is True
+    save_mock.assert_awaited_once_with(999, "David Li", "daev1005")
+
+
+@pytest.mark.asyncio
+async def test_github_link_capture_skips_cache_when_profile_has_no_name(monkeypatch):
+    monkeypatch.setattr(main, "_remember_github_username", Mock())
+    monkeypatch.setattr(main, "GITHUB_PAT", "fake-pat")
+    monkeypatch.setattr(main, "get_user_profile", lambda username, pat: {"name": None, "email": None})
+    save_mock = AsyncMock()
+    monkeypatch.setattr(main, "save_member_real_name", save_mock)
+
+    author = SimpleNamespace(id=999, bot=False, __str__=lambda self: "tester#0")
+    channel = SimpleNamespace(send=AsyncMock())
+    message = SimpleNamespace(guild=None, author=author, content="https://github.com/octocat", channel=channel)
+
+    handled = await main._maybe_handle_onboarding_dm(message)
+
+    assert handled is True
+    save_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
