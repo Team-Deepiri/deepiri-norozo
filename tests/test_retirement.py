@@ -42,6 +42,35 @@ async def test_no_target_resolvable_asks_for_clarification(monkeypatch):
     assert "Couldn't tell who's retiring" in reply_channel.send.await_args.args[0]
 
 
+def test_trigger_regex_matches_retiring_and_leaving_deepiri():
+    assert main.RETIRING_TRIGGER_RE.search("she's retiring next week")
+    assert main.RETIRING_TRIGGER_RE.search("he is leaving Deepiri")
+    assert main.RETIRING_TRIGGER_RE.search("LEAVING DEEPIRI as of today")
+
+
+def test_trigger_regex_does_not_match_leaving_and_deepiri_separately():
+    """Must be the exact combined phrase, not just both words anywhere in
+    the same sentence."""
+    assert main.RETIRING_TRIGGER_RE.search("I'm leaving the team, still love Deepiri though") is None
+
+
+@pytest.mark.asyncio
+async def test_leaving_deepiri_phrase_triggers_same_flow_as_retiring(monkeypatch):
+    monkeypatch.setattr(main, "_is_staff_or_security_ops", lambda member: True)
+    author = _member(id_=1, display_name="Staffer")
+    target = _member(id_=2, display_name="Departing")
+    channel = SimpleNamespace(id=50, name="ticket-thread")
+    message = SimpleNamespace(guild=SimpleNamespace(), author=author, content="<@2> is leaving Deepiri", channel=channel, mentions=[target])
+    reply_channel = SimpleNamespace(id=50, send=AsyncMock())
+    monkeypatch.setattr(main, "_resolve_reply_channel", AsyncMock(return_value=reply_channel))
+
+    handled = await main._maybe_handle_retirement_announcement(message)
+
+    assert handled is True
+    reply_channel.send.assert_awaited_once()
+    assert "Are you sure you want to retire" in reply_channel.send.await_args.args[0]
+
+
 @pytest.mark.asyncio
 async def test_non_staff_cannot_trigger_retirement(monkeypatch):
     monkeypatch.setattr(main, "_is_staff_or_security_ops", lambda member: False)
