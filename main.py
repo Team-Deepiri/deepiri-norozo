@@ -84,11 +84,13 @@ KICK_OUT_COMMAND_CHANNEL_IDS = {
 }
 KICK_OUT_COMMAND_RE = re.compile(r"^\s*kick\s*(?:out)?\s+(.+)$", re.IGNORECASE)
 
-# "@Someone is retiring" / "@Someone retiring as well" -- voluntary offboarding,
-# triggered by mentioning "retiring" anywhere in a message (staff-only, since it
-# leads to the same Discord kick + GitHub org removal as kick-out). Falls back
-# to the current thread's ticket creator when no @mention is present.
-RETIRING_TRIGGER_RE = re.compile(r"\bretiring\b", re.IGNORECASE)
+# "@Someone is retiring" / "@Someone retiring as well" / "@Someone is leaving
+# Deepiri" -- voluntary offboarding, triggered by "retiring" anywhere in a
+# message, or the exact combined phrase "leaving deepiri" (not just both
+# words separately in the same sentence) -- staff-only, since it leads to the
+# same Discord kick + GitHub org removal as kick-out. Falls back to the
+# current thread's ticket creator when no @mention is present.
+RETIRING_TRIGGER_RE = re.compile(r"\bretiring\b|\bleaving\s+deepiri\b", re.IGNORECASE)
 
 # PR staleness escalation: 2 weeks -> #qa-support-team (one-time, includes the
 # assigned QA reviewer), 2.5 weeks -> recurring DM to the author AND, separately,
@@ -1877,11 +1879,12 @@ def _resolve_retirement_target(message: discord.Message) -> Optional[discord.Mem
 
 
 async def _maybe_handle_retirement_announcement(message: discord.Message) -> bool:
-    """Staff saying "<@member> is retiring" (or just "retiring" in a ticket
-    thread, falling back to the ticket creator) posts a confirmation prompt
-    directly in that ticket thread -- only the named person can confirm, at
-    which point it's the same offboarding as kick-out (Discord kick + GitHub
-    org removal), framed as a retirement rather than a termination."""
+    """Staff saying "<@member> is retiring" / "is leaving Deepiri" (or just
+    "retiring"/"leaving deepiri" in a ticket thread, falling back to the
+    ticket creator) posts a confirmation prompt directly in that ticket
+    thread -- only the named person can confirm, at which point it's the
+    same offboarding as kick-out (Discord kick + GitHub org removal), framed
+    as a retirement rather than a termination."""
     if message.guild is None or not RETIRING_TRIGGER_RE.search(message.content or ""):
         return False
     if not isinstance(message.author, discord.Member) or not _is_staff_or_security_ops(message.author):
