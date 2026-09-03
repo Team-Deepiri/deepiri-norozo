@@ -160,21 +160,21 @@ async def test_github_link_capture_also_caches_real_name(monkeypatch):
     """This is the whole "dynamic alias table": the moment someone
     self-reports their GitHub link, their real name is fetched and cached
     immediately -- not left to be fuzzy-guessed from a stylized handle
-    ("daev1005") months later at kick-out time."""
+    ("wrenx1005") months later at kick-out time."""
     monkeypatch.setattr(main, "_remember_github_username", Mock())
     monkeypatch.setattr(main, "GITHUB_PAT", "fake-pat")
-    monkeypatch.setattr(main, "get_user_profile", lambda username, pat: {"name": "David Li", "email": None})
+    monkeypatch.setattr(main, "get_user_profile", lambda username, pat: {"name": "Taylor Chen", "email": None})
     save_mock = AsyncMock()
     monkeypatch.setattr(main, "save_member_real_name", save_mock)
 
     author = SimpleNamespace(id=999, bot=False, __str__=lambda self: "tester#0")
     channel = SimpleNamespace(send=AsyncMock())
-    message = SimpleNamespace(guild=None, author=author, content="https://github.com/daev1005", channel=channel)
+    message = SimpleNamespace(guild=None, author=author, content="https://github.com/wrenx1005", channel=channel)
 
     handled = await main._maybe_handle_onboarding_dm(message)
 
     assert handled is True
-    save_mock.assert_awaited_once_with(999, "David Li", "daev1005")
+    save_mock.assert_awaited_once_with(999, "Taylor Chen", "wrenx1005")
 
 
 @pytest.mark.asyncio
@@ -186,6 +186,47 @@ async def test_github_link_capture_skips_cache_when_profile_has_no_name(monkeypa
     monkeypatch.setattr(main, "save_member_real_name", save_mock)
 
     author = SimpleNamespace(id=999, bot=False, __str__=lambda self: "tester#0")
+    channel = SimpleNamespace(send=AsyncMock())
+    message = SimpleNamespace(guild=None, author=author, content="https://github.com/octocat", channel=channel)
+
+    handled = await main._maybe_handle_onboarding_dm(message)
+
+    assert handled is True
+    save_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_github_link_capture_falls_back_to_discord_name_when_github_has_none(monkeypatch):
+    """Not just onboarding, and not just GitHub: when GitHub's public profile
+    has no real name set, a "First Last"-shaped Discord global_name is still
+    a good identity-search candidate, so it gets cached too."""
+    monkeypatch.setattr(main, "_remember_github_username", Mock())
+    monkeypatch.setattr(main, "GITHUB_PAT", "fake-pat")
+    monkeypatch.setattr(main, "get_user_profile", lambda username, pat: {"name": None, "email": None})
+    save_mock = AsyncMock()
+    monkeypatch.setattr(main, "save_member_real_name", save_mock)
+
+    author = SimpleNamespace(id=999, bot=False, global_name="Jordan Rivera", display_name="jr_dev", __str__=lambda self: "tester#0")
+    channel = SimpleNamespace(send=AsyncMock())
+    message = SimpleNamespace(guild=None, author=author, content="https://github.com/octocat", channel=channel)
+
+    handled = await main._maybe_handle_onboarding_dm(message)
+
+    assert handled is True
+    save_mock.assert_awaited_once_with(999, "Jordan Rivera", "octocat")
+
+
+@pytest.mark.asyncio
+async def test_github_link_capture_ignores_non_name_shaped_discord_handle(monkeypatch):
+    """A stylized single-word handle isn't "First Last"-shaped, so it must not
+    get cached as if it were a real name."""
+    monkeypatch.setattr(main, "_remember_github_username", Mock())
+    monkeypatch.setattr(main, "GITHUB_PAT", "fake-pat")
+    monkeypatch.setattr(main, "get_user_profile", lambda username, pat: {"name": None, "email": None})
+    save_mock = AsyncMock()
+    monkeypatch.setattr(main, "save_member_real_name", save_mock)
+
+    author = SimpleNamespace(id=999, bot=False, global_name="wrenx1005", display_name="wrenx1005", __str__=lambda self: "tester#0")
     channel = SimpleNamespace(send=AsyncMock())
     message = SimpleNamespace(guild=None, author=author, content="https://github.com/octocat", channel=channel)
 
