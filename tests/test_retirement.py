@@ -1,6 +1,10 @@
-"""Voluntary retirement flow: staff mentioning "retiring" in chat DMs the
-named (or ticket-creator-fallback) person a confirmation prompt; only that
-person's own confirmation click actually kicks them + removes GitHub access."""
+"""Voluntary retirement flow: staff mentioning "retiring" in chat posts a
+confirmation prompt directly in the ticket thread (not a DM), naming the
+target (or falling back to the ticket creator); only that person's own
+confirmation click actually kicks them + removes GitHub access. Resolved
+threads are closed via Needle's "/close" text command, not a raw Discord-API
+archive -- Norozo's own archive calls have never actually closed a ticket in
+practice."""
 
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -50,7 +54,7 @@ async def test_non_staff_cannot_trigger_retirement(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_mentioned_member_gets_dm_with_confirm_view(monkeypatch):
+async def test_mentioned_member_gets_confirm_prompt_in_ticket_thread_not_dm(monkeypatch):
     monkeypatch.setattr(main, "_is_staff_or_security_ops", lambda member: True)
     author = _member(id_=1, display_name="Staffer")
     target = _member(id_=2, display_name="Departing")
@@ -62,11 +66,12 @@ async def test_mentioned_member_gets_dm_with_confirm_view(monkeypatch):
     handled = await main._maybe_handle_retirement_announcement(message)
 
     assert handled is True
-    target.send.assert_awaited_once()
-    assert "Are you sure you want to retire" in target.send.await_args.args[0]
-    assert isinstance(target.send.await_args.kwargs["view"], main.RetirementConfirmView)
+    target.send.assert_not_awaited()  # never a DM
     reply_channel.send.assert_awaited_once()
-    assert "Sent" in reply_channel.send.await_args.args[0]
+    call = reply_channel.send.await_args
+    assert "Are you sure you want to retire" in call.args[0]
+    assert target.mention in call.args[0]
+    assert isinstance(call.kwargs["view"], main.RetirementConfirmView)
 
 
 @pytest.mark.asyncio
@@ -85,7 +90,9 @@ async def test_falls_back_to_ticket_thread_creator_when_no_mention(monkeypatch):
     handled = await main._maybe_handle_retirement_announcement(message)
 
     assert handled is True
-    owner.send.assert_awaited_once()
+    owner.send.assert_not_awaited()
+    reply_channel.send.assert_awaited_once()
+    assert owner.mention in reply_channel.send.await_args.args[0]
 
 
 @pytest.mark.asyncio
@@ -100,14 +107,18 @@ async def test_confirm_button_rejects_non_target_clicker(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_confirm_button_executes_offboarding_for_target(monkeypatch):
+async def test_confirm_button_executes_offboarding_and_closes_ticket(monkeypatch):
     target_member = _member(id_=2, display_name="Departing")
     guild = SimpleNamespace(get_member=lambda uid: target_member if uid == 2 else None)
     monkeypatch.setattr(main, "_get_primary_guild", AsyncMock(return_value=guild))
     execute_mock = AsyncMock(return_value="summary text")
     monkeypatch.setattr(main, "_execute_retirement", execute_mock)
+    origin_channel = SimpleNamespace(send=AsyncMock())
+    monkeypatch.setattr(main, "_channel_from_id", AsyncMock(return_value=origin_channel))
+    close_mock = AsyncMock()
+    monkeypatch.setattr(main, "_close_ticket_thread", close_mock)
 
-    view = main.RetirementConfirmView(target_id=2, origin_channel_id=None)
+    view = main.RetirementConfirmView(target_id=2, origin_channel_id=99)
     interaction = SimpleNamespace(
         user=SimpleNamespace(id=2),
         response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
@@ -120,6 +131,26 @@ async def test_confirm_button_executes_offboarding_for_target(monkeypatch):
     execute_mock.assert_awaited_once_with(target_member, guild)
     interaction.followup.send.assert_awaited_once()
     assert "Retirement confirmed" in interaction.followup.send.await_args.args[0]
+    close_mock.assert_awaited_once_with(origin_channel)
+
+
+@pytest.mark.asyncio
+async def test_close_ticket_thread_sends_slash_close_for_needle(monkeypatch):
+    thread = Mock(spec=discord.Thread)
+    thread.send = AsyncMock()
+
+    await main._close_ticket_thread(thread)
+
+    thread.send.assert_awaited_once_with("/close")
+
+
+@pytest.mark.asyncio
+async def test_close_ticket_thread_noop_for_non_thread(monkeypatch):
+    channel = SimpleNamespace(send=AsyncMock())
+
+    await main._close_ticket_thread(channel)
+
+    channel.send.assert_not_awaited()
 
 
 @pytest.mark.asyncio

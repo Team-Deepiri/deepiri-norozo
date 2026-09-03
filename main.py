@@ -380,11 +380,7 @@ async def _maybe_auto_assign_ipca_roles(message: discord.Message) -> bool:
     # passed since the send above, during which the companion thread may have
     # only just been created.
     ticket_thread = await _resolve_reply_channel(message)
-    if isinstance(ticket_thread, discord.Thread):
-        try:
-            await ticket_thread.edit(archived=True, locked=False, reason="IPCA signed — ticket resolved")
-        except Exception:
-            logger.exception("Failed to archive IPCA ticket thread %s", ticket_thread.id)
+    await _close_ticket_thread(ticket_thread)
 
     return True
 
@@ -1671,6 +1667,22 @@ async def _resolve_reply_channel(message: discord.Message):
     return message.channel
 
 
+async def _close_ticket_thread(channel) -> None:
+    """Closes a resolved support-ticket thread. Norozo directly calling
+    thread.edit(archived=True) has never actually closed a ticket in practice
+    (Needle, the ticketing bot that owns these threads, manages their
+    open/closed lifecycle itself and doesn't treat a bare Discord-API archive
+    as "closed" in its own bookkeeping) -- so instead this sends the same
+    "/close" text Needle listens for, same as a human typing it in the
+    thread."""
+    if not isinstance(channel, discord.Thread):
+        return
+    try:
+        await channel.send("/close")
+    except Exception:
+        logger.exception("Failed to send /close to ticket thread %s", channel.id)
+
+
 async def _maybe_handle_kick_out_command(message: discord.Message) -> bool:
     """Staff saying 'kick out <name>' (or 'kick <name>') in #support-tickets,
     #admin-terminal, or #it-kick-list removes the member from Discord AND the
@@ -1748,13 +1760,9 @@ async def _maybe_handle_kick_out_command(message: discord.Message) -> bool:
             except Exception:
                 pass
 
-    # Same as IPCA's resolve-and-archive: the kick-out ticket is now handled,
+    # Same as IPCA's resolve-and-close: the kick-out ticket is now handled,
     # close it out the way a human staffer would rather than leaving it open.
-    if isinstance(summary_channel, discord.Thread):
-        try:
-            await summary_channel.edit(archived=True, locked=False, reason="Kick-out resolved")
-        except Exception:
-            logger.exception("Failed to archive kick-out ticket thread %s", summary_channel.id)
+    await _close_ticket_thread(summary_channel)
     return True
 
 
@@ -1840,10 +1848,9 @@ class RetirementConfirmView(discord.ui.View):
             if origin_channel is not None:
                 try:
                     await origin_channel.send(f"{member} confirmed their retirement.\n{summary}")
-                    if isinstance(origin_channel, discord.Thread):
-                        await origin_channel.edit(archived=True, locked=False, reason="Retirement resolved")
                 except Exception:
                     logger.exception("Failed to post retirement summary to origin channel %s", self.origin_channel_id)
+                await _close_ticket_thread(origin_channel)
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, custom_id="retirement_cancel")
     async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -1871,10 +1878,10 @@ def _resolve_retirement_target(message: discord.Message) -> Optional[discord.Mem
 
 async def _maybe_handle_retirement_announcement(message: discord.Message) -> bool:
     """Staff saying "<@member> is retiring" (or just "retiring" in a ticket
-    thread, falling back to the ticket creator) DMs that person a confirmation
-    prompt -- only they can confirm, at which point it's the same offboarding
-    as kick-out (Discord kick + GitHub org removal), framed as a retirement
-    rather than a termination."""
+    thread, falling back to the ticket creator) posts a confirmation prompt
+    directly in that ticket thread -- only the named person can confirm, at
+    which point it's the same offboarding as kick-out (Discord kick + GitHub
+    org removal), framed as a retirement rather than a termination."""
     if message.guild is None or not RETIRING_TRIGGER_RE.search(message.content or ""):
         return False
     if not isinstance(message.author, discord.Member) or not _is_staff_or_security_ops(message.author):
@@ -1889,18 +1896,11 @@ async def _maybe_handle_retirement_announcement(message: discord.Message) -> boo
         return True
 
     view = RetirementConfirmView(target_id=target.id, origin_channel_id=reply_channel.id)
-    try:
-        await target.send(
-            f"**Are you sure you want to retire from Deepiri?**\n\n"
-            f"{message.author.display_name} said you're retiring in {getattr(message.channel, 'name', 'the server')}. "
-            "Click below to confirm -- this will remove your Discord access and GitHub org membership.",
-            view=view,
-        )
-    except discord.Forbidden:
-        await reply_channel.send(f"{message.author.mention} Couldn't DM {target.mention} to confirm -- they may have DMs disabled.")
-        return True
-
-    await reply_channel.send(f"{message.author.mention} Sent {target.mention} a retirement confirmation via DM.")
+    await reply_channel.send(
+        f"{target.mention} **Are you sure you want to retire from Deepiri?** "
+        "Click below to confirm -- this will remove your Discord access and GitHub org membership.",
+        view=view,
+    )
     return True
 
 

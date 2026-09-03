@@ -85,11 +85,11 @@ async def test_maybe_auto_assign_ipca_roles_assigns_when_missing(monkeypatch):
     message.add_reaction.assert_awaited_once_with("✅")
     # support-tickets auto-thread: confirmation must land in the companion
     # thread (message.thread), not back in the parent channel via reply().
-    thread.send.assert_awaited_once()
-    assert "We gave you access to the rest of the Discord." in thread.send.call_args.args[0]
+    assert "We gave you access to the rest of the Discord." in thread.send.call_args_list[0].args[0]
     channel.send.assert_not_awaited()
-    # Ticket resolved -> the companion thread gets archived (closed).
-    thread.edit.assert_awaited_once_with(archived=True, locked=False, reason="IPCA signed — ticket resolved")
+    # Ticket resolved -> closed via Needle's "/close" text command, not a raw
+    # Discord-API archive (which never actually closed a ticket in practice).
+    thread.send.assert_awaited_with("/close")
 
 
 @pytest.mark.asyncio
@@ -159,8 +159,7 @@ async def test_maybe_auto_assign_ipca_roles_archives_current_thread_when_message
     assigned = await main._maybe_auto_assign_ipca_roles(message)
 
     assert assigned is True
-    thread_channel.send.assert_awaited_once()
-    thread_channel.edit.assert_awaited_once_with(archived=True, locked=False, reason="IPCA signed — ticket resolved")
+    thread_channel.send.assert_awaited_with("/close")
 
 
 @pytest.mark.asyncio
