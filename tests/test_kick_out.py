@@ -68,6 +68,7 @@ async def test_org_roster_fallback_matches_truncated_discord_handle(monkeypatch)
     monkeypatch.setattr(main, "GITHUB_ORG", "Team-Deepiri")
     monkeypatch.setattr(main, "GITHUB_PAT", "fake-token")
     monkeypatch.setattr(main, "list_org_members", lambda org, pat: ["samimahlaka", "someoneelse"])
+    monkeypatch.setattr(main, "get_user_profile", lambda username, pat: {"name": None, "email": None})
     remember_mock = Mock()
     monkeypatch.setattr(main, "_remember_github_username", remember_mock)
 
@@ -88,6 +89,7 @@ async def test_org_roster_fallback_refuses_on_no_confident_match(monkeypatch):
     monkeypatch.setattr(main, "GITHUB_ORG", "Team-Deepiri")
     monkeypatch.setattr(main, "GITHUB_PAT", "fake-token")
     monkeypatch.setattr(main, "list_org_members", lambda org, pat: ["completelyunrelated"])
+    monkeypatch.setattr(main, "get_user_profile", lambda username, pat: {"name": None, "email": None})
 
     member = Mock(spec=discord.Member)
     member.id = 42
@@ -98,6 +100,31 @@ async def test_org_roster_fallback_refuses_on_no_confident_match(monkeypatch):
     result = await main._find_github_username_via_org_roster(member)
 
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_org_roster_fallback_matches_via_github_profile_real_name(monkeypatch):
+    """Real incident: org member 'shan-versc' has GitHub profile real name
+    'Shanley V.'; Discord global_name 'Shanley' doesn't fuzzy-match the bare
+    login 'shan-versc' (ratio ~0.47, correctly refused) but does match the
+    real name via the first-name-token rule -- the resolver must check both
+    fields, not just the login."""
+    monkeypatch.setattr(main, "GITHUB_ORG", "Team-Deepiri")
+    monkeypatch.setattr(main, "GITHUB_PAT", "fake-token")
+    monkeypatch.setattr(main, "list_org_members", lambda org, pat: ["shan-versc", "someoneelse"])
+    profiles = {"shan-versc": {"name": "Shanley V.", "email": None}, "someoneelse": {"name": None, "email": None}}
+    monkeypatch.setattr(main, "get_user_profile", lambda username, pat: profiles[username])
+    monkeypatch.setattr(main, "_remember_github_username", Mock())
+
+    member = Mock(spec=discord.Member)
+    member.id = 42
+    member.display_name = "Shanley"
+    member.global_name = "Shanley"
+    member.name = "shanley_h"
+
+    result = await main._find_github_username_via_org_roster(member)
+
+    assert result == "shan-versc"
 
 
 def test_plain_staff_role_without_security_ops_cannot_dispatch(monkeypatch):

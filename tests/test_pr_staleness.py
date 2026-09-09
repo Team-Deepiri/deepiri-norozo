@@ -94,6 +94,31 @@ async def test_falls_back_to_name_fuzzy_match(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_name_fuzzy_match_checks_global_name_and_username_too(monkeypatch):
+    """Real incident: the docstring already claimed display_name/global_name/name
+    were all checked, but the code only ever built candidates from display_name --
+    a member with an abbreviated display_name ("Sergio V.") that doesn't clear
+    the fuzzy-match threshold against the full GitHub real name should still
+    resolve via a fuller global_name or username."""
+    monkeypatch.setattr(main, "_load_github_username_map", lambda: {})
+    monkeypatch.setattr(main, "GITHUB_PAT", "fake")
+    monkeypatch.setattr(main, "get_user_profile", lambda login, pat: {"name": "Sergio Vargas Aguilar", "email": None})
+    monkeypatch.setattr(main, "PLAKY_API_KEY", None)
+    remember_mock = Mock()
+    monkeypatch.setattr(main, "_remember_github_username", remember_mock)
+
+    member = _member(id_=55, display_name="Sergio V.")
+    member.global_name = "Sergio Vargas Aguilar"
+    member.name = "sergio_v"
+    guild = SimpleNamespace(get_member=lambda uid: member, members=[member])
+
+    result = await main._resolve_discord_member_for_github_login("sergiovargas111", guild)
+
+    assert result is member
+    remember_mock.assert_called_once_with(55, "sergiovargas111")
+
+
+@pytest.mark.asyncio
 async def test_falls_back_to_plaky_email_reverse_lookup(monkeypatch):
     monkeypatch.setattr(main, "_load_github_username_map", lambda: {})
     monkeypatch.setattr(main, "GITHUB_PAT", "fake")

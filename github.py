@@ -97,10 +97,25 @@ def get_user_email(username: str, github_pat: str) -> Optional[str]:
     return get_user_profile(username, github_pat).get("email")
 
 
-def add_user_to_team(username: str, github_org: str, github_pat: str, team_slug: str) -> Dict[str, Any]:
-    """Add a GitHub user to a team in the configured org by username."""
+def add_user_to_team(username: str, github_org: str, github_pat: str, team_slug: str, role: str = "member") -> Dict[str, Any]:
+    """Add a GitHub user to a team in the configured org by username.
+
+    ``role`` is the GitHub *team* role ("member" or "maintainer" -- team
+    maintainers can manage the team's membership and repo access, not to be
+    confused with the org-wide role set on invite_user). Also works to invite
+    someone who isn't an org member yet: GitHub creates a pending invitation
+    scoped to this org+team that resolves to the requested role once accepted,
+    same as the plain org invite in invite_user() but team-scoped.
+    """
     normalized_org = _normalize_org_name(github_org)
     normalized_team = (team_slug or "").strip()
+    normalized_role = (role or "member").strip().lower()
+    if normalized_role not in ("member", "maintainer"):
+        return {
+            "ok": False,
+            "status": 400,
+            "message": f"Invalid team role '{role}' (must be 'member' or 'maintainer').",
+        }
     if not github_pat or not normalized_org or not normalized_team:
         return {
             "ok": False,
@@ -127,15 +142,15 @@ def add_user_to_team(username: str, github_org: str, github_pat: str, team_slug:
     }
     url = f"{GITHUB_API_BASE}/orgs/{normalized_org}/teams/{normalized_team}/memberships/{username}"
 
-    logger.info("PUT %s", url)
-    response = _request_with_rate_limit_retry("PUT", url, headers=headers, json={"role": "member"})
+    logger.info("PUT %s role=%s", url, normalized_role)
+    response = _request_with_rate_limit_retry("PUT", url, headers=headers, json={"role": normalized_role})
     logger.info("GitHub team assignment response: status=%s body=%s", response.status_code, response.text[:500])
 
     if response.status_code in (200, 201, 202):
         return {
             "ok": True,
             "status": response.status_code,
-            "message": f"Added GitHub user '{username}' to team '{normalized_team}'.",
+            "message": f"Added GitHub user '{username}' to team '{normalized_team}' as {normalized_role}.",
         }
 
     if response.status_code == 404:
