@@ -1174,11 +1174,20 @@ async def _find_github_username_in_profiles_channel(member: discord.Member) -> O
 
 async def _find_github_username_via_org_roster(member: discord.Member) -> Optional[str]:
     """Last resort: fuzzy-match the Discord name against the full GitHub org
-    member list. GitHub logins are often nothing like a real name, but they
-    sometimes genuinely overlap -- a Discord handle like "mahlaka." can be a
-    truncated form of the GitHub login "samimahlaka" (SequenceMatcher ratio
-    ~0.78 there, comfortably above best_match's threshold). Every candidate
-    here is already a confirmed org member by construction, so no separate
+    member list -- against BOTH each member's raw login AND their GitHub
+    profile real name, keeping whichever scores higher (find_user_email in
+    plaky.py already uses this same "try every candidate string, keep the
+    single best score" shape). Real incident this fixes: org member
+    "shan-versc" has GitHub real name "Shanley V.", and a Discord global_name
+    of "Shanley" scored a correctly-refused ~0.47 against the bare login
+    "shan-versc" but would score 0.93 (first-name-token match) against the
+    real name "Shanley V." -- login-only matching silently failed to resolve
+    a real member because it never looked at the one field that would work.
+    GitHub logins are ALSO sometimes a genuine overlap on their own -- a
+    Discord handle like "mahlaka." can be a truncated form of the GitHub
+    login "samimahlaka" (SequenceMatcher ratio ~0.78) -- so both signals stay
+    in play rather than real-name replacing login. Every candidate here is
+    already a confirmed org member by construction, so no separate
     is_org_member re-check is needed the way the other two sources require.
     """
     if not GITHUB_ORG or not GITHUB_PAT:
@@ -1188,14 +1197,30 @@ async def _find_github_username_via_org_roster(member: discord.Member) -> Option
     if not usernames:
         logger.warning("Org roster fallback for %s: list_org_members returned nothing", member.id)
         return None
+
+    async def _fetch_name(username: str) -> str:
+        profile = await asyncio.to_thread(get_user_profile, username, GITHUB_PAT)
+        return profile.get("name") or ""
+
+    real_names = await asyncio.gather(*(_fetch_name(u) for u in usernames))
+
+    best_username = None
+    best_score = -1.0
+    best_query = None
     for candidate_name in (member.display_name, str(getattr(member, "global_name", "") or ""), str(member.name)):
         if not candidate_name:
             continue
-        match = best_match(candidate_name, usernames)
-        if match is not None:
-            logger.info("Org roster fallback: matched %s (query %r) -> %s", member.id, candidate_name, usernames[match.index])
-            await _remember_identity(member.id, usernames[match.index], member)
-            return usernames[match.index]
+        login_match = best_match(candidate_name, usernames)
+        if login_match is not None and login_match.score > best_score:
+            best_username, best_score, best_query = usernames[login_match.index], login_match.score, candidate_name
+        name_match = best_match(candidate_name, real_names)
+        if name_match is not None and name_match.score > best_score:
+            best_username, best_score, best_query = usernames[name_match.index], name_match.score, candidate_name
+
+    if best_username is not None:
+        logger.info("Org roster fallback: matched %s (query %r) -> %s (score=%s)", member.id, best_query, best_username, best_score)
+        await _remember_identity(member.id, best_username, member)
+        return best_username
     logger.warning("Org roster fallback for %s: no confident match among %s org members", member.id, len(usernames))
     return None
 
@@ -1268,8 +1293,19 @@ async def _resolve_discord_member_for_github_login(login: str, guild: discord.Gu
     real_name = profile.get("name")
 
     if real_name:
-        candidate_members = list(guild.members)
-        candidate_names = [m.display_name for m in candidate_members]
+        # All three name fields as separate candidates (not just display_name,
+        # despite what this docstring's step 2 already claimed) -- a member
+        # whose display_name is abbreviated ("Sergio V.") can still resolve
+        # via a fuller global_name or raw username that display_name alone
+        # would never surface. Same expanded-candidate-list shape as
+        # _find_github_username_via_org_roster's login+real-name fix.
+        candidate_members = []
+        candidate_names = []
+        for m in guild.members:
+            for name in (m.display_name, getattr(m, "global_name", None), m.name):
+                if isinstance(name, str) and name:
+                    candidate_members.append(m)
+                    candidate_names.append(name)
         match = best_match(real_name, candidate_names)
         if match is not None:
             member = candidate_members[match.index]
