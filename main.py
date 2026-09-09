@@ -3272,6 +3272,28 @@ def _register_slash_commands(target_bot: DeepiriBot) -> None:
         embed = _build_indepth_security_embed("In-depth security assessment", results)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
+    @target_bot.tree.command(name="resolve-github-identity", description="Test the GitHub->Discord identity resolver for a login on demand (staff/IT only)")
+    @app_commands.describe(github_login="The GitHub username to resolve")
+    async def resolve_github_identity(interaction: discord.Interaction, github_login: str) -> None:
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("This command must be used in a server.", ephemeral=True)
+            return
+        if not _is_staff_or_security_ops(interaction.user):
+            await interaction.response.send_message("This command is restricted to staff/IT.", ephemeral=True)
+            return
+
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        if not interaction.guild.chunked:
+            try:
+                await interaction.guild.chunk(cache=True)
+            except Exception:
+                logger.exception("resolve-github-identity: failed to chunk guild before resolving %s", github_login)
+        member = await _resolve_discord_member_for_github_login(github_login, interaction.guild)
+        if member is not None:
+            await interaction.followup.send(f"`{github_login}` resolved to {member.mention} ({member.id}).", ephemeral=True)
+        else:
+            await interaction.followup.send(f"`{github_login}` did not resolve to any Discord member. Check the logs (search for `{github_login}`) for the full diagnostic -- queries tried, near-hits, and the complete candidate roster.", ephemeral=True)
+
     @target_bot.tree.command(name="poll", description="Create a poll (staff only)")
     @app_commands.describe(question="The poll question", options="Comma-separated options (e.g., Yes, No, Maybe)")
     async def poll(interaction: discord.Interaction, question: str, options: str) -> None:
