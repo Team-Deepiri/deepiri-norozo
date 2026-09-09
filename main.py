@@ -310,8 +310,8 @@ async def _remember_user_data(discord_id: int, github_username: str = None, emai
     always a deliberate correction, not an opportunistic guess."""
     await remember_user_data(
         discord_id,
-        github_username=github_username.lower() if github_username else None,
-        email=email.lower().strip() if email else None,
+        github_username=github_username,
+        email=email,
         overwrite=overwrite,
     )
 

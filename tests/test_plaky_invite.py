@@ -603,5 +603,10 @@ async def test_migrate_user_data_json_to_postgres_fills_gaps_without_clobbering(
 
     assert summary["total"] == 3
     assert summary["migrated"] == 1  # only discord_id 2 actually changed
+    # Explicit non-overwrite check: discord_id 1 already has an email in
+    # Postgres, so no call is ever made for it -- save_identity's single
+    # call, asserted below, is for discord_id 2's github_username only.
     save_identity.assert_awaited_once()
+    assert save_identity.await_args.args[0] == 2
     assert save_identity.await_args.kwargs["github_username"] == "needs-migrating"
+    assert save_identity.await_args.kwargs["email"] is None

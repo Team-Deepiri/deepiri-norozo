@@ -165,6 +165,12 @@ async def remember_user_data(
     unconditionally whenever a non-null value is sent, so overwrite=True
     here just means "send the value"; overwrite=False means "only send it
     if Postgres doesn't already have one" (one extra read first)."""
+    # Normalized once here, the single canonical write path, rather than
+    # separately by each caller (main.py's _remember_user_data wrapper used
+    # to duplicate this same .lower()/.strip() -- one copy avoids drift).
+    email = email.lower().strip() if email else None
+    github_username = github_username.lower().strip() if github_username else None
+
     _remember_user_data_local(discord_id, email=email, github_username=github_username, real_name=real_name, overwrite=overwrite)
 
     payload_email, payload_github, payload_real_name = email, github_username, real_name
