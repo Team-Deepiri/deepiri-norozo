@@ -708,6 +708,35 @@ async def test_qa_role_grant_matched_dynamically_by_name_not_hardcoded_id(monkey
         github_org="Team-Deepiri",
         github_pat="token",
         team_slug="support-team",
+        role="member",
+    )
+
+
+@pytest.mark.asyncio
+async def test_qa_lead_role_grant_gets_maintainer_access(monkeypatch):
+    """"QA Lead" (as opposed to plain "QA Engineer") gets maintainer access on
+    the GitHub support team, not just member."""
+    qa_lead_role = SimpleNamespace(id=1000, name="QA Lead")
+    before = FakeMember(23, "@user", roles=[])
+    after = FakeMember(23, "@user", roles=[qa_lead_role])
+
+    monkeypatch.setattr(main, "GITHUB_ORG", "Team-Deepiri")
+    monkeypatch.setattr(main, "GITHUB_PAT", "token")
+    monkeypatch.setattr(main, "GITHUB_SUPPORT_TEAM_SLUG", "support-team")
+    monkeypatch.setattr(main, "IT_OPERATIONS_SUPPORT_ROLE_ID", None)
+    monkeypatch.setattr(main, "_get_github_username_for_member", lambda member: "jane-lead")
+
+    add_team_mock = Mock(return_value={"ok": True, "status": 200, "message": "Added"})
+    monkeypatch.setattr(main, "add_user_to_team", add_team_mock)
+
+    await main.on_member_update(cast(discord.Member, before), cast(discord.Member, after))
+
+    add_team_mock.assert_called_once_with(
+        username="jane-lead",
+        github_org="Team-Deepiri",
+        github_pat="token",
+        team_slug="support-team",
+        role="maintainer",
     )
 
 
@@ -717,3 +746,11 @@ def test_is_qa_role_name_matches_common_shapes_and_rejects_unrelated():
     assert main._is_qa_role_name("Quality Assurance") is True
     assert main._is_qa_role_name("Quaid") is False
     assert main._is_qa_role_name("") is False
+
+
+def test_is_qa_lead_role_name_matches_only_the_lead_tier():
+    assert main._is_qa_lead_role_name("QA Lead") is True
+    assert main._is_qa_lead_role_name("Quality Assurance Lead") is True
+    assert main._is_qa_lead_role_name("QA Engineer") is False
+    assert main._is_qa_lead_role_name("QA") is False
+    assert main._is_qa_lead_role_name("") is False
