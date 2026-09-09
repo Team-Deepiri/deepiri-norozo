@@ -1362,13 +1362,27 @@ async def _resolve_discord_member_for_github_login(login: str, guild: discord.Gu
 
         # No confident match despite trying every signal -- log what was
         # actually compared instead of failing silently into the Plaky hop.
-        # This is the one piece of visibility that was missing to tell "this
-        # person's Discord name genuinely doesn't overlap what we have" apart
-        # from "the guild roster we searched was wrong/incomplete/stale" --
-        # both look identical from a bare failure, but very different fixes.
+        # A truncated sample isn't enough to actually answer "is this person
+        # in the roster at all" (a real incident: a 20-name sample out of 134
+        # looked like a miss but said nothing about the other 114) -- do an
+        # explicit raw substring scan of the FULL candidate list for anything
+        # resembling either query, so the log gives a definitive yes/no
+        # instead of a coin-flip on where a truncated sample happened to cut
+        # off. This is deliberately looser than best_match's scoring (raw
+        # casefolded substring, no length floor) -- it's a diagnostic, not a
+        # decision, so it's fine if it's noisier than the real matcher.
+        near_hits = []
+        for query in candidate_queries:
+            if not query or len(query) < 3:
+                continue
+            q_lower = re.sub(r"[^a-z0-9]", "", query.lower())
+            for candidate in candidate_names:
+                c_lower = re.sub(r"[^a-z0-9]", "", candidate.lower())
+                if q_lower and c_lower and (q_lower in c_lower or c_lower in q_lower) and candidate not in near_hits:
+                    near_hits.append(candidate)
         logger.info(
-            "PR staleness identity: no confident Discord name match for GitHub %s (queries tried: %s) against %s candidates from %s guild members (sample: %s)",
-            login, [q for q in candidate_queries if q], len(candidate_names), len(guild.members), candidate_names[:20],
+            "PR staleness identity: no confident Discord name match for GitHub %s (queries tried: %s) against %s candidates from %s guild members. Raw substring near-hits (should have matched if present): %s. Full candidate list: %s",
+            login, [q for q in candidate_queries if q], len(candidate_names), len(guild.members), near_hits or "NONE FOUND -- this person's name/login does not appear anywhere in the guild roster we searched", candidate_names,
         )
     else:
         logger.info("PR staleness identity: guild has no usable member name candidates at all (guild.members len=%s, chunked=%s)", len(guild.members), getattr(guild, "chunked", "?"))
