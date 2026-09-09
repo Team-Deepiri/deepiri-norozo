@@ -101,9 +101,22 @@ def remember_user_data(
     email: Optional[str] = None,
     github_username: Optional[str] = None,
     real_name: Optional[str] = None,
+    overwrite: bool = False,
 ) -> None:
-    """Merge newly-confirmed facts into the local user_data record. Never
-    overwrites an existing value with None; only monotonic facts are kept."""
+    """Merge newly-confirmed facts into the local user_data record. By default
+    never overwrites an existing value -- an opportunistic background capture
+    (a name spotted while scraping a GitHub profile, a fuzzy Plaky-roster
+    guess) shouldn't clobber a previously-confirmed real value.
+
+    Pass overwrite=True when the person EXPLICITLY, deliberately supplied
+    this value in the current request -- that's a correction, not a guess,
+    and must always win. Real incident this fixes: a corrected email
+    ("joeblack@deepiri.com") replied in response to "that's the email
+    already on file, reply with a different one if wrong" never actually
+    got saved, because every persistence path funneled through this
+    monotonic-only function -- the correction was silently discarded and
+    the next lookup kept returning the original stale ("joeblacky@...")
+    address forever, with no way to ever fix it."""
     data = _load_user_data()
     key = str(discord_id)
     entry = data.get(key) if isinstance(data.get(key), dict) else {}
@@ -113,7 +126,7 @@ def remember_user_data(
         "github_username": github_username,
         "real_name": real_name,
     }.items():
-        if value and not entry.get(field):
+        if value and (overwrite or not entry.get(field)):
             entry[field] = value
     entry["recorded_at"] = entry.get("recorded_at") or _now_iso()
     _save_user_data(data)
@@ -225,11 +238,16 @@ async def resolve_member_email(
     return None
 
 
-async def persist_member_email(discord_id: int, discord_username: Optional[str], email: str, *, github_username: Optional[str] = None) -> None:
+async def persist_member_email(discord_id: int, discord_username: Optional[str], email: str, *, github_username: Optional[str] = None, overwrite: bool = False) -> None:
     """Save a confirmed email into the local user_data mirror AND the platform
     cloud DB, so every capture path (onboarding DM, in-thread answer, IPCA sign,
     staff /plaky-invite) feeds the same chain. Cloud failures are best-effort
-    (save_member_email returns False) -- the local mirror always wins."""
-    remember_user_data(discord_id, email=email, github_username=github_username)
+    (save_member_email returns False) -- the local mirror always wins.
+
+    overwrite is forwarded to remember_user_data -- pass True when the caller
+    explicitly supplied this email in the current request (a correction),
+    so it always replaces whatever was on file rather than being silently
+    dropped by the default monotonic-only behavior."""
+    remember_user_data(discord_id, email=email, github_username=github_username, overwrite=overwrite)
     if discord_username:
         await save_member_email(discord_id, discord_username, email)

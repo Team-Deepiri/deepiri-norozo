@@ -100,6 +100,22 @@ def test_remember_user_data_never_overwrites_with_none(monkeypatch, tmp_path):
     assert get_user_data(1)["github_username"] == "jane"
 
 
+def test_remember_user_data_overwrite_flag_replaces_existing_value(monkeypatch, tmp_path):
+    """Real incident: a corrected email ("joeblack@deepiri.com") never
+    replaced the stale one on file ("joeblacky@deepiri.com") because every
+    persistence path funneled through the monotonic-only default. An
+    explicit, deliberate correction (overwrite=True) must always win."""
+    from plaky_invite import remember_user_data, get_user_data
+
+    monkeypatch.setattr(plaky_invite, "USER_DATA_PATH", tmp_path / "user_data.json")
+    remember_user_data(1, email="joeblacky@deepiri.com")
+    assert get_user_data(1)["email"] == "joeblacky@deepiri.com"
+
+    remember_user_data(1, email="joeblack@deepiri.com", overwrite=True)
+
+    assert get_user_data(1)["email"] == "joeblack@deepiri.com"
+
+
 @pytest.mark.asyncio
 async def test_call_plaky_bridge_invite_contract(monkeypatch):
     sent = {}
@@ -192,6 +208,27 @@ async def test_invite_already_in_workspace_flags_reused_email_too(monkeypatch):
     assert status == "already_from_file"
     text = main._plaky_invite_status_text(status, email, "")
     assert "already on file" in text.lower()
+
+
+@pytest.mark.asyncio
+async def test_invite_explicit_email_persists_even_when_bridge_says_already(monkeypatch, tmp_path):
+    """Real incident, end to end: the stored email is "joeblacky@deepiri.com".
+    The requester explicitly corrects it to "joeblack@deepiri.com" -- even
+    though the Plaky bridge reports that address as "already" a member too,
+    the CORRECTION ITSELF (what's on file for next time) must still be saved,
+    since the requester explicitly, deliberately gave this exact address."""
+    monkeypatch.setattr(plaky_invite, "USER_DATA_PATH", tmp_path / "user_data.json")
+    plaky_invite.remember_user_data(42, email="joeblacky@deepiri.com")
+    monkeypatch.setattr(main, "PLAKY_API_KEY", "pk")
+    monkeypatch.setattr(main, "call_plaky_bridge_invite", AsyncMock(return_value={"success": False, "already": True}))
+
+    status, email = await main._invite_member_to_plaky(
+        discord_id=42, discord_username="jane", email="joeblack@deepiri.com",
+    )
+
+    assert status == "already"  # explicitly given, so NOT the "_from_file" variant
+    assert email == "joeblack@deepiri.com"
+    assert plaky_invite.get_user_data(42)["email"] == "joeblack@deepiri.com"
 
 
 @pytest.mark.asyncio

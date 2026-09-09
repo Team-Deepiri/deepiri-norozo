@@ -606,9 +606,13 @@ async def _invite_member_to_plaky(
         return ("asked", None)
     result = await call_plaky_bridge_invite(email, role=role)
     if result.get("success"):
-        await persist_member_email(discord_id, discord_username, email, github_username=github_username)
+        await persist_member_email(discord_id, discord_username, email, github_username=github_username, overwrite=email_was_given)
         return ("ok" if email_was_given else "ok_from_file", email)
-    remember_user_data(discord_id, email=email, github_username=github_username)
+    # overwrite=email_was_given here too -- an explicit correction must be
+    # saved even when the bridge reports "already" for the new address (real
+    # incident: a corrected email kept losing to the stale one on file
+    # because this call, on the "already" path, never overwrote at all).
+    remember_user_data(discord_id, email=email, github_username=github_username, overwrite=email_was_given)
     if result.get("already"):
         return ("already" if email_was_given else "already_from_file", email)
     return (f"failed:{result.get('error') or 'bridge error'}", email)
