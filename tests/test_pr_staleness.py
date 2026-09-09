@@ -82,7 +82,7 @@ async def test_falls_back_to_name_fuzzy_match(monkeypatch):
     monkeypatch.setattr(main, "GITHUB_PAT", "fake")
     monkeypatch.setattr(main, "get_user_profile", lambda login, pat: {"name": "Ricardo Beale", "email": None})
     monkeypatch.setattr(main, "PLAKY_API_KEY", None)
-    remember_mock = Mock()
+    remember_mock = AsyncMock()
     monkeypatch.setattr(main, "_remember_github_username", remember_mock)
 
     member = _member(id_=99, display_name="Ricardo Beale")
@@ -105,7 +105,7 @@ async def test_name_fuzzy_match_checks_global_name_and_username_too(monkeypatch)
     monkeypatch.setattr(main, "GITHUB_PAT", "fake")
     monkeypatch.setattr(main, "get_user_profile", lambda login, pat: {"name": "Sergio Vargas Aguilar", "email": None})
     monkeypatch.setattr(main, "PLAKY_API_KEY", None)
-    remember_mock = Mock()
+    remember_mock = AsyncMock()
     monkeypatch.setattr(main, "_remember_github_username", remember_mock)
 
     member = _member(id_=55, display_name="Sergio V.")
@@ -134,7 +134,7 @@ async def test_duplicate_name_fields_on_the_same_member_do_not_cause_a_false_amb
     monkeypatch.setattr(main, "GITHUB_PAT", "fake")
     monkeypatch.setattr(main, "get_user_profile", lambda login, pat: {"name": None, "email": None})
     monkeypatch.setattr(main, "PLAKY_API_KEY", None)
-    remember_mock = Mock()
+    remember_mock = AsyncMock()
     monkeypatch.setattr(main, "_remember_github_username", remember_mock)
 
     member = _member(id_=66, display_name="Asmita N.")
@@ -159,7 +159,7 @@ async def test_name_fuzzy_match_also_tries_raw_login_when_real_name_fails(monkey
     monkeypatch.setattr(main, "GITHUB_PAT", "fake")
     monkeypatch.setattr(main, "get_user_profile", lambda login, pat: {"name": "Ricardo Beale", "email": None})
     monkeypatch.setattr(main, "PLAKY_API_KEY", None)
-    remember_mock = Mock()
+    remember_mock = AsyncMock()
     monkeypatch.setattr(main, "_remember_github_username", remember_mock)
 
     member = _member(id_=77, display_name="Some Unrelated Name")
@@ -186,7 +186,7 @@ async def test_combined_real_name_and_login_query_breaks_a_tie_the_name_alone_ca
     monkeypatch.setattr(main, "GITHUB_PAT", "fake")
     monkeypatch.setattr(main, "get_user_profile", lambda login, pat: {"name": "Ricardo Beale", "email": None})
     monkeypatch.setattr(main, "PLAKY_API_KEY", None)
-    remember_mock = Mock()
+    remember_mock = AsyncMock()
     monkeypatch.setattr(main, "_remember_github_username", remember_mock)
 
     wrong_member = _member(id_=88, display_name="Ricardo")
@@ -211,7 +211,7 @@ async def test_falls_back_to_plaky_email_reverse_lookup(monkeypatch):
     monkeypatch.setattr(main, "PLAKY_API_KEY", "fake-plaky-key")
     monkeypatch.setattr(main, "find_user_email", lambda names, key, known_emails=None: "found@example.com")
     monkeypatch.setattr(main, "find_discord_id_by_email", AsyncMock(return_value="123"))
-    remember_mock = Mock()
+    remember_mock = AsyncMock()
     monkeypatch.setattr(main, "_remember_github_username", remember_mock)
 
     member = _member(id_=123, display_name="Totally Different Display Name")
@@ -239,7 +239,7 @@ async def test_plaky_email_local_part_matched_against_discord_when_not_self_repo
     monkeypatch.setattr(main, "PLAKY_API_KEY", "fake-plaky-key")
     monkeypatch.setattr(main, "find_user_email", lambda names, key, known_emails=None: "minhhuyngoctruong@gmail.com")
     monkeypatch.setattr(main, "find_discord_id_by_email", AsyncMock(return_value=None))
-    remember_mock = Mock()
+    remember_mock = AsyncMock()
     monkeypatch.setattr(main, "_remember_github_username", remember_mock)
 
     member = _member(id_=55, display_name="minhhuyngoctruong")

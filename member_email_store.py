@@ -87,6 +87,27 @@ async def save_member_email(discord_id: int, discord_username: str, email: str) 
     return await _save_member_identity(discord_id, discord_username=discord_username, email=email)
 
 
+async def save_member_identity(
+    discord_id: int,
+    *,
+    discord_username: Optional[str] = None,
+    email: Optional[str] = None,
+    real_name: Optional[str] = None,
+    github_username: Optional[str] = None,
+) -> bool:
+    """Public entry point for setting any combination of fields at once --
+    plaky_invite.remember_user_data's cloud half. Any field left None keeps
+    whatever the row already has (the upsert's own COALESCE); pass a real
+    value to set/overwrite it."""
+    return await _save_member_identity(
+        discord_id,
+        discord_username=discord_username,
+        email=email,
+        real_name=real_name,
+        github_username=github_username,
+    )
+
+
 async def save_member_real_name(discord_id: int, real_name: str, github_username: Optional[str] = None) -> bool:
     """Called the moment we ever get a confident real name for someone -- today,
     right after onboarding captures their self-reported GitHub link. This is

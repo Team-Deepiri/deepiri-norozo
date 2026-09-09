@@ -69,7 +69,7 @@ async def test_org_roster_fallback_matches_truncated_discord_handle(monkeypatch)
     monkeypatch.setattr(main, "GITHUB_PAT", "fake-token")
     monkeypatch.setattr(main, "list_org_members", lambda org, pat: ["samimahlaka", "someoneelse"])
     monkeypatch.setattr(main, "get_user_profile", lambda username, pat: {"name": None, "email": None})
-    remember_mock = Mock()
+    remember_mock = AsyncMock()
     monkeypatch.setattr(main, "_remember_github_username", remember_mock)
 
     member = Mock(spec=discord.Member)
@@ -114,7 +114,7 @@ async def test_org_roster_fallback_matches_via_github_profile_real_name(monkeypa
     monkeypatch.setattr(main, "list_org_members", lambda org, pat: ["shan-versc", "someoneelse"])
     profiles = {"shan-versc": {"name": "Shanley V.", "email": None}, "someoneelse": {"name": None, "email": None}}
     monkeypatch.setattr(main, "get_user_profile", lambda username, pat: profiles[username])
-    monkeypatch.setattr(main, "_remember_github_username", Mock())
+    monkeypatch.setattr(main, "_remember_github_username", AsyncMock())
 
     member = Mock(spec=discord.Member)
     member.id = 42
