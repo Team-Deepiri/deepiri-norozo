@@ -34,6 +34,7 @@ from plaky_invite import (
     call_plaky_bridge_kick,
     get_user_data,
     is_valid_email,
+    migrate_user_data_json_to_postgres,
     persist_member_email,
     remember_user_data,
     resolve_member_email,
@@ -299,31 +300,20 @@ def _load_user_data() -> dict:
         return {}
 
 
-def _save_user_data(data: dict) -> None:
-    try:
-        USER_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
-        tmp = USER_DATA_PATH.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        tmp.replace(USER_DATA_PATH)
-    except Exception:
-        logger.exception("Failed to save user data")
-
-
-def _remember_user_data(discord_id: int, github_username: str = None, email: str = None) -> None:
-    data = _load_user_data()
-    key = str(discord_id)
-    if key not in data:
-        data[key] = {}
-    if github_username:
-        data[key]["github"] = github_username.lower()
-    if email:
-        data[key]["email"] = email.lower().strip()
-    _save_user_data(data)
-
-
-def _get_user_data(discord_id: int) -> dict:
-    data = _load_user_data()
-    return data.get(str(discord_id), {})
+async def _remember_user_data(discord_id: int, github_username: str = None, email: str = None, overwrite: bool = True) -> None:
+    """Thin wrapper over plaky_invite.remember_user_data (Postgres primary +
+    local JSON backup) -- kept for call-site compatibility with the many
+    existing `_remember_user_data(...)` calls in this file. Every caller here
+    is the user (or staff) directly, explicitly telling Norozo this value
+    right now (a self-reported email/GitHub link, an explicit
+    /github-invite-request username) -- overwrite defaults True since that's
+    always a deliberate correction, not an opportunistic guess."""
+    await remember_user_data(
+        discord_id,
+        github_username=github_username,
+        email=email,
+        overwrite=overwrite,
+    )
 
 
 async def _resolve_member_email_for_plaky(member: discord.Member, github_username: Optional[str] = None) -> Optional[str]:
@@ -612,7 +602,7 @@ async def _invite_member_to_plaky(
     # saved even when the bridge reports "already" for the new address (real
     # incident: a corrected email kept losing to the stale one on file
     # because this call, on the "already" path, never overwrote at all).
-    remember_user_data(discord_id, email=email, github_username=github_username, overwrite=email_was_given)
+    await remember_user_data(discord_id, email=email, github_username=github_username, overwrite=email_was_given)
     if result.get("already"):
         return ("already" if email_was_given else "already_from_file", email)
     return (f"failed:{result.get('error') or 'bridge error'}", email)
@@ -1078,9 +1068,17 @@ def _is_valid_announcement_signature(raw_body: bytes, signature_header: str, sec
 
 
 def _load_github_username_map() -> dict:
-    """Legacy wrapper — reads from user_data.json for backward compatibility."""
+    """Full-table discord_id->github_username reverse index for the fast
+    path in _resolve_discord_member_for_github_login. Reads from the local
+    user_data.json backup mirror -- deliberately NOT the Postgres
+    member_emails table, since the platform webhook API only supports
+    lookup by a single discord_id, not "list every row" the way this needs.
+    Checks both "github_username" (current field name, written by
+    plaky_invite.remember_user_data) and the legacy "github" key (written by
+    this file's own _remember_user_data before the Postgres cutover) so
+    entries recorded before this change still resolve."""
     data = _load_user_data()
-    return {k: v.get("github", "") for k, v in data.items() if v.get("github")}
+    return {k: (v.get("github_username") or v.get("github") or "") for k, v in data.items() if v.get("github_username") or v.get("github")}
 
 
 def _save_github_username_map(mapping: dict) -> None:
@@ -1088,10 +1086,10 @@ def _save_github_username_map(mapping: dict) -> None:
     pass
 
 
-def _remember_github_username(discord_id: int, github_username: str) -> None:
+async def _remember_github_username(discord_id: int, github_username: str) -> None:
     if not discord_id or not github_username:
         return
-    _remember_user_data(discord_id, github_username=github_username)
+    await _remember_user_data(discord_id, github_username=github_username)
 
 
 _LOOKS_LIKE_REAL_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z.'-]*\s+[A-Za-z][A-Za-z.'-]*$")
@@ -1113,7 +1111,7 @@ async def _remember_identity(discord_id: int, github_username: str, member: Opti
     specific is a far better identity-search candidate than the raw handle,
     even without GitHub confirming it.
     """
-    _remember_github_username(discord_id, github_username)
+    await _remember_github_username(discord_id, github_username)
     real_name = None
     if GITHUB_PAT:
         try:
@@ -1141,8 +1139,8 @@ def _get_github_username_for_member(member: discord.Member) -> Optional[str]:
     """
     data = _load_user_data()
     entry = data.get(str(member.id))
-    if entry and entry.get("github"):
-        return entry["github"]
+    if entry and (entry.get("github_username") or entry.get("github")):
+        return entry.get("github_username") or entry.get("github")
     # Fallback: try display name or global name if it looks like a github username
     for candidate in [getattr(member, "global_name", None), getattr(member, "display_name", None), str(member.name) if hasattr(member, "name") else None]:
         if candidate and GITHUB_USERNAME_RE.match(candidate.strip()) and candidate.strip().lower() not in GITHUB_RESERVED_PATHS:
@@ -2184,7 +2182,7 @@ async def handle_github_invite_request(interaction: discord.Interaction, github_
 
     # Remember mapping for future role->team sync
     try:
-        _remember_user_data(interaction.user.id, github_username=normalized_username)
+        await _remember_user_data(interaction.user.id, github_username=normalized_username)
         await _remember_identity(interaction.user.id, normalized_username, interaction.user if isinstance(interaction.user, discord.Member) else None)
     except Exception:
         logger.exception(
@@ -2610,7 +2608,7 @@ async def _maybe_handle_onboarding_dm(message: discord.Message) -> bool:
         email = email_match.group(0)
         ok = await save_member_email(message.author.id, str(message.author), email)
         if ok:
-            remember_user_data(message.author.id, email=email)
+            await remember_user_data(message.author.id, email=email, overwrite=True)
             await message.channel.send(f"Got it — saved {email} on file. Thanks!")
         else:
             logger.error("Failed to persist member email for %s", message.author.id)
@@ -2641,7 +2639,7 @@ async def _maybe_handle_onboarding_dm(message: discord.Message) -> bool:
         # reverse lookup), so this fills in for members who joined before it
         # existed too, not just fresh onboarding.
         await _remember_identity(message.author.id, github_username, message.author)
-        remember_user_data(message.author.id, github_username=github_username)
+        await remember_user_data(message.author.id, github_username=github_username, overwrite=True)
         await message.channel.send(f"Got it — linked your GitHub as **{github_username}**.")
         return True
 
@@ -3798,6 +3796,11 @@ def _create_and_register_bot() -> DeepiriBot:
         asyncio.create_task(_heartbeat_last_online())
         asyncio.create_task(_pr_staleness_scan_loop())
         asyncio.create_task(_security_assessment_loop())
+        # One-time (idempotent -- safe every restart) backfill of anything
+        # still only in the local user_data.json backup mirror into
+        # Postgres, now the primary identity store. See
+        # migrate_user_data_json_to_postgres's docstring.
+        asyncio.create_task(migrate_user_data_json_to_postgres())
 
     @new_bot.event  # type: ignore[attr-defined]
     async def on_member_join(member: discord.Member) -> None:  # type: ignore[no-redef]
@@ -3853,7 +3856,7 @@ def _create_and_register_bot() -> DeepiriBot:
             if message.author.id in pending_email_requests:
                 email = message.content.strip()
                 if is_valid_email(email):
-                    _remember_user_data(message.author.id, email=email)
+                    await _remember_user_data(message.author.id, email=email)
                     result = await call_plaky_bridge_invite(email)
                     if result.get("success"):
                         await message.channel.send(f"Plaky invite sent to {email}")

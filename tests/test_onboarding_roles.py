@@ -3,7 +3,7 @@ since that role carries elevated permissions and must never be self-assignable
 through the fuzzy-matched DM flow."""
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -124,7 +124,7 @@ async def test_plain_role_word_is_not_swallowed_as_a_github_username(monkeypatch
     backend_role = _role("Backend Engineer")
     guild = SimpleNamespace(roles=[backend_role], get_member=lambda uid: _member())
     monkeypatch.setattr(main, "_get_primary_guild", AsyncMock(return_value=guild))
-    remember_mock = Mock()
+    remember_mock = AsyncMock()
     monkeypatch.setattr(main, "_remember_github_username", remember_mock)
 
     author = SimpleNamespace(id=999, bot=False, __str__=lambda self: "tester#0")
@@ -141,7 +141,7 @@ async def test_plain_role_word_is_not_swallowed_as_a_github_username(monkeypatch
 
 @pytest.mark.asyncio
 async def test_github_link_is_still_captured_as_username(monkeypatch):
-    remember_mock = Mock()
+    remember_mock = AsyncMock()
     monkeypatch.setattr(main, "_remember_github_username", remember_mock)
     monkeypatch.setattr(main, "GITHUB_PAT", None)
 
@@ -161,7 +161,7 @@ async def test_github_link_capture_also_caches_real_name(monkeypatch):
     self-reports their GitHub link, their real name is fetched and cached
     immediately -- not left to be fuzzy-guessed from a stylized handle
     ("wrenx1005") months later at kick-out time."""
-    monkeypatch.setattr(main, "_remember_github_username", Mock())
+    monkeypatch.setattr(main, "_remember_github_username", AsyncMock())
     monkeypatch.setattr(main, "GITHUB_PAT", "fake-pat")
     monkeypatch.setattr(main, "get_user_profile", lambda username, pat: {"name": "Taylor Chen", "email": None})
     save_mock = AsyncMock()
@@ -179,7 +179,7 @@ async def test_github_link_capture_also_caches_real_name(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_github_link_capture_skips_cache_when_profile_has_no_name(monkeypatch):
-    monkeypatch.setattr(main, "_remember_github_username", Mock())
+    monkeypatch.setattr(main, "_remember_github_username", AsyncMock())
     monkeypatch.setattr(main, "GITHUB_PAT", "fake-pat")
     monkeypatch.setattr(main, "get_user_profile", lambda username, pat: {"name": None, "email": None})
     save_mock = AsyncMock()
@@ -200,7 +200,7 @@ async def test_github_link_capture_falls_back_to_discord_name_when_github_has_no
     """Not just onboarding, and not just GitHub: when GitHub's public profile
     has no real name set, a "First Last"-shaped Discord global_name is still
     a good identity-search candidate, so it gets cached too."""
-    monkeypatch.setattr(main, "_remember_github_username", Mock())
+    monkeypatch.setattr(main, "_remember_github_username", AsyncMock())
     monkeypatch.setattr(main, "GITHUB_PAT", "fake-pat")
     monkeypatch.setattr(main, "get_user_profile", lambda username, pat: {"name": None, "email": None})
     save_mock = AsyncMock()
@@ -220,7 +220,7 @@ async def test_github_link_capture_falls_back_to_discord_name_when_github_has_no
 async def test_github_link_capture_ignores_non_name_shaped_discord_handle(monkeypatch):
     """A stylized single-word handle isn't "First Last"-shaped, so it must not
     get cached as if it were a real name."""
-    monkeypatch.setattr(main, "_remember_github_username", Mock())
+    monkeypatch.setattr(main, "_remember_github_username", AsyncMock())
     monkeypatch.setattr(main, "GITHUB_PAT", "fake-pat")
     monkeypatch.setattr(main, "get_user_profile", lambda username, pat: {"name": None, "email": None})
     save_mock = AsyncMock()
