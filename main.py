@@ -620,18 +620,18 @@ async def _invite_member_to_plaky(
 
 def _plaky_invite_status_text(status: str, email: Optional[str], sender_mention: str) -> str:
     if status in ("ok", "ok_from_file"):
-        text = f"✅ Plaky invite sent to **{email}** — they just need to accept it from their inbox."
+        text = f"✅ For the Plaky board invite, we just sent one to **{email}** — you should get an email shortly, accept it from there."
         if status == "ok_from_file":
-            text += " (That's the email already on file for you -- reply with a different one if that's wrong.)"
+            text += " That's the email already on file for you -- reply with a different one if that's wrong."
         return text
     if status in ("already", "already_from_file"):
-        text = f"ℹ️ **{email}** is already in the Plaky workspace — nothing to do."
+        text = f"ℹ️ For the Plaky board invite, your email **{email}** is already in the workspace — you should have already received an invite for it."
         if status == "already_from_file":
-            text += " (That's the email already on file for you -- reply with a different one if that's wrong.)"
+            text += " That's the email already on file for you -- reply with a different one if that's wrong."
         return text
     if status == "asked":
         return (
-            f"{sender_mention} I need their email to send the Plaky invite. "
+            f"{sender_mention} For the Plaky board invite, I need your email. "
             "Reply in this thread with the address (for example `jane@deepiri.com`) and I'll take it from there."
         )
     reason = status.split(":", 1)[1] if ":" in status else status
