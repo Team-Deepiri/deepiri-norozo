@@ -64,6 +64,8 @@ def _ticket_message(member, channel, content: str):
         "please invite me to plaky",
         "can you add claire to plaky?",
         "I signed the IPCA, please add me to plaky",
+        "I need an invite to plaky",
+        "invite me to plaky joeblacky@deepiri.com",
     ],
 )
 def test_is_plaky_add_intent_matches_request_forms(text):
@@ -79,6 +81,8 @@ def test_is_plaky_add_intent_matches_request_forms(text):
         "the plaky invite worked",
         "plaky invite was sent already",
         "plaky status all good",
+        "having an issue with my plaky invite",
+        "can someone help with my plaky invite",
     ],
 )
 def test_is_plaky_add_intent_rejects_removal_and_report_noise(text):
@@ -154,6 +158,40 @@ async def test_invite_uses_explicit_email_and_persists(monkeypatch):
     assert email == "jane@deepiri.com"
     bridge_invite.assert_awaited_once_with("jane@deepiri.com", role="MEMBER")
     resolve.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_invite_flags_when_email_reused_from_file_not_explicitly_given(monkeypatch):
+    """Real incident: a repeat 'invite me to plaky' with no email typed
+    silently reused whatever was already on file, with the response looking
+    identical to a genuinely fresh invite -- no way to tell it happened, and
+    no chance to correct a stale/wrong address. The status must distinguish
+    'explicitly given this request' from 'resolved from file'."""
+    monkeypatch.setattr(main, "PLAKY_API_KEY", "pk")
+    bridge_invite = AsyncMock(return_value={"success": True, "via": "cake"})
+    monkeypatch.setattr(main, "call_plaky_bridge_invite", bridge_invite)
+    monkeypatch.setattr(main, "resolve_member_email", AsyncMock(return_value="joeblacky@deepiri.com"))
+
+    status, email = await main._invite_member_to_plaky(discord_id=42, discord_username="jane")
+
+    assert status == "ok_from_file"
+    assert email == "joeblacky@deepiri.com"
+    text = main._plaky_invite_status_text(status, email, "")
+    assert "joeblacky@deepiri.com" in text
+    assert "already on file" in text.lower()
+
+
+@pytest.mark.asyncio
+async def test_invite_already_in_workspace_flags_reused_email_too(monkeypatch):
+    monkeypatch.setattr(main, "PLAKY_API_KEY", "pk")
+    monkeypatch.setattr(main, "call_plaky_bridge_invite", AsyncMock(return_value={"success": False, "already": True}))
+    monkeypatch.setattr(main, "resolve_member_email", AsyncMock(return_value="joeblacky@deepiri.com"))
+
+    status, email = await main._invite_member_to_plaky(discord_id=42, discord_username="jane")
+
+    assert status == "already_from_file"
+    text = main._plaky_invite_status_text(status, email, "")
+    assert "already on file" in text.lower()
 
 
 @pytest.mark.asyncio
@@ -253,7 +291,10 @@ async def test_add_request_mention_target_invites_with_cloud_email(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_ipca_sign_triggers_plaky_invite_and_asks_without_email(monkeypatch):
+async def test_ipca_sign_asks_for_email_in_the_same_ticket_thread(monkeypatch):
+    """IPCA sign with no email resolvable: the ask happens right in the same
+    support-ticket thread as one combined message with the access-grant
+    confirmation -- no DM, and no second separate message."""
     member = _member(discord_id=42, name="jane")
     channel = _ticket_channel(thread_id=710)
     message = _ticket_message(member, channel, "I signed the IPCA")
@@ -269,46 +310,56 @@ async def test_ipca_sign_triggers_plaky_invite_and_asks_without_email(monkeypatc
     monkeypatch.setattr(main, "resolve_member_email", AsyncMock(return_value=None))
     monkeypatch.setattr(main, "_resolve_reply_channel", AsyncMock(return_value=channel))
     monkeypatch.setattr(main, "_close_ticket_thread", AsyncMock())
-    dm_msg = SimpleNamespace(channel=SimpleNamespace(id=42))
-    member.send = AsyncMock(return_value=dm_msg)
+    member.send = AsyncMock()
 
     ipca_assigned = await main._maybe_auto_assign_ipca_roles(message)
+
     assert ipca_assigned is True
-
-    # IPCA sign, no email known -> DM the signer (not an in-thread ask).
-    await main._maybe_auto_invite_to_plaky(message, member)
-
-    member.send.assert_awaited_once()
-    assert main.PENDING_PLAKY_EMAIL_THREADS.get(42, {}).get("discord_id") == 42
-    assert main.PENDING_PLAKY_EMAIL_THREADS.get(42, {}).get("via") == "dm"
-    # The DM ask never hints the address is also kept on file for offboarding.
-    dm_copy = member.send.await_args.args[0]
-    assert "plaky" in dm_copy.lower()
-    assert "kick" not in dm_copy.lower()
-    assert "offboard" not in dm_copy.lower()
-    # Thread only gets a short handled-note, not the in-thread "reply here" ask.
-    thread_copy = " ".join(str(c.args) for c in channel.send.call_args_list)
-    assert "DM" in thread_copy
+    member.send.assert_not_awaited()  # never DMs -- the ask lives in this thread
+    assert main.PENDING_PLAKY_EMAIL_THREADS.get(710, {}).get("discord_id") == 42
+    assert main.PENDING_PLAKY_EMAIL_THREADS.get(710, {}).get("via") == "thread"
+    # One combined message: access confirmation + the Plaky email ask.
+    channel.send.assert_awaited_once()
+    combined = channel.send.await_args.args[0]
+    assert "we gave you access to the rest of the discord" in combined.lower()
+    assert "email" in combined.lower()
+    assert "plaky" in combined.lower()
 
 
 @pytest.mark.asyncio
-async def test_ipca_sign_falls_back_to_thread_ask_when_dms_closed(monkeypatch):
-    member = _member(discord_id=42, name="jane")
-    channel = _ticket_channel(thread_id=711)
+async def test_ipca_sign_restart_catchup_sweep_also_triggers_plaky_invite(monkeypatch):
+    """Real gap this closes: the restart catch-up sweep
+    (_sweep_open_support_threads_for_ipca et al) previously only granted
+    roles for IPCA signs that happened while the bot was down -- it never
+    triggered the Plaky invite/ask at all, because that used to be a
+    separate call only made from the live on_message handler. Now that it's
+    folded into _maybe_auto_assign_ipca_roles itself, the sweep path (which
+    also just calls that same function) gets it too."""
+    member = _member(discord_id=43, name="alex")
+    channel = _ticket_channel(thread_id=712)
     message = _ticket_message(member, channel, "I signed the IPCA")
+    message.guild = SimpleNamespace(
+        get_role=lambda rid: _member() if rid in (main.DEV_TEAM_ROLE_ID, main.AVAILABLE_ROLE_ID) else None
+    )
+    monkeypatch.setattr(main, "DEV_TEAM_ROLE_ID", 10)
+    monkeypatch.setattr(main, "AVAILABLE_ROLE_ID", 20)
     monkeypatch.setattr(main, "SUPPORT_SESSIONS_CHANNEL_ID", 100)
     monkeypatch.setattr(main, "GITHUB_PROFILES_CHANNEL_ID", None)
-    monkeypatch.setattr(main, "PLAKY_API_KEY", None)
-    monkeypatch.setattr(main, "call_plaky_bridge_invite", AsyncMock())
-    monkeypatch.setattr(main, "resolve_member_email", AsyncMock(return_value=None))
+    monkeypatch.setattr(main, "PLAKY_API_KEY", "pk")
+    bridge_invite = AsyncMock(return_value={"success": True, "via": "cake"})
+    monkeypatch.setattr(main, "call_plaky_bridge_invite", bridge_invite)
+    monkeypatch.setattr(main, "resolve_member_email", AsyncMock(return_value="alex@deepiri.com"))
     monkeypatch.setattr(main, "_resolve_reply_channel", AsyncMock(return_value=channel))
-    monkeypatch.setattr(main, "_send_plaky_dm_email_ask", AsyncMock(return_value=None))
+    monkeypatch.setattr(main, "_close_ticket_thread", AsyncMock())
 
-    await main._maybe_auto_invite_to_plaky(message, member)
+    # This IS the sweep path's own call shape -- no separate plaky trigger.
+    assigned = await main._maybe_auto_assign_ipca_roles(message)
 
-    assert main.PENDING_PLAKY_EMAIL_THREADS.get(711, {}).get("via") == "thread"
-    joined = " ".join(str(c.args) for c in channel.send.call_args_list)
-    assert "reply in this thread" in joined.lower()
+    assert assigned is True
+    bridge_invite.assert_awaited_once_with("alex@deepiri.com", role="MEMBER")
+    combined = channel.send.await_args.args[0]
+    assert "we gave you access to the rest of the discord" in combined.lower()
+    assert "alex@deepiri.com" in combined
 
 
 @pytest.mark.asyncio

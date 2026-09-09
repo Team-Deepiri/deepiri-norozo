@@ -456,6 +456,29 @@ def _is_plaky_add_intent(content: str) -> bool:
     text = (content or "").strip().lower()
     if not PLAKY_ADD_INTENT_RE.search(text):
         return False
+
+    has_invite = re.search(r"\binvite\b", text) is not None
+
+    # "issue"/"help" alongside "invite" signals a problem report or a general
+    # assistance ask rather than a plain invite request ("having an issue
+    # with my plaky invite", "can someone help with my plaky invite") --
+    # authoritative regardless of what the older verb-matching logic below
+    # would otherwise decide, since _POSITIVE_PLAKY_VERBS treats "invite" as
+    # a positive signal on its own too.
+    if has_invite and ("issue" in text or "help" in text):
+        return False
+
+    # Report-style chatter ("the plaky invite worked", "plaky invite was sent
+    # already") must stay filtered regardless of which path below would
+    # otherwise fire on it -- computed once and checked by both.
+    is_report_noise = bool(_PLAKY_REPORT_NOISE_RE.search(text) and not _STRONG_PLAKY_VERBS.search(text))
+
+    # Direct rule: "invite" and "plaky" together in the same message is an
+    # add-intent on its own (the issue/help/report-noise exclusions above and
+    # below already ran).
+    if not is_report_noise and has_invite:
+        return True
+
     positive = _POSITIVE_PLAKY_VERBS.search(text)
     if not positive:
         return False
@@ -467,7 +490,7 @@ def _is_plaky_add_intent(content: str) -> bool:
         strong_add = _ADD_PLAKY_VERB_RE.search(text)
         if not strong_add or strong_add.start() < negative.start():
             return False
-    if _PLAKY_REPORT_NOISE_RE.search(text) and not _STRONG_PLAKY_VERBS.search(text):
+    if is_report_noise:
         return False
     return True
 
@@ -564,6 +587,14 @@ async def _invite_member_to_plaky(
     headless bridge. Returns (status, email) where status is one of:
     'ok', 'already', 'asked', 'failed:<reason>'. Every capture feeds both the
     local user_data mirror and the platform cloud DB."""
+    # Whether THIS request explicitly supplied the address matters for how the
+    # result gets worded -- a repeat "invite me to plaky" with no email typed
+    # silently reused whatever resolve_member_email's fallback chain (local ->
+    # cloud -> GitHub -> Plaky roster) turned up, with nothing telling the
+    # requester it did that or giving them a chance to correct a stale/wrong
+    # address on file. The "_from_file" status variants surface that instead
+    # of a bare "invite sent" that looks identical to a genuinely fresh one.
+    email_was_given = bool(email)
     if not email:
         email = await resolve_member_email(
             discord_id,
@@ -576,18 +607,24 @@ async def _invite_member_to_plaky(
     result = await call_plaky_bridge_invite(email, role=role)
     if result.get("success"):
         await persist_member_email(discord_id, discord_username, email, github_username=github_username)
-        return ("ok", email)
+        return ("ok" if email_was_given else "ok_from_file", email)
     remember_user_data(discord_id, email=email, github_username=github_username)
     if result.get("already"):
-        return ("already", email)
+        return ("already" if email_was_given else "already_from_file", email)
     return (f"failed:{result.get('error') or 'bridge error'}", email)
 
 
 def _plaky_invite_status_text(status: str, email: Optional[str], sender_mention: str) -> str:
-    if status == "ok":
-        return f"✅ Plaky invite sent to **{email}** — they just need to accept it from their inbox."
-    if status == "already":
-        return f"ℹ️ **{email}** is already in the Plaky workspace — nothing to do."
+    if status in ("ok", "ok_from_file"):
+        text = f"✅ Plaky invite sent to **{email}** — they just need to accept it from their inbox."
+        if status == "ok_from_file":
+            text += " (That's the email already on file for you -- reply with a different one if that's wrong.)"
+        return text
+    if status in ("already", "already_from_file"):
+        text = f"ℹ️ **{email}** is already in the Plaky workspace — nothing to do."
+        if status == "already_from_file":
+            text += " (That's the email already on file for you -- reply with a different one if that's wrong.)"
+        return text
     if status == "asked":
         return (
             f"{sender_mention} I need their email to send the Plaky invite. "
@@ -752,16 +789,18 @@ def _extract_add_target_name(content: str) -> Optional[str]:
     return candidate
 
 
-async def _maybe_auto_invite_to_plaky(message: discord.Message, member: discord.Member) -> None:
+async def _resolve_plaky_invite_for_ipca_sign(message: discord.Message, member: discord.Member) -> tuple:
     """IPCA-sign side effect: once roles are granted, the same ticket message
     also kicks off the Plaky invite (email from the message, GitHub link if
-    present, then the resolution chain). If the email can't be resolved the
-    signer is DM'd straight away to send it -- phrased purely as setting up
-    their Plaky access -- and the pending ask is keyed off that DM. When the
-    member's DMs are closed (or the ask otherwise can't be DM'd) it falls back
-    to the in-thread ask. The address they reply with is recorded on file via
-    the usual persistence chain; nothing surfaces that the record also serves
-    future offboarding."""
+    present, then the resolution chain). Runs the resolution only -- sends
+    nothing itself -- so the caller (_maybe_auto_assign_ipca_roles) can fold
+    the outcome into the SAME access-confirmation message, in the SAME
+    support-ticket thread the conversation is already happening in, rather
+    than a separate message (or, previously, a separate DM the person had to
+    go find). Called from both the live on_message path and the restart
+    catch-up sweep, so a bot-downtime window no longer silently skips the
+    Plaky invite the way it used to when only on_message triggered it.
+    Returns (status, email, github_username)."""
     content = message.content or ""
     email = _email_from_text(content)
     github_username = None
@@ -781,37 +820,16 @@ async def _maybe_auto_invite_to_plaky(message: discord.Message, member: discord.
         email=email,
         role="MEMBER",
     )
-    reply_channel = await _resolve_reply_channel(message)
+    return status, used_email or email, github_username
+
+
+def _ipca_access_and_plaky_text(mention: str, status: str, email: Optional[str]) -> str:
+    """One combined message: the access-grant confirmation plus the Plaky
+    outcome, instead of two separate sends."""
+    prefix = f"{mention} We gave you access to the rest of the Discord."
     if status == "asked":
-        dm_ask = await _send_plaky_dm_email_ask(member)
-        if dm_ask is not None:
-            await _pending_plaky_ask_set(
-                dm_ask.channel.id,
-                {
-                    "discord_id": member.id,
-                    "github_username": github_username,
-                    "role": "MEMBER",
-                    "requested_at": time.time(),
-                    "sender_id": member.id,
-                    "via": "dm",
-                },
-            )
-            await reply_channel.send(
-                f"📩 Sent {member.mention} a DM for their email to set up the Plaky invite — no action needed from you."
-            )
-            return
-        await _pending_plaky_ask_set(
-            reply_channel.id if getattr(reply_channel, "id", None) else message.channel.id,
-            {
-                "discord_id": member.id,
-                "github_username": github_username,
-                "role": "MEMBER",
-                "requested_at": time.time(),
-                "sender_id": member.id,
-                "via": "thread",
-            },
-        )
-    await reply_channel.send(_plaky_invite_status_text(status, used_email or email, member.mention))
+        return f"{prefix} What's your email? So I can get you invited to Plaky."
+    return f"{prefix} {_plaky_invite_status_text(status, email, mention)}"
 
 
 def _github_it_team_dm_ask_text(member_name: str) -> str:
@@ -824,32 +842,6 @@ def _github_it_team_dm_ask_text(member_name: str) -> str:
         "GitHub profile link in #github-profiles, or reply here with your GitHub "
         "username, and I'll send the org + team invite right away."
     )
-
-
-def _plaky_dm_ask_text(member_name: str) -> str:
-    """DM copy for the IPCA-sign Plaky email ask. Deliberately only ever talks
-    about setting up Plaky access -- never about having the address on file for
-    future offboarding."""
-    return (
-        f"Hey {member_name}! I'm setting you up on the Deepiri Plaky workspace so "
-        "you can track your tickets alongside the team. Just reply here with the "
-        "email you'd like me to invite (e.g. `jane@deepiri.com`) and I'll sort the "
-        "invite out from there."
-    )
-
-
-async def _send_plaky_dm_email_ask(member: discord.Member):
-    """DM the IPCA signer asking for the Plaky-invite email, framed purely as
-    workspace setup. Returns the created DM message on success (the caller keys
-    the pending ask off its channel id), or None when the member can't be DM'd
-    and the ask has to fall back to the ticket thread."""
-    try:
-        return await member.send(_plaky_dm_ask_text(member.display_name or member.name or "there"))
-    except discord.Forbidden:
-        return None
-    except Exception:
-        logger.exception("Failed to DM %s the Plaky email ask", member.id)
-        return None
 
 
 async def _maybe_handle_plaky_kick_on_kickout(message: discord.Message, target: discord.Member) -> str:
@@ -908,17 +900,35 @@ async def _maybe_auto_assign_ipca_roles(message: discord.Message) -> bool:
         await message.add_reaction("✅")
     except Exception:
         pass
+
+    plaky_status, plaky_email, plaky_github_username = await _resolve_plaky_invite_for_ipca_sign(message, message.author)
     try:
         # support-tickets uses Discord's auto-thread feature: the triggering
         # message lives in the parent channel and spawns a same-id companion
         # thread as a SIDE EFFECT that can land after on_message already fired.
         # Re-resolve fresh rather than trusting message.thread captured at
         # handler-start -- same race _resolve_reply_channel exists to handle
-        # for the kick-out command.
+        # for the kick-out command. One combined message: access confirmation
+        # + the Plaky outcome (invited / already in / or the email ask),
+        # instead of two separate sends.
         target_channel = await _resolve_reply_channel(message)
-        await target_channel.send(f"{message.author.mention} We gave you access to the rest of the Discord.")
+        await target_channel.send(_ipca_access_and_plaky_text(message.author.mention, plaky_status, plaky_email))
     except Exception:
         logger.exception("Failed to post IPCA access confirmation reply for %s", message.author.id)
+
+    if plaky_status == "asked":
+        ask_thread = await _resolve_reply_channel(message)
+        await _pending_plaky_ask_set(
+            ask_thread.id if getattr(ask_thread, "id", None) else message.channel.id,
+            {
+                "discord_id": message.author.id,
+                "github_username": plaky_github_username,
+                "role": "MEMBER",
+                "requested_at": time.time(),
+                "sender_id": message.author.id,
+                "via": "thread",
+            },
+        )
 
     # Resolve again (not reuse target_channel) -- more real async time has
     # passed since the send above, during which the companion thread may have
@@ -3862,11 +3872,10 @@ def _create_and_register_bot() -> DeepiriBot:
         if await _maybe_handle_plaky_add_request(message):
             await new_bot.process_commands(message)
             return
-        ipca_assigned = await _maybe_auto_assign_ipca_roles(message)
-        if ipca_assigned and isinstance(message.author, discord.Member):
-            # Same ticket message that signed the IPCA also triggers the Plaky
-            # invite (email from the message, then the resolution chain/ask).
-            await _maybe_auto_invite_to_plaky(message, message.author)
+        # Plaky invite is now folded into _maybe_auto_assign_ipca_roles itself
+        # (one combined access+Plaky message, and shared with the restart
+        # catch-up sweep) rather than a separate call here.
+        await _maybe_auto_assign_ipca_roles(message)
         if _is_announcements_channel(message.channel):
             title = format_discussion_title(resolve_discord_mentions(message, message.content or ""))
             body = format_discussion_body(message)

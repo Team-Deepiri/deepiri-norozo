@@ -55,6 +55,7 @@ async def test_maybe_auto_assign_ipca_roles_assigns_when_missing(monkeypatch):
     monkeypatch.setattr(main, "AVAILABLE_ROLE_ID", 20)
     monkeypatch.setattr(main, "SUPPORT_SESSIONS_CHANNEL_ID", 100)
     monkeypatch.setattr(main, "GITHUB_PROFILES_CHANNEL_ID", None)
+    monkeypatch.setattr(main, "_resolve_plaky_invite_for_ipca_sign", AsyncMock(return_value=("asked", None, None)))
 
     dev_role = SimpleNamespace(id=10)
     available_role = SimpleNamespace(id=20)
@@ -98,6 +99,7 @@ async def test_maybe_auto_assign_ipca_roles_posts_to_channel_when_no_companion_t
     monkeypatch.setattr(main, "AVAILABLE_ROLE_ID", 20)
     monkeypatch.setattr(main, "SUPPORT_SESSIONS_CHANNEL_ID", 100)
     monkeypatch.setattr(main, "GITHUB_PROFILES_CHANNEL_ID", None)
+    monkeypatch.setattr(main, "_resolve_plaky_invite_for_ipca_sign", AsyncMock(return_value=("asked", None, None)))
 
     dev_role = SimpleNamespace(id=10)
     available_role = SimpleNamespace(id=20)
@@ -133,6 +135,7 @@ async def test_maybe_auto_assign_ipca_roles_archives_current_thread_when_message
     monkeypatch.setattr(main, "AVAILABLE_ROLE_ID", 20)
     monkeypatch.setattr(main, "SUPPORT_SESSIONS_CHANNEL_ID", 100)
     monkeypatch.setattr(main, "GITHUB_PROFILES_CHANNEL_ID", None)
+    monkeypatch.setattr(main, "_resolve_plaky_invite_for_ipca_sign", AsyncMock(return_value=("asked", None, None)))
 
     dev_role = SimpleNamespace(id=10)
     available_role = SimpleNamespace(id=20)
