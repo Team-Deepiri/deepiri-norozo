@@ -205,6 +205,7 @@ def test_create_and_register_bot_registers_all_global_slash_commands(monkeypatch
         "discord-kick",
         "plaky-request",
         "plaky-status",
+        "resolve-github-identity",
         "poll",
         "schedule-meeting",
         "list-meetings",

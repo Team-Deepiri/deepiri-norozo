@@ -754,3 +754,76 @@ def test_is_qa_lead_role_name_matches_only_the_lead_tier():
     assert main._is_qa_lead_role_name("QA Engineer") is False
     assert main._is_qa_lead_role_name("QA") is False
     assert main._is_qa_lead_role_name("") is False
+
+
+@pytest.mark.asyncio
+async def test_resolve_github_identity_command_reports_success(monkeypatch):
+    monkeypatch.setattr(main, "_is_staff_or_security_ops", lambda member: True)
+    resolved_member = SimpleNamespace(id=99, mention="@resolved-user")
+    monkeypatch.setattr(main, "_resolve_discord_member_for_github_login", AsyncMock(return_value=resolved_member))
+
+    guild = SimpleNamespace(chunked=True, chunk=AsyncMock(), id=1)
+    staff_user = Mock(spec=discord.Member)
+    staff_user.id = 1
+    staff_user.mention = "@staff"
+    interaction = SimpleNamespace(
+        guild=guild,
+        user=staff_user,
+        response=SimpleNamespace(defer=AsyncMock()),
+        followup=SimpleNamespace(send=AsyncMock()),
+    )
+    fresh_bot = main.DeepiriBot()
+    main._register_slash_commands(fresh_bot)
+    cmd = fresh_bot.tree.get_command("resolve-github-identity")
+    await cmd.callback(cast(discord.Interaction, interaction), "AsmitaN")
+
+    interaction.response.defer.assert_awaited_once_with(thinking=True, ephemeral=True)
+    guild.chunk.assert_not_awaited()
+    sent_text = interaction.followup.send.await_args.kwargs.get("content") or interaction.followup.send.await_args.args[0]
+    assert "@resolved-user" in sent_text
+
+
+@pytest.mark.asyncio
+async def test_resolve_github_identity_command_chunks_unchunked_guild_and_reports_failure(monkeypatch):
+    monkeypatch.setattr(main, "_is_staff_or_security_ops", lambda member: True)
+    monkeypatch.setattr(main, "_resolve_discord_member_for_github_login", AsyncMock(return_value=None))
+
+    guild = SimpleNamespace(chunked=False, chunk=AsyncMock(), id=1)
+    staff_user = Mock(spec=discord.Member)
+    staff_user.id = 1
+    staff_user.mention = "@staff"
+    interaction = SimpleNamespace(
+        guild=guild,
+        user=staff_user,
+        response=SimpleNamespace(defer=AsyncMock()),
+        followup=SimpleNamespace(send=AsyncMock()),
+    )
+    fresh_bot = main.DeepiriBot()
+    main._register_slash_commands(fresh_bot)
+    cmd = fresh_bot.tree.get_command("resolve-github-identity")
+    await cmd.callback(cast(discord.Interaction, interaction), "NobodyHome")
+
+    guild.chunk.assert_awaited_once_with(cache=True)
+    sent_text = interaction.followup.send.await_args.kwargs.get("content") or interaction.followup.send.await_args.args[0]
+    assert "did not resolve" in sent_text
+
+
+@pytest.mark.asyncio
+async def test_resolve_github_identity_command_rejects_non_staff(monkeypatch):
+    monkeypatch.setattr(main, "_is_staff_or_security_ops", lambda member: False)
+
+    rando_user = Mock(spec=discord.Member)
+    rando_user.id = 1
+    rando_user.mention = "@rando"
+    interaction = SimpleNamespace(
+        guild=SimpleNamespace(chunked=True, chunk=AsyncMock(), id=1),
+        user=rando_user,
+        response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+    )
+    fresh_bot = main.DeepiriBot()
+    main._register_slash_commands(fresh_bot)
+    cmd = fresh_bot.tree.get_command("resolve-github-identity")
+    await cmd.callback(cast(discord.Interaction, interaction), "AsmitaN")
+
+    interaction.response.send_message.assert_awaited_once_with("This command is restricted to staff/IT.", ephemeral=True)
+    interaction.response.defer.assert_not_awaited()
