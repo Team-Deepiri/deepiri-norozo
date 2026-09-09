@@ -1322,18 +1322,26 @@ async def _resolve_discord_member_for_github_login(login: str, guild: discord.Gu
                 candidate_names.append(name)
 
     if candidate_names:
-        # Try the real name AND the raw login as separate queries, keep
-        # whichever scores higher -- same "try every candidate string, keep
-        # the single best score" shape as _find_github_username_via_org_roster.
-        # Real gap this closes: a formal real name ("Ricardo Beale") can fail
-        # to clear the fuzzy-match threshold against an unrelated-looking
-        # Discord display name, while the bare login ("RiccoWrld") matches
-        # a Discord username ("riccowrld") trivially -- people often reuse
-        # the same handle across GitHub and Discord even when their GitHub
-        # profile name is fully spelled out.
+        # Try the real name, the raw login, AND a synthesized "real name
+        # (login)" combination as separate queries, keeping whichever scores
+        # highest -- same "try every candidate string, keep the single best
+        # score" shape as _find_github_username_via_org_roster. Real gaps
+        # this closes: a formal real name ("Ricardo Beale") can fail to clear
+        # the fuzzy-match threshold against an unrelated-looking Discord
+        # display name, while the bare login ("RiccoWrld") matches a Discord
+        # username ("riccowrld") trivially -- people often reuse the same
+        # handle across platforms even when their GitHub profile name is
+        # fully spelled out. The combined form additionally catches a Discord
+        # display name that itself embeds BOTH pieces (a not-uncommon nickname
+        # shape like "Ricardo Beale (riccowrld)" or "Ricardo | riccowrld"),
+        # which the containment/token-overlap rules in identity_match.py can
+        # match even when neither name nor login alone clears the threshold.
+        candidate_queries = [real_name, login]
+        if real_name and login:
+            candidate_queries.append(f"{real_name} {login}")
         best_query_match = None
         best_query_name = None
-        for query in (real_name, login):
+        for query in candidate_queries:
             if not query:
                 continue
             m = best_match(query, candidate_names)
@@ -1346,7 +1354,15 @@ async def _resolve_discord_member_for_github_login(login: str, guild: discord.Gu
             return member
 
     if PLAKY_API_KEY:
-        plaky_email = await asyncio.to_thread(find_user_email, [n for n in (real_name, login) if n], PLAKY_API_KEY)
+        # Same widened candidate set as the Discord-side match above -- real
+        # name, raw login, AND the synthesized combination -- so the Plaky
+        # hop gets the same "whatever signal actually matches" treatment
+        # instead of only the two standalone strings. find_user_email already
+        # tries every candidate in the list and keeps the single best score.
+        plaky_candidates = [n for n in (real_name, login) if n]
+        if real_name and login:
+            plaky_candidates.append(f"{real_name} {login}")
+        plaky_email = await asyncio.to_thread(find_user_email, plaky_candidates, PLAKY_API_KEY)
         if plaky_email:
             discord_id_str = await find_discord_id_by_email(plaky_email)
             if discord_id_str:
