@@ -733,7 +733,15 @@ async def _maybe_handle_plaky_add_request(message: discord.Message) -> bool:
             email=email,
             role="MEMBER",
         )
-        if status == "asked":
+        if status in ("asked", "ok_from_file", "already_from_file"):
+            # Real gap this closes: telling the requester "reply with a
+            # different email if that's wrong" (the "_from_file" wording) did
+            # nothing if they actually did reply -- no pending entry was ever
+            # registered for those statuses, so the correction silently fell
+            # on the floor with no confirmation either way. Same pending-ask
+            # mechanism as a fresh "asked" -- the next email-carrying reply in
+            # this thread re-invites with the corrected address and persists
+            # it, overwriting the stale one on file.
             await _pending_plaky_ask_set(
                 reply_channel.id if getattr(reply_channel, "id", None) else message.channel.id,
                 {
