@@ -1277,9 +1277,11 @@ async def _resolve_discord_member_for_github_login(login: str, guild: discord.Gu
     1. Reverse-check the persisted github_username_map -- if some discord_id
        already maps to this login (built by kick-out's resolution + the
        onboarding DM's github-link capture), done instantly.
-    2. GitHub's real display name fuzzy-matched against current guild members'
-       display_name/global_name/name (identity_match.best_match, same
-       refuse-rather-than-guess philosophy as everywhere else).
+    2. GitHub's real display name AND raw login, each fuzzy-matched against
+       current guild members' display_name/global_name/name (best score of
+       the two queries wins -- a login often matches a reused Discord handle
+       even when the formal real name doesn't), via identity_match.best_match,
+       same refuse-rather-than-guess philosophy as everywhere else.
     3. Plaky hop: find_user_email([login, real_name], ...) -- if Plaky has this
        person under a self-reported email, reverse-look that email up against
        member_emails (self-reported at onboarding) to land on a discord_id
@@ -1303,25 +1305,44 @@ async def _resolve_discord_member_for_github_login(login: str, guild: discord.Gu
     profile = await asyncio.to_thread(get_user_profile, login, GITHUB_PAT) if GITHUB_PAT else {"name": None, "email": None}
     real_name = profile.get("name")
 
-    if real_name:
-        # All three name fields as separate candidates (not just display_name,
-        # despite what this docstring's step 2 already claimed) -- a member
-        # whose display_name is abbreviated ("Sergio V.") can still resolve
-        # via a fuller global_name or raw username that display_name alone
-        # would never surface. Same expanded-candidate-list shape as
-        # _find_github_username_via_org_roster's login+real-name fix.
-        candidate_members = []
-        candidate_names = []
-        for m in guild.members:
-            for name in (m.display_name, getattr(m, "global_name", None), m.name):
-                if isinstance(name, str) and name:
-                    candidate_members.append(m)
-                    candidate_names.append(name)
-        match = best_match(real_name, candidate_names)
-        if match is not None:
-            member = candidate_members[match.index]
+    # All three Discord name fields as separate candidates (not just
+    # display_name, despite what this docstring's step 2 already claimed) --
+    # a member whose display_name is abbreviated ("Sergio V.") can still
+    # resolve via a fuller global_name or raw username that display_name
+    # alone would never surface. Built unconditionally (not gated behind
+    # `if real_name`) because the login itself is also tried below -- a
+    # GitHub profile with no public real name shouldn't skip this step
+    # entirely when the login alone might still match a Discord handle.
+    candidate_members = []
+    candidate_names = []
+    for m in guild.members:
+        for name in (m.display_name, getattr(m, "global_name", None), m.name):
+            if isinstance(name, str) and name:
+                candidate_members.append(m)
+                candidate_names.append(name)
+
+    if candidate_names:
+        # Try the real name AND the raw login as separate queries, keep
+        # whichever scores higher -- same "try every candidate string, keep
+        # the single best score" shape as _find_github_username_via_org_roster.
+        # Real gap this closes: a formal real name ("Ricardo Beale") can fail
+        # to clear the fuzzy-match threshold against an unrelated-looking
+        # Discord display name, while the bare login ("RiccoWrld") matches
+        # a Discord username ("riccowrld") trivially -- people often reuse
+        # the same handle across GitHub and Discord even when their GitHub
+        # profile name is fully spelled out.
+        best_query_match = None
+        best_query_name = None
+        for query in (real_name, login):
+            if not query:
+                continue
+            m = best_match(query, candidate_names)
+            if m is not None and (best_query_match is None or m.score > best_query_match.score):
+                best_query_match, best_query_name = m, query
+        if best_query_match is not None:
+            member = candidate_members[best_query_match.index]
             await _remember_identity(member.id, login, member)
-            logger.info("PR staleness identity: matched GitHub %s (name %r) -> Discord %s via name fuzzy match", login, real_name, member.id)
+            logger.info("PR staleness identity: matched GitHub %s (query %r) -> Discord %s via name fuzzy match", login, best_query_name, member.id)
             return member
 
     if PLAKY_API_KEY:
