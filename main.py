@@ -1304,6 +1304,7 @@ async def _resolve_discord_member_for_github_login(login: str, guild: discord.Gu
 
     profile = await asyncio.to_thread(get_user_profile, login, GITHUB_PAT) if GITHUB_PAT else {"name": None, "email": None}
     real_name = profile.get("name")
+    github_email = profile.get("email")
 
     # All three Discord name fields as separate candidates (not just
     # display_name, despite what this docstring's step 2 already claimed) --
@@ -1339,6 +1340,12 @@ async def _resolve_discord_member_for_github_login(login: str, guild: discord.Gu
         candidate_queries = [real_name, login]
         if real_name and login:
             candidate_queries.append(f"{real_name} {login}")
+        if github_email:
+            # GitHub's own public profile email, if set -- same "local part is
+            # often the real name concatenated" signal already used for the
+            # Plaky-confirmed email fallback below, but sourced directly from
+            # GitHub itself rather than requiring the Plaky hop to even run.
+            candidate_queries.append(github_email.split("@", 1)[0])
         best_query_match = None
         best_query_name = None
         for query in candidate_queries:
@@ -1353,6 +1360,19 @@ async def _resolve_discord_member_for_github_login(login: str, guild: discord.Gu
             logger.info("PR staleness identity: matched GitHub %s (query %r) -> Discord %s via name fuzzy match", login, best_query_name, member.id)
             return member
 
+        # No confident match despite trying every signal -- log what was
+        # actually compared instead of failing silently into the Plaky hop.
+        # This is the one piece of visibility that was missing to tell "this
+        # person's Discord name genuinely doesn't overlap what we have" apart
+        # from "the guild roster we searched was wrong/incomplete/stale" --
+        # both look identical from a bare failure, but very different fixes.
+        logger.info(
+            "PR staleness identity: no confident Discord name match for GitHub %s (queries tried: %s) against %s candidates from %s guild members (sample: %s)",
+            login, [q for q in candidate_queries if q], len(candidate_names), len(guild.members), candidate_names[:20],
+        )
+    else:
+        logger.info("PR staleness identity: guild has no usable member name candidates at all (guild.members len=%s, chunked=%s)", len(guild.members), getattr(guild, "chunked", "?"))
+
     if PLAKY_API_KEY:
         # Same widened candidate set as the Discord-side match above -- real
         # name, raw login, AND the synthesized combination -- so the Plaky
@@ -1362,7 +1382,12 @@ async def _resolve_discord_member_for_github_login(login: str, guild: discord.Gu
         plaky_candidates = [n for n in (real_name, login) if n]
         if real_name and login:
             plaky_candidates.append(f"{real_name} {login}")
-        plaky_email = await asyncio.to_thread(find_user_email, plaky_candidates, PLAKY_API_KEY)
+        # GitHub's own public profile email (if set) feeds Plaky's exact-email
+        # fast path -- a far stronger signal than any fuzzy name match, and
+        # sourced directly from GitHub rather than needing Plaky to separately
+        # rediscover it by name.
+        known_emails = [github_email] if github_email else None
+        plaky_email = await asyncio.to_thread(find_user_email, plaky_candidates, PLAKY_API_KEY, known_emails)
         if plaky_email:
             discord_id_str = await find_discord_id_by_email(plaky_email)
             if discord_id_str:
