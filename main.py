@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 from bot import format_discussion_body, format_discussion_title, resolve_discord_mentions
 from emailer import send_email
 from github import add_user_to_team, get_pull_request, get_pull_request_reviews, get_user_profile, invite_user, is_org_member, list_open_prs, list_org_members, remove_user_from_org, remove_user_from_team
-from identity_match import best_match
+from identity_match import AMBIGUITY_MARGIN, best_match
 from github_discussion import GitHubDiscussionError, create_github_discussion
 from meetings import setup_meeting_features
 from onboarding import ApprovalView
@@ -1314,11 +1314,24 @@ async def _resolve_discord_member_for_github_login(login: str, guild: discord.Gu
     # `if real_name`) because the login itself is also tried below -- a
     # GitHub profile with no public real name shouldn't skip this step
     # entirely when the login alone might still match a Discord handle.
+    # Real incident this dedup fixes: best_match's ambiguity-refusal logic
+    # treats two candidate STRINGS tied at the top score as two different
+    # people and refuses to guess -- correct when they really are two
+    # different members, but a member whose display_name/global_name/name
+    # fields collide (e.g. display_name == global_name == "Asmita N.", or
+    # username "superhuygaming" is just the login casefolded) gets counted as
+    # tied against THEMSELVES in this flattened list, producing a false
+    # "ambiguous" refusal for a match that was never actually ambiguous.
+    # Deduping per-member (casefolded, so "SuperHuyGaming"/"superhuygaming"
+    # collide too) keeps each member contributing only genuinely distinct
+    # name strings.
     candidate_members = []
     candidate_names = []
     for m in guild.members:
+        seen_for_member = set()
         for name in (m.display_name, getattr(m, "global_name", None), m.name):
-            if isinstance(name, str) and name:
+            if isinstance(name, str) and name and name.casefold() not in seen_for_member:
+                seen_for_member.add(name.casefold())
                 candidate_members.append(m)
                 candidate_names.append(name)
 
@@ -1346,19 +1359,41 @@ async def _resolve_discord_member_for_github_login(login: str, guild: discord.Gu
             # Plaky-confirmed email fallback below, but sourced directly from
             # GitHub itself rather than requiring the Plaky hop to even run.
             candidate_queries.append(github_email.split("@", 1)[0])
-        best_query_match = None
-        best_query_name = None
-        for query in candidate_queries:
-            if not query:
-                continue
-            m = best_match(query, candidate_names)
-            if m is not None and (best_query_match is None or m.score > best_query_match.score):
-                best_query_match, best_query_name = m, query
-        if best_query_match is not None:
-            member = candidate_members[best_query_match.index]
-            await _remember_identity(member.id, login, member)
-            logger.info("PR staleness identity: matched GitHub %s (query %r) -> Discord %s via name fuzzy match", login, best_query_name, member.id)
-            return member
+
+        # Score PER MEMBER (the max across that member's own distinct name
+        # fields and every query signal), THEN apply ambiguity-refusal only
+        # ACROSS different members -- not by flattening every member's name
+        # variants into one shared list and letting best_match's tie-check
+        # run over it. Real incident the per-member dedup above didn't fully
+        # cover: a member's display_name ("Asmita N.") and username
+        # ("asmita_n_handle") are different strings that can EACH
+        # independently score against the same query -- a flattened list
+        # would see two "different" top-scoring candidates tied and refuse,
+        # even though they're the same person. Scoring each candidate string
+        # via a single-candidate best_match call (nothing else in that call
+        # to be ambiguous against) and taking the max per member sidesteps
+        # this entirely; genuine ambiguity between two DIFFERENT people is
+        # still caught by the cross-member check below.
+        per_member_best: Dict[int, tuple] = {}
+        for member_obj, name in zip(candidate_members, candidate_names):
+            for query in candidate_queries:
+                if not query:
+                    continue
+                m = best_match(query, [name])
+                if m is None:
+                    continue
+                current = per_member_best.get(member_obj.id)
+                if current is None or m.score > current[0]:
+                    per_member_best[member_obj.id] = (m.score, query, member_obj)
+
+        if per_member_best:
+            ranked = sorted(per_member_best.values(), key=lambda t: t[0], reverse=True)
+            top_score, top_query, top_member = ranked[0]
+            ambiguous = len(ranked) > 1 and (top_score - ranked[1][0]) < AMBIGUITY_MARGIN
+            if not ambiguous:
+                await _remember_identity(top_member.id, login, top_member)
+                logger.info("PR staleness identity: matched GitHub %s (query %r, score=%s) -> Discord %s via name fuzzy match", login, top_query, top_score, top_member.id)
+                return top_member
 
         # No confident match despite trying every signal -- log what was
         # actually compared instead of failing silently into the Plaky hop.

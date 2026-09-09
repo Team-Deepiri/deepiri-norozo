@@ -120,6 +120,35 @@ async def test_name_fuzzy_match_checks_global_name_and_username_too(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_duplicate_name_fields_on_the_same_member_do_not_cause_a_false_ambiguity_refusal(monkeypatch):
+    """Real incident (AsmitaN and SuperHuyGaming both hit this): when a single
+    member's display_name/global_name/name fields collide (identical or only
+    case-different, e.g. display_name == global_name == "Asmita N.", or
+    global_name "SuperHuyGaming" vs username "superhuygaming"), the flattened
+    candidate list contained that same string twice pointing at the SAME
+    member -- best_match's ambiguity-refusal logic saw two candidates tied at
+    the top score and refused to guess, thinking it was choosing between two
+    different people when it was really the same person duplicated. Must be
+    deduped per-member before matching."""
+    monkeypatch.setattr(main, "_load_github_username_map", lambda: {})
+    monkeypatch.setattr(main, "GITHUB_PAT", "fake")
+    monkeypatch.setattr(main, "get_user_profile", lambda login, pat: {"name": None, "email": None})
+    monkeypatch.setattr(main, "PLAKY_API_KEY", None)
+    remember_mock = Mock()
+    monkeypatch.setattr(main, "_remember_github_username", remember_mock)
+
+    member = _member(id_=66, display_name="Asmita N.")
+    member.global_name = "Asmita N."  # identical to display_name -- the collision
+    member.name = "asmita_n_handle"
+    guild = SimpleNamespace(get_member=lambda uid: None, members=[member])
+
+    result = await main._resolve_discord_member_for_github_login("AsmitaN", guild)
+
+    assert result is member
+    remember_mock.assert_called_once_with(66, "AsmitaN")
+
+
+@pytest.mark.asyncio
 async def test_name_fuzzy_match_also_tries_raw_login_when_real_name_fails(monkeypatch):
     """Real incident: GitHub real name "Ricardo Beale" doesn't fuzzy-match an
     unrelated-looking Discord display_name, but the raw GitHub login
