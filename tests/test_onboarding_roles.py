@@ -3,7 +3,7 @@ since that role carries elevated permissions and must never be self-assignable
 through the fuzzy-matched DM flow."""
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock
 
 import pytest
 
