@@ -226,6 +226,64 @@ async def test_add_request_self_asks_for_email_in_thread(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_from_file_result_registers_a_correction_listener(monkeypatch):
+    """Real incident: "I need invited to plaky" resolved silently from a
+    stored email ("already_from_file") and told the requester to "reply with
+    a different one if that's wrong" -- but nothing was actually listening
+    for that reply, so a genuine correction ("joeblack@deepiri.com") silently
+    did nothing, with no confirmation either way. A pending-ask entry must be
+    registered for the "_from_file" statuses too, not just a fresh "asked"."""
+    discord = __import__("discord")
+    member = Mock(spec=discord.Member)
+    member.id = 42
+    member.display_name = "jane"
+    member.global_name = "jane"
+    member.name = "jane"
+    member.bot = False
+
+    thread = Mock(spec=discord.Thread)
+    thread.id = 555
+    thread.guild = SimpleNamespace()
+    thread.owner_id = 42
+    thread.parent_id = 100
+    thread.send = AsyncMock()
+
+    first_message = SimpleNamespace(
+        id=997, guild=SimpleNamespace(), channel=thread, thread=None,
+        content="I need invited to plaky", author=member, mentions=[],
+    )
+    monkeypatch.setattr(main, "SUPPORT_SESSIONS_CHANNEL_ID", 100)
+    monkeypatch.setattr(main, "GITHUB_PROFILES_CHANNEL_ID", None)
+    monkeypatch.setattr(main, "PLAKY_API_KEY", None)
+    monkeypatch.setattr(main, "_resolve_reply_channel", AsyncMock(return_value=thread))
+    monkeypatch.setattr(main, "call_plaky_bridge_invite", AsyncMock(return_value={"success": False, "already": True}))
+    monkeypatch.setattr(main, "resolve_member_email", AsyncMock(return_value="joeblacky@deepiri.com"))
+
+    handled = await main._maybe_handle_plaky_add_request(first_message)
+
+    assert handled is True
+    already_text = thread.send.await_args.args[0]
+    assert "already on file" in already_text.lower()
+    assert main.PENDING_PLAKY_EMAIL_THREADS.get(555, {}).get("discord_id") == 42
+
+    # Requester replies with the CORRECT address in the same thread.
+    bridge_invite = AsyncMock(return_value={"success": True, "via": "cake"})
+    monkeypatch.setattr(main, "call_plaky_bridge_invite", bridge_invite)
+    correction_message = SimpleNamespace(
+        id=998, guild=SimpleNamespace(), channel=thread, thread=None,
+        content="joeblack@deepiri.com", author=member, mentions=[],
+    )
+
+    handled_correction = await main._maybe_handle_plaky_pending_email_reply(correction_message)
+
+    assert handled_correction is True
+    bridge_invite.assert_awaited_once_with("joeblack@deepiri.com", role="MEMBER")
+    assert 555 not in main.PENDING_PLAKY_EMAIL_THREADS
+    confirmation_text = thread.send.await_args.args[0]
+    assert "joeblack@deepiri.com" in confirmation_text
+
+
+@pytest.mark.asyncio
 async def test_pending_email_reply_completes_invite(monkeypatch):
     discord = __import__("discord")
     member = Mock(spec=discord.Member)
