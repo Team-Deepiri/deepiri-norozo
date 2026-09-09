@@ -153,6 +153,19 @@ def test_real_incident_first_name_plus_bare_initial_does_not_match_unrelated_ful
     assert best_match("joe black", ["Joe Hauer", "Someone Else"]) is None
 
 
+def test_multi_token_query_matches_bare_first_name_candidate():
+    """Real incident: GitHub real name "Sergio Vargas Aguilar" fuzzy-matched
+    against guild members whose Discord display name is just "sergio" fell
+    through to None -- the first-name-only-query case ("jordan" ->
+    "Jordan Runyon") was handled, but not this reversed shape (full name query
+    -> bare-first-name candidate), so PR-staleness identity resolution missed
+    an obviously-correct guild member and fell back to a weaker Plaky-email
+    hop that often has nothing to match against either."""
+    m = best_match("Sergio Vargas Aguilar", ["sergio", "Someone Else"])
+    assert m is not None
+    assert m.index == 0
+
+
 def test_full_name_typo_still_matches_via_ratio_fallback():
     """Must not overcorrect: a genuine full "First Last" typo (not an
     abbreviated initial) still matches through the whole-string ratio

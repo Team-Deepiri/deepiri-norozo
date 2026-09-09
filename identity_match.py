@@ -105,6 +105,19 @@ def _score_one(query: str, candidate: str) -> tuple:
     if multi_token and all(t in v_tokens for t in q_tokens):
         return 0.9, f"all parts of {query!r} match {candidate!r}"
 
+    # Symmetric case to the first-name-only query match above, but with the
+    # roles reversed: a multi-token query (a GitHub real name like "Sergio
+    # Vargas Aguilar") against a candidate that is itself just a bare first
+    # name (a Discord display name set to "sergio") -- real incident where
+    # PR-staleness identity resolution fell through this exact shape straight
+    # to the weaker Plaky-email hop instead of matching the obviously-correct
+    # guild member directly. len(v_tokens) == 1 keeps this from ever firing
+    # against an unrelated multi-word candidate that merely shares one token
+    # (that case already has its own, more guarded, ratio-based path below);
+    # the length-2 floor mirrors the bare-initial guard used above.
+    if multi_token and len(v_tokens) == 1 and len(v_tokens[0]) >= 2 and v_tokens[0] in q_tokens:
+        return 0.9, f"{candidate!r} matches a name part of {query!r}"
+
     if not multi_token:
         containment = _containment_score(q, v)
         if containment > 0:
