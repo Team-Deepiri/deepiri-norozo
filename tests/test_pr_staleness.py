@@ -119,6 +119,61 @@ async def test_name_fuzzy_match_checks_global_name_and_username_too(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_name_fuzzy_match_also_tries_raw_login_when_real_name_fails(monkeypatch):
+    """Real incident: GitHub real name "Ricardo Beale" doesn't fuzzy-match an
+    unrelated-looking Discord display_name, but the raw GitHub login
+    ("RiccoWrld") matches a reused Discord username ("riccowrld") trivially --
+    step 2 previously only ever tried the real name and gave up instead of
+    also trying the login."""
+    monkeypatch.setattr(main, "_load_github_username_map", lambda: {})
+    monkeypatch.setattr(main, "GITHUB_PAT", "fake")
+    monkeypatch.setattr(main, "get_user_profile", lambda login, pat: {"name": "Ricardo Beale", "email": None})
+    monkeypatch.setattr(main, "PLAKY_API_KEY", None)
+    remember_mock = Mock()
+    monkeypatch.setattr(main, "_remember_github_username", remember_mock)
+
+    member = _member(id_=77, display_name="Some Unrelated Name")
+    member.global_name = None
+    member.name = "riccowrld"
+    guild = SimpleNamespace(get_member=lambda uid: member, members=[member])
+
+    result = await main._resolve_discord_member_for_github_login("RiccoWrld", guild)
+
+    assert result is member
+    remember_mock.assert_called_once_with(77, "RiccoWrld")
+
+
+@pytest.mark.asyncio
+async def test_combined_real_name_and_login_query_breaks_a_tie_the_name_alone_cannot(monkeypatch):
+    """Real name alone can be genuinely ambiguous -- two guild members both
+    plausibly named "Ricardo" score an identical 0.9 and best_match correctly
+    refuses to guess between them. The short login "rb" is too short to match
+    anything on its own (below the containment length floor). But the
+    synthesized "Ricardo Beale rb" query exact-matches the actual person's
+    display name at 1.0 while the wrong "Ricardo" only scores 0.9 against it
+    -- a decisive margin neither standalone signal could produce."""
+    monkeypatch.setattr(main, "_load_github_username_map", lambda: {})
+    monkeypatch.setattr(main, "GITHUB_PAT", "fake")
+    monkeypatch.setattr(main, "get_user_profile", lambda login, pat: {"name": "Ricardo Beale", "email": None})
+    monkeypatch.setattr(main, "PLAKY_API_KEY", None)
+    remember_mock = Mock()
+    monkeypatch.setattr(main, "_remember_github_username", remember_mock)
+
+    wrong_member = _member(id_=88, display_name="Ricardo")
+    wrong_member.global_name = None
+    wrong_member.name = "ricardo_unrelated"
+    right_member = _member(id_=89, display_name="Ricardo Beale rb")
+    right_member.global_name = None
+    right_member.name = "unrelated_handle"
+    guild = SimpleNamespace(get_member=lambda uid: None, members=[wrong_member, right_member])
+
+    result = await main._resolve_discord_member_for_github_login("rb", guild)
+
+    assert result is right_member
+    remember_mock.assert_called_once_with(89, "rb")
+
+
+@pytest.mark.asyncio
 async def test_falls_back_to_plaky_email_reverse_lookup(monkeypatch):
     monkeypatch.setattr(main, "_load_github_username_map", lambda: {})
     monkeypatch.setattr(main, "GITHUB_PAT", "fake")
