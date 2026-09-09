@@ -1606,6 +1606,22 @@ async def _pr_staleness_scan_loop() -> None:
         try:
             guild = await _get_primary_guild()
             if guild is not None:
+                if not guild.chunked:
+                    # The very first iteration after every restart/reconnect
+                    # otherwise runs within ~10-15s of the gateway connecting --
+                    # well before Discord has finished delivering the full
+                    # member list for a guild this size. guild.members would
+                    # then silently be missing whoever hasn't arrived yet,
+                    # producing a CONSISTENT (not random) identity-resolution
+                    # failure for specific people on every single restart,
+                    # regardless of how good the fuzzy-name-matching logic is.
+                    # Real incident: SuperHuyGaming/Huy Truong failed to
+                    # resolve on the first scan after every deploy even after
+                    # the matching logic itself was fixed and verified correct.
+                    try:
+                        await guild.chunk(cache=True)
+                    except Exception:
+                        logger.exception("PR staleness scan: failed to chunk guild %s members before scanning", guild.id)
                 await _scan_stale_prs(guild)
         except Exception:
             logger.exception("PR staleness scan iteration failed")

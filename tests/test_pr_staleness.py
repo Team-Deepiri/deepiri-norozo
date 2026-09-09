@@ -2,6 +2,7 @@
 member), the one-time 2-week/1-month tiers, and the recurring author/QA-reviewer
 DM cooldown cadence (weekly -> every 3 days at 3 weeks -> daily at 1 month+)."""
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -615,3 +616,51 @@ async def test_pr_already_reviewed_by_checks_review_authors(monkeypatch):
 
     assert await main._pr_already_reviewed_by(pr, "somereviewer") is True
     assert await main._pr_already_reviewed_by(pr, "nobody") is False
+
+
+@pytest.mark.asyncio
+async def test_staleness_scan_loop_chunks_unchunked_guild_before_scanning(monkeypatch):
+    """Real incident: the first PR-staleness scan after every restart ran
+    within ~10-15s of the gateway connecting -- before Discord finished
+    delivering the full member list for a guild this size -- so guild.members
+    silently missed whoever hadn't arrived yet. This caused a CONSISTENT
+    (not random) identity-resolution failure for specific people (e.g.
+    SuperHuyGaming/Huy Truong) on every single restart, regardless of how
+    correct the fuzzy-name-matching logic itself was. The loop must chunk an
+    unchunked guild before scanning."""
+    chunk_mock = AsyncMock()
+    guild = SimpleNamespace(chunked=False, chunk=chunk_mock, id=999)
+    monkeypatch.setattr(main, "_get_primary_guild", AsyncMock(return_value=guild))
+    scan_mock = AsyncMock()
+    monkeypatch.setattr(main, "_scan_stale_prs", scan_mock)
+
+    async def fake_sleep(_):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await main._pr_staleness_scan_loop()
+
+    chunk_mock.assert_awaited_once_with(cache=True)
+    scan_mock.assert_awaited_once_with(guild)
+
+
+@pytest.mark.asyncio
+async def test_staleness_scan_loop_skips_chunking_an_already_chunked_guild(monkeypatch):
+    chunk_mock = AsyncMock()
+    guild = SimpleNamespace(chunked=True, chunk=chunk_mock, id=999)
+    monkeypatch.setattr(main, "_get_primary_guild", AsyncMock(return_value=guild))
+    scan_mock = AsyncMock()
+    monkeypatch.setattr(main, "_scan_stale_prs", scan_mock)
+
+    async def fake_sleep(_):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await main._pr_staleness_scan_loop()
+
+    chunk_mock.assert_not_awaited()
+    scan_mock.assert_awaited_once_with(guild)
