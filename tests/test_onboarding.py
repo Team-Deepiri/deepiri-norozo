@@ -15,10 +15,11 @@ class FakeApprovalView:
 
 
 class FakeRole:
-    def __init__(self, role_id: int, mention: str, members=None):
+    def __init__(self, role_id: int, mention: str, members=None, name: str = ""):
         self.id = role_id
         self.mention = mention
         self.members = members or []
+        self.name = name or mention.lstrip("@")
 
 
 class FakeMember:
@@ -615,3 +616,104 @@ async def test_discord_kick_command_uses_handler(monkeypatch):
     await discord_kick.callback(cast(discord.Interaction, interaction), member, "rule violation")
 
     assert called["args"] == (interaction, member, "rule violation")
+
+
+@pytest.mark.asyncio
+async def test_it_role_grant_invites_and_adds_as_maintainer(monkeypatch):
+    """IT/Support Operations role auto-sync: resolves a GitHub identity, sends
+    the org invite, adds them to the IT team as maintainer (not plain member),
+    and confirms via DM -- the actual feature request, not just the QA-style
+    plain team-membership sync."""
+    it_role = SimpleNamespace(id=555, name="IT Operations Support")
+    before = FakeMember(20, "@user", roles=[])
+    after = FakeMember(20, "@user", roles=[it_role])
+
+    monkeypatch.setattr(main, "GITHUB_ORG", "Team-Deepiri")
+    monkeypatch.setattr(main, "GITHUB_PAT", "token")
+    monkeypatch.setattr(main, "GITHUB_IT_TEAM_SLUG", "it-management-team")
+    monkeypatch.setattr(main, "IT_OPERATIONS_SUPPORT_ROLE_ID", 555)
+    monkeypatch.setattr(main, "STAFF_CHANNEL_ID", None)
+    monkeypatch.setattr(main, "_resolve_github_username_for_role_sync", AsyncMock(return_value="sergiovargas111"))
+
+    invite_mock = Mock(return_value={"ok": True, "status": 201, "message": "Invite sent"})
+    add_team_mock = Mock(return_value={"ok": True, "status": 200, "message": "Added"})
+    monkeypatch.setattr(main, "invite_user", invite_mock)
+    monkeypatch.setattr(main, "add_user_to_team", add_team_mock)
+
+    await main.on_member_update(cast(discord.Member, before), cast(discord.Member, after))
+
+    invite_mock.assert_called_once_with(username="sergiovargas111", github_org="Team-Deepiri", github_pat="token")
+    add_team_mock.assert_called_once_with(
+        username="sergiovargas111",
+        github_org="Team-Deepiri",
+        github_pat="token",
+        team_slug="it-management-team",
+        role="maintainer",
+    )
+    after.send.assert_awaited_once()
+    assert "maintainer" in after.send.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_it_role_grant_asks_member_when_no_github_identity_found(monkeypatch):
+    """When every resolution source (mapping, #github-profiles scan, org-roster
+    fuzzy match) comes up empty, the bot must ask the member directly instead
+    of silently giving up like the old QA-only sync path did."""
+    it_role = SimpleNamespace(id=555, name="IT Operations Support")
+    before = FakeMember(21, "@user", roles=[])
+    after = FakeMember(21, "@user", roles=[it_role])
+
+    monkeypatch.setattr(main, "GITHUB_ORG", "Team-Deepiri")
+    monkeypatch.setattr(main, "GITHUB_PAT", "token")
+    monkeypatch.setattr(main, "GITHUB_IT_TEAM_SLUG", "it-management-team")
+    monkeypatch.setattr(main, "IT_OPERATIONS_SUPPORT_ROLE_ID", 555)
+    monkeypatch.setattr(main, "_resolve_github_username_for_role_sync", AsyncMock(return_value=None))
+
+    invite_mock = Mock(return_value={"ok": True})
+    add_team_mock = Mock(return_value={"ok": True})
+    monkeypatch.setattr(main, "invite_user", invite_mock)
+    monkeypatch.setattr(main, "add_user_to_team", add_team_mock)
+
+    await main.on_member_update(cast(discord.Member, before), cast(discord.Member, after))
+
+    invite_mock.assert_not_called()
+    add_team_mock.assert_not_called()
+    after.send.assert_awaited_once()
+    assert "github" in after.send.await_args.args[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_qa_role_grant_matched_dynamically_by_name_not_hardcoded_id(monkeypatch):
+    """QA_ROLE_ID must not be required -- a role merely named "QA Engineer"
+    (no matching QA_ROLE_ID configured, or even set to something else entirely)
+    still triggers the GitHub support-team sync purely by name."""
+    qa_role = SimpleNamespace(id=999, name="QA Engineer")
+    before = FakeMember(22, "@user", roles=[])
+    after = FakeMember(22, "@user", roles=[qa_role])
+
+    monkeypatch.setattr(main, "GITHUB_ORG", "Team-Deepiri")
+    monkeypatch.setattr(main, "GITHUB_PAT", "token")
+    monkeypatch.setattr(main, "GITHUB_SUPPORT_TEAM_SLUG", "support-team")
+    monkeypatch.setattr(main, "QA_ROLE_ID", 123456)  # deliberately unrelated to qa_role.id
+    monkeypatch.setattr(main, "IT_OPERATIONS_SUPPORT_ROLE_ID", None)
+    monkeypatch.setattr(main, "_get_github_username_for_member", lambda member: "jane-qa")
+
+    add_team_mock = Mock(return_value={"ok": True, "status": 200, "message": "Added"})
+    monkeypatch.setattr(main, "add_user_to_team", add_team_mock)
+
+    await main.on_member_update(cast(discord.Member, before), cast(discord.Member, after))
+
+    add_team_mock.assert_called_once_with(
+        username="jane-qa",
+        github_org="Team-Deepiri",
+        github_pat="token",
+        team_slug="support-team",
+    )
+
+
+def test_is_qa_role_name_matches_common_shapes_and_rejects_unrelated():
+    assert main._is_qa_role_name("QA") is True
+    assert main._is_qa_role_name("QA Engineer") is True
+    assert main._is_qa_role_name("Quality Assurance") is True
+    assert main._is_qa_role_name("Quaid") is False
+    assert main._is_qa_role_name("") is False

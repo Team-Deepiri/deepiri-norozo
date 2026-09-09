@@ -577,7 +577,7 @@ async def _invite_member_to_plaky(
     if result.get("success"):
         await persist_member_email(discord_id, discord_username, email, github_username=github_username)
         return ("ok", email)
-    await remember_user_data(discord_id, email=email, github_username=github_username)
+    remember_user_data(discord_id, email=email, github_username=github_username)
     if result.get("already"):
         return ("already", email)
     return (f"failed:{result.get('error') or 'bridge error'}", email)
@@ -812,6 +812,18 @@ async def _maybe_auto_invite_to_plaky(message: discord.Message, member: discord.
             },
         )
     await reply_channel.send(_plaky_invite_status_text(status, used_email or email, member.mention))
+
+
+def _github_it_team_dm_ask_text(member_name: str) -> str:
+    """DM copy for when the IT/Support-Operations role grant fires the GitHub
+    org+team auto-invite but no GitHub identity could be resolved yet."""
+    return (
+        f"Hey {member_name}! You just got IT/Support Operations access, which "
+        f"also gets you added to the `{GITHUB_IT_TEAM_SLUG}` GitHub team -- but I "
+        "couldn't find a GitHub username on file for you yet. Either post your "
+        "GitHub profile link in #github-profiles, or reply here with your GitHub "
+        "username, and I'll send the org + team invite right away."
+    )
 
 
 def _plaky_dm_ask_text(member_name: str) -> str:
@@ -1186,6 +1198,38 @@ async def _find_github_username_via_org_roster(member: discord.Member) -> Option
             return usernames[match.index]
     logger.warning("Org roster fallback for %s: no confident match among %s org members", member.id, len(usernames))
     return None
+
+
+def _is_qa_role_name(name: str) -> bool:
+    """Dynamic role-name match for the GitHub support-team sync -- no hardcoded
+    role id, so it keeps working across servers/role renames as long as the
+    role is recognizably QA ("QA", "QA Engineer", "Quality Assurance", ...).
+    \\bqa\\b (not a bare substring check) so it doesn't fire on unrelated role
+    names that merely contain "qa" as part of another word.
+    """
+    n = (name or "").strip().lower()
+    if not n:
+        return False
+    return "quality assurance" in n or re.search(r"\bqa\b", n) is not None
+
+
+async def _resolve_github_username_for_role_sync(member: discord.Member) -> Optional[str]:
+    """Full identity-resolution chain for a Discord role -> GitHub team auto-sync,
+    same three sources used for the offboarding kick-out flow (in that order of
+    cheapness/confidence): the persisted mapping/name-guess, then a scan of
+    #github-profiles for a link this exact member posted, then a last-resort
+    fuzzy match against the org roster. Each fallback only runs when the one
+    before it came up empty, and the profiles-channel/org-roster hits already
+    persist the mapping via _remember_identity so this chain is O(1) next time.
+    """
+    github_username = _get_github_username_for_member(member)
+    if github_username and GITHUB_ORG and GITHUB_PAT and not await asyncio.to_thread(is_org_member, github_username, GITHUB_ORG, GITHUB_PAT):
+        github_username = None
+    if not github_username:
+        github_username = await _find_github_username_in_profiles_channel(member)
+    if not github_username:
+        github_username = await _find_github_username_via_org_roster(member)
+    return github_username
 
 
 async def _resolve_discord_member_for_github_login(login: str, guild: discord.Guild) -> Optional[discord.Member]:
@@ -1740,22 +1784,15 @@ async def on_member_update(before: discord.Member, after: discord.Member) -> Non
     if not added:
         return
 
-    github_username = _get_github_username_for_member(after)
-    # If no mapping, we cannot sync; log and skip but still try display_name fallback
-    if not github_username:
-        # Only attempt if we can infer username; otherwise skip with log
-        logger.info("Member %s gained roles %s but no GitHub username mapping found, skipping team sync", after.id, added)
-        return
-
     # Build name fallback maps for when role IDs not configured
     added_roles = [r for r in after.roles if r.id in added]
     added_names_lower = {r.name.strip().lower() for r in added_roles}
 
-    qa_triggered = False
-    if QA_ROLE_ID is not None and QA_ROLE_ID in added:
-        qa_triggered = True
-    elif QA_ROLE_ID is None and ("qa" in added_names_lower or "quality assurance" in added_names_lower):
-        qa_triggered = True
+    # Deliberately name-matched rather than a hardcoded QA_ROLE_ID -- QA_ROLE_ID
+    # is optional config used elsewhere (PR-staleness reviewer pings) and often
+    # isn't set at all, so the GitHub support-team sync must not depend on it.
+    # Matches "QA", "QA Engineer", "Quality Assurance", etc. by role name alone.
+    qa_triggered = any(_is_qa_role_name(r.name) for r in added_roles)
 
     it_triggered = False
     if IT_OPERATIONS_SUPPORT_ROLE_ID is not None and IT_OPERATIONS_SUPPORT_ROLE_ID in added:
@@ -1766,37 +1803,98 @@ async def on_member_update(before: discord.Member, after: discord.Member) -> Non
         if added_names_lower & it_candidates:
             it_triggered = True
 
-    # QA -> support-team
+    if not qa_triggered and not it_triggered:
+        return
+
+    # QA -> support-team (regular member; no identity-chain/invite needed here,
+    # unchanged from before -- only the IT branch below gained the full chain).
     if qa_triggered:
-        logger.info("Syncing %s (%s) to GitHub team %s for QA role", after, github_username, GITHUB_SUPPORT_TEAM_SLUG)
+        github_username = _get_github_username_for_member(after)
+        if not github_username:
+            logger.info("Member %s gained QA role but no GitHub username mapping found, skipping team sync", after.id)
+        else:
+            logger.info("Syncing %s (%s) to GitHub team %s for QA role", after, github_username, GITHUB_SUPPORT_TEAM_SLUG)
+            try:
+                result = await asyncio.to_thread(
+                    add_user_to_team,
+                    username=github_username,
+                    github_org=GITHUB_ORG,
+                    github_pat=GITHUB_PAT,
+                    team_slug=GITHUB_SUPPORT_TEAM_SLUG,
+                )
+                if not result.get("ok"):
+                    logger.warning("Failed to add %s to support team: %s", github_username, result.get("message"))
+            except Exception:
+                logger.exception("Exception syncing QA to GitHub team")
+
+    # IT Operations / Support Operations -> it-management-team, as a maintainer.
+    # Runs the full GitHub-identity resolution chain (stored mapping ->
+    # #github-profiles scan -> org-roster fuzzy match) rather than giving up
+    # when there's no mapping yet, sends the actual org invite (not just the
+    # team-membership PUT, which also invites but silently), and DMs the
+    # member either the invite confirmation or an ask for their username when
+    # every resolution source came up empty.
+    if it_triggered:
+        github_username = await _resolve_github_username_for_role_sync(after)
+        if not github_username:
+            logger.info("Member %s gained IT/Support Operations role but no GitHub username could be resolved, asking them directly", after.id)
+            try:
+                await after.send(_github_it_team_dm_ask_text(getattr(after, "display_name", None) or getattr(after, "name", None) or "there"))
+            except discord.Forbidden:
+                logger.warning("Could not DM %s to ask for their GitHub username — DMs disabled", after.id)
+            except Exception:
+                logger.exception("Failed to DM %s the GitHub username ask", after.id)
+            return
+
+        logger.info("Syncing %s (%s) to GitHub org %s + team %s (maintainer) for IT role", after, github_username, GITHUB_ORG, GITHUB_IT_TEAM_SLUG)
         try:
-            result = await asyncio.to_thread(
-                add_user_to_team,
+            invite_result = await asyncio.to_thread(
+                invite_user,
                 username=github_username,
                 github_org=GITHUB_ORG,
                 github_pat=GITHUB_PAT,
-                team_slug=GITHUB_SUPPORT_TEAM_SLUG,
             )
-            if not result.get("ok"):
-                logger.warning("Failed to add %s to support team: %s", github_username, result.get("message"))
-        except Exception:
-            logger.exception("Exception syncing QA to GitHub team")
+            if not invite_result.get("ok") and invite_result.get("status") != 422:
+                # 422 just means they're already a member/already invited -- expected
+                # on every re-sync after the first, not worth a warning.
+                logger.warning("GitHub org invite failed for %s: %s", github_username, invite_result.get("message"))
 
-    # IT Operations -> it-management-team
-    if it_triggered:
-        logger.info("Syncing %s (%s) to GitHub team %s for IT role", after, github_username, GITHUB_IT_TEAM_SLUG)
-        try:
-            result = await asyncio.to_thread(
+            team_result = await asyncio.to_thread(
                 add_user_to_team,
                 username=github_username,
                 github_org=GITHUB_ORG,
                 github_pat=GITHUB_PAT,
                 team_slug=GITHUB_IT_TEAM_SLUG,
+                role="maintainer",
             )
-            if not result.get("ok"):
-                logger.warning("Failed to add %s to IT team: %s", github_username, result.get("message"))
+            if not team_result.get("ok"):
+                logger.warning("Failed to add %s to IT team as maintainer: %s", github_username, team_result.get("message"))
+                return
         except Exception:
-            logger.exception("Exception syncing IT to GitHub team")
+            logger.exception("Exception syncing IT role to GitHub org/team")
+            return
+
+        try:
+            await after.send(
+                f"You've been invited to the Deepiri GitHub org and added as a **maintainer** on "
+                f"`{GITHUB_IT_TEAM_SLUG}` (GitHub: `{github_username}`). Check your GitHub notifications "
+                "or https://github.com/settings/organizations to accept the invite."
+            )
+        except discord.Forbidden:
+            pass
+        except Exception:
+            logger.exception("Failed to DM %s the GitHub IT team invite confirmation", after.id)
+
+        if STAFF_CHANNEL_ID is not None:
+            staff_channel = await _channel_from_id(STAFF_CHANNEL_ID)
+            if staff_channel:
+                try:
+                    await staff_channel.send(
+                        f"Auto-invited `{github_username}` ({after.mention}) to GitHub org `{GITHUB_ORG}` "
+                        f"and added as maintainer on `{GITHUB_IT_TEAM_SLUG}` (IT/Support Operations role grant)."
+                    )
+                except Exception:
+                    logger.warning("Could not post GitHub IT auto-invite log to staff channel %s", STAFF_CHANNEL_ID)
 
 
 @bot.event
