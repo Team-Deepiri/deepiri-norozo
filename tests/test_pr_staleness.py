@@ -194,6 +194,36 @@ async def test_falls_back_to_plaky_email_reverse_lookup(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_plaky_email_local_part_matched_against_discord_when_not_self_reported(monkeypatch):
+    """Real incident: Plaky confidently matches GitHub login "SuperHuyGaming"
+    (real name "Huy Truong") to a real email on file -- but that email was
+    never self-reported into our own member_emails store, so
+    find_discord_id_by_email 404s. Plaky's own match IS the confirmation this
+    is really this person's email; the local part ("minhhuyngoctruong") is
+    the person's full name concatenated and should still be tried against the
+    guild roster rather than giving up just because our separate self-report
+    store doesn't independently also know it."""
+    monkeypatch.setattr(main, "_load_github_username_map", lambda: {})
+    monkeypatch.setattr(main, "GITHUB_PAT", "fake")
+    monkeypatch.setattr(main, "get_user_profile", lambda login, pat: {"name": "Huy Truong", "email": None})
+    monkeypatch.setattr(main, "PLAKY_API_KEY", "fake-plaky-key")
+    monkeypatch.setattr(main, "find_user_email", lambda names, key: "minhhuyngoctruong@gmail.com")
+    monkeypatch.setattr(main, "find_discord_id_by_email", AsyncMock(return_value=None))
+    remember_mock = Mock()
+    monkeypatch.setattr(main, "_remember_github_username", remember_mock)
+
+    member = _member(id_=55, display_name="minhhuyngoctruong")
+    member.global_name = None
+    member.name = "unrelated_handle"
+    guild = SimpleNamespace(get_member=lambda uid: None, members=[member])
+
+    result = await main._resolve_discord_member_for_github_login("SuperHuyGaming", guild)
+
+    assert result is member
+    remember_mock.assert_called_once_with(55, "SuperHuyGaming")
+
+
+@pytest.mark.asyncio
 async def test_no_confident_match_returns_none(monkeypatch):
     monkeypatch.setattr(main, "_load_github_username_map", lambda: {})
     monkeypatch.setattr(main, "GITHUB_PAT", None)
