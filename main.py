@@ -1238,6 +1238,17 @@ def _is_qa_role_name(name: str) -> bool:
     return "quality assurance" in n or re.search(r"\bqa\b", n) is not None
 
 
+def _is_qa_lead_role_name(name: str) -> bool:
+    """Subset of _is_qa_role_name for the "QA Lead" tier specifically -- Discord
+    roles named like "QA Lead" or "Quality Assurance Lead" get maintainer
+    access on GITHUB_SUPPORT_TEAM_SLUG instead of the plain member access every
+    other QA role name (e.g. "QA Engineer") gets."""
+    n = (name or "").strip().lower()
+    if not n:
+        return False
+    return "quality assurance lead" in n or re.search(r"\bqa\s+lead\b", n) is not None
+
+
 async def _resolve_github_username_for_role_sync(member: discord.Member) -> Optional[str]:
     """Full identity-resolution chain for a Discord role -> GitHub team auto-sync,
     same three sources used for the offboarding kick-out flow (in that order of
@@ -1829,6 +1840,7 @@ async def on_member_update(before: discord.Member, after: discord.Member) -> Non
     # isn't set at all, so the GitHub support-team sync must not depend on it.
     # Matches "QA", "QA Engineer", "Quality Assurance", etc. by role name alone.
     qa_triggered = any(_is_qa_role_name(r.name) for r in added_roles)
+    qa_lead_triggered = any(_is_qa_lead_role_name(r.name) for r in added_roles)
 
     it_triggered = False
     if IT_OPERATIONS_SUPPORT_ROLE_ID is not None and IT_OPERATIONS_SUPPORT_ROLE_ID in added:
@@ -1842,14 +1854,17 @@ async def on_member_update(before: discord.Member, after: discord.Member) -> Non
     if not qa_triggered and not it_triggered:
         return
 
-    # QA -> support-team (regular member; no identity-chain/invite needed here,
-    # unchanged from before -- only the IT branch below gained the full chain).
+    # QA -> support-team: "QA Lead" gets maintainer access on the team, every
+    # other QA-shaped role name ("QA Engineer", bare "QA", ...) gets plain
+    # member access. No identity-chain/invite needed here, unchanged from
+    # before -- only the IT branch below gained the full chain.
     if qa_triggered:
+        qa_role = "maintainer" if qa_lead_triggered else "member"
         github_username = _get_github_username_for_member(after)
         if not github_username:
             logger.info("Member %s gained QA role but no GitHub username mapping found, skipping team sync", after.id)
         else:
-            logger.info("Syncing %s (%s) to GitHub team %s for QA role", after, github_username, GITHUB_SUPPORT_TEAM_SLUG)
+            logger.info("Syncing %s (%s) to GitHub team %s for QA role as %s", after, github_username, GITHUB_SUPPORT_TEAM_SLUG, qa_role)
             try:
                 result = await asyncio.to_thread(
                     add_user_to_team,
@@ -1857,6 +1872,7 @@ async def on_member_update(before: discord.Member, after: discord.Member) -> Non
                     github_org=GITHUB_ORG,
                     github_pat=GITHUB_PAT,
                     team_slug=GITHUB_SUPPORT_TEAM_SLUG,
+                    role=qa_role,
                 )
                 if not result.get("ok"):
                     logger.warning("Failed to add %s to support team: %s", github_username, result.get("message"))
@@ -3625,36 +3641,13 @@ def _create_and_register_bot() -> DeepiriBot:
 
     @new_bot.event  # type: ignore[attr-defined]
     async def on_member_update(before: discord.Member, after: discord.Member) -> None:  # type: ignore[no-redef]
-        if not GITHUB_ORG or not GITHUB_PAT:
-            return
-        before_roles = {r.id for r in before.roles}
-        after_roles = {r.id for r in after.roles}
-        added = after_roles - before_roles
-        if not added:
-            return
-        github_username = _get_github_username_for_member(after)
-        if not github_username:
-            logger.info("Member %s gained roles %s but no GitHub username mapping found, skipping team sync", after.id, added)
-            return
-        added_roles = [r for r in after.roles if r.id in added]
-        added_names_lower = {r.name.strip().lower() for r in added_roles}
-        qa_triggered = (QA_ROLE_ID is not None and QA_ROLE_ID in added) or (QA_ROLE_ID is None and ("qa" in added_names_lower or "quality assurance" in added_names_lower))
-        it_candidates = {"it operations support", "support operations", "it", "it-management", "security it", "it operations", "support operations and security it"}
-        it_triggered = (IT_OPERATIONS_SUPPORT_ROLE_ID is not None and IT_OPERATIONS_SUPPORT_ROLE_ID in added) or (IT_OPERATIONS_SUPPORT_ROLE_ID is None and bool(added_names_lower & it_candidates))
-        if qa_triggered:
-            try:
-                result = await asyncio.to_thread(add_user_to_team, username=github_username, github_org=GITHUB_ORG, github_pat=GITHUB_PAT, team_slug=GITHUB_SUPPORT_TEAM_SLUG)
-                if not result.get("ok"):
-                    logger.warning("Failed to add %s to support team: %s", github_username, result.get("message"))
-            except Exception:
-                logger.exception("Exception syncing QA to GitHub team")
-        if it_triggered:
-            try:
-                result = await asyncio.to_thread(add_user_to_team, username=github_username, github_org=GITHUB_ORG, github_pat=GITHUB_PAT, team_slug=GITHUB_IT_TEAM_SLUG)
-                if not result.get("ok"):
-                    logger.warning("Failed to add %s to IT team: %s", github_username, result.get("message"))
-            except Exception:
-                logger.exception("Exception syncing IT to GitHub team")
+        # Delegates to the primary bot's on_member_update instead of keeping a
+        # second copy of the QA/IT GitHub-team sync logic in sync by hand --
+        # this retry-path bot had drifted stale (missing the IT-maintainer
+        # sync, the identity-resolution chain, and the QA Lead/Engineer role
+        # split) precisely because a duplicate is easy to update in one place
+        # and forget in the other.
+        await globals()["on_member_update"](before, after)
 
     @new_bot.event  # type: ignore[attr-defined]
     async def on_message(message: discord.Message) -> None:  # type: ignore[no-redef]
