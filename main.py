@@ -1375,6 +1375,23 @@ async def _resolve_discord_member_for_github_login(login: str, guild: discord.Gu
                     logger.info("PR staleness identity: matched GitHub %s -> Plaky email %s -> Discord %s", login, plaky_email, member.id)
                     return member
 
+            # find_discord_id_by_email only finds a hit if someone self-reported
+            # this exact email at onboarding -- but Plaky itself already
+            # confirmed the email belongs to this person (a real, independent
+            # identity source, not a guess), so a missing self-report shouldn't
+            # be a dead end. The email's local part is very often the person's
+            # real name concatenated (e.g. "minhhuyngoctruong@gmail.com" for
+            # "Huy Truong") -- worth one more fuzzy-match pass against the same
+            # guild roster before giving up.
+            if candidate_names:
+                email_local_part = plaky_email.split("@", 1)[0]
+                m = best_match(email_local_part, candidate_names)
+                if m is not None:
+                    member = candidate_members[m.index]
+                    await _remember_identity(member.id, login, member)
+                    logger.info("PR staleness identity: matched GitHub %s -> Plaky email %s local-part -> Discord %s", login, plaky_email, member.id)
+                    return member
+
     logger.warning("PR staleness identity: could not resolve GitHub login %s to any Discord member", login)
     return None
 
