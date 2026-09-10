@@ -680,11 +680,46 @@ async def _maybe_handle_plaky_pending_email_reply(message: discord.Message) -> b
     return True
 
 
+PLAKY_ASK_HISTORY_SCAN_LIMIT = 15
+
+
+async def _thread_had_prior_plaky_ask(channel: object) -> bool:
+    """Scans this ticket thread's own message history for a prior Norozo
+    message about the Plaky invite -- Discord's message history is durable
+    across bot restarts, unlike PENDING_PLAKY_EMAIL_THREADS. This is what
+    scopes a bare-email reply to "this is a Plaky correction/answer" instead
+    of firing on any unrelated email someone happens to type into a
+    support-ticket thread. A short, recent-message limit is enough: the
+    Plaky ask/status message is always one of the last few things Norozo
+    said in a ticket thread, never buried under dozens of replies."""
+    try:
+        async for msg in channel.history(limit=PLAKY_ASK_HISTORY_SCAN_LIMIT):
+            if getattr(msg.author, "bot", False) and "plaky" in (msg.content or "").lower():
+                return True
+    except Exception:
+        logger.exception("Failed scanning thread %s for a prior Plaky ask", getattr(channel, "id", "?"))
+    return False
+
+
 async def _maybe_handle_plaky_add_request(message: discord.Message) -> bool:
     """Support-ticket intent: 'I want to add someone to the Plaky' /
     'I need to be added to Plaky'. Resolves who's being added (mention wins,
     then self, then a named member, then ask), resolves the email, invites, or
-    starts an in-thread ask for the address. Returns True when it handled it."""
+    starts an in-thread ask for the address. Returns True when it handled it.
+
+    Also handles a message that's PURELY a bare email address, with no
+    "plaky" keyword at all, when it's a reply in a thread that already had a
+    Plaky email ask -- deliberately NOT gated behind
+    PENDING_PLAKY_EMAIL_THREADS (an in-memory dict that a bot
+    restart/redeploy wipes clean; real incident: a requester replied with
+    their corrected email hours after the original ask, the process had
+    recycled in between, and the reply was silently dropped because nothing
+    remembered it was waiting). Instead, scoped by scanning the thread's own
+    message history for a prior Norozo Plaky-ask -- Discord's history is
+    durable across restarts, our in-memory dict isn't. Deliberately NOT "any
+    bare email in any support-ticket thread": a member could type their
+    email into a ticket for a completely unrelated reason, and a bare email
+    alone shouldn't be enough on its own without that thread-scoped context."""
     if message.guild is None or message.author.bot:
         return False
     if not isinstance(message.author, discord.Member):
@@ -692,7 +727,14 @@ async def _maybe_handle_plaky_add_request(message: discord.Message) -> bool:
     if not _is_support_sessions_channel(message.channel):
         return False
     content = (message.content or "").strip()
-    if not content or not _is_plaky_add_intent(content):
+    if not content:
+        return False
+    bare_email = _email_from_text(content)
+    is_bare_email_reply = bool(bare_email and bare_email == content)
+    if is_bare_email_reply:
+        if not await _thread_had_prior_plaky_ask(message.channel):
+            return False
+    elif not _is_plaky_add_intent(content):
         return False
 
     guild = message.guild

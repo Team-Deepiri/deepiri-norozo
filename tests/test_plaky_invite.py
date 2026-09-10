@@ -35,7 +35,11 @@ def _member(discord_id: int = 42, name: str = "jane"):
     return m
 
 
-def _ticket_channel(thread_id: int, parent_id: int = 100):
+def _ticket_channel(thread_id: int, parent_id: int = 100, history_messages=None):
+    async def _history(limit=None):
+        for msg in (history_messages or []):
+            yield msg
+
     channel = SimpleNamespace(
         id=thread_id,
         parent_id=parent_id,
@@ -43,6 +47,7 @@ def _ticket_channel(thread_id: int, parent_id: int = 100):
         get_thread=lambda mid: None,
         fetch_message=AsyncMock(return_value=SimpleNamespace(thread=None)),
         send=AsyncMock(),
+        history=_history,
     )
     return channel
 
@@ -256,6 +261,52 @@ async def test_add_request_self_asks_for_email_in_thread(monkeypatch):
     assert "email" in "".join(str(c.args) for c in channel.send.call_args_list).lower()
 
     assert main.PENDING_PLAKY_EMAIL_THREADS.get(555, {}).get("discord_id") == 42
+
+
+@pytest.mark.asyncio
+async def test_bare_email_reply_works_even_after_a_restart_wiped_pending_state(monkeypatch):
+    """Real incident: a requester replied with their corrected email hours
+    after the original ask; the bot process had recycled (a deploy) in
+    between, wiping PENDING_PLAKY_EMAIL_THREADS clean, and the bare-email
+    reply was silently dropped. Scoped by the thread's own message history
+    (a prior Norozo message mentioning "plaky") instead of in-memory state
+    that a restart can't survive -- no pending entry needed here at all."""
+    member = _member()
+    prior_bot_message = SimpleNamespace(author=SimpleNamespace(bot=True), content="For the Plaky board invite, your email joeblacky@deepiri.com is already in the workspace...")
+    channel = _ticket_channel(thread_id=555, history_messages=[prior_bot_message])
+    message = _ticket_message(member, channel, "joeblack@deepiri.com")
+    monkeypatch.setattr(main, "SUPPORT_SESSIONS_CHANNEL_ID", 100)
+    monkeypatch.setattr(main, "GITHUB_PROFILES_CHANNEL_ID", None)
+    monkeypatch.setattr(main, "PLAKY_API_KEY", None)
+    bridge_invite = AsyncMock(return_value={"success": True, "via": "cake"})
+    monkeypatch.setattr(main, "call_plaky_bridge_invite", bridge_invite)
+    # No pending-ask entry registered anywhere -- simulating the post-restart state.
+
+    handled = await main._maybe_handle_plaky_add_request(message)
+
+    assert handled is True
+    bridge_invite.assert_awaited_once_with("joeblack@deepiri.com", role="MEMBER")
+
+
+@pytest.mark.asyncio
+async def test_bare_email_in_thread_without_a_prior_plaky_ask_is_ignored(monkeypatch):
+    """The other half of the fix: a bare email typed into a support-ticket
+    thread for a totally unrelated reason must NOT be treated as a Plaky
+    correction just because it's the only thing in the message -- only a
+    thread that already had a Norozo Plaky ask qualifies."""
+    member = _member()
+    unrelated_bot_message = SimpleNamespace(author=SimpleNamespace(bot=True), content="We gave you access to the rest of the Discord.")
+    channel = _ticket_channel(thread_id=556, history_messages=[unrelated_bot_message])
+    message = _ticket_message(member, channel, "someone@example.com")
+    monkeypatch.setattr(main, "SUPPORT_SESSIONS_CHANNEL_ID", 100)
+    monkeypatch.setattr(main, "GITHUB_PROFILES_CHANNEL_ID", None)
+    bridge_invite = AsyncMock()
+    monkeypatch.setattr(main, "call_plaky_bridge_invite", bridge_invite)
+
+    handled = await main._maybe_handle_plaky_add_request(message)
+
+    assert handled is False
+    bridge_invite.assert_not_awaited()
 
 
 @pytest.mark.asyncio
