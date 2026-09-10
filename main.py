@@ -32,9 +32,7 @@ from plaky import create_task, find_user_email, get_tasks
 from plaky_invite import (
     call_plaky_bridge_invite,
     call_plaky_bridge_kick,
-    get_user_data,
     is_valid_email,
-    migrate_user_data_json_to_postgres,
     persist_member_email,
     remember_user_data,
     resolve_member_email,
@@ -284,30 +282,32 @@ GITHUB_RESERVED_PATHS = {
     "trending",
 }
 
-USER_DATA_PATH = Path("user_data.json")
 pending_email_requests = {}  # user_id -> True (we only track pending state)
 
-
-def _load_user_data() -> dict:
-    try:
-        if not USER_DATA_PATH.exists():
-            return {}
-        raw = USER_DATA_PATH.read_text(encoding="utf-8").strip() or "{}"
-        data = json.loads(raw)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        logger.exception("Failed to load user data")
-        return {}
+# In-memory, THIS-PROCESS-ONLY cache of discord_id(str) -> github_username,
+# purely a same-session speed-up for _load_github_username_map's fast-path
+# reverse lookup and _get_github_username_for_member's guess. Deliberately
+# NOT disk-backed: this service's Render deployment has no persistent disk
+# (see plaky_invite's module docstring), so a JSON file here would silently
+# reset to nothing on every restart anyway while *looking* like a durable
+# cache -- an honest in-memory dict makes the same tradeoff (lost on
+# restart) without pretending otherwise. Postgres (via
+# plaky_invite.remember_user_data) remains the only durable store.
+_GITHUB_USERNAME_SESSION_CACHE: Dict[str, str] = {}
 
 
 async def _remember_user_data(discord_id: int, github_username: str = None, email: str = None, overwrite: bool = True) -> None:
-    """Thin wrapper over plaky_invite.remember_user_data (Postgres primary +
-    local JSON backup) -- kept for call-site compatibility with the many
+    """Thin wrapper over plaky_invite.remember_user_data (Postgres, the only
+    durable store) -- kept for call-site compatibility with the many
     existing `_remember_user_data(...)` calls in this file. Every caller here
     is the user (or staff) directly, explicitly telling Norozo this value
     right now (a self-reported email/GitHub link, an explicit
     /github-invite-request username) -- overwrite defaults True since that's
-    always a deliberate correction, not an opportunistic guess."""
+    always a deliberate correction, not an opportunistic guess. Also updates
+    the in-memory session cache so this process's own fast-path lookups see
+    it immediately, without waiting on a round trip back to Postgres."""
+    if github_username:
+        _GITHUB_USERNAME_SESSION_CACHE[str(discord_id)] = github_username.strip().lower()
     await remember_user_data(
         discord_id,
         github_username=github_username,
@@ -534,11 +534,8 @@ async def _find_member_by_name(guild: Optional[discord.Guild], name: str) -> Opt
 
 
 async def _resolve_github_for_member(discord_id: int, member: Optional[discord.Member] = None) -> Optional[str]:
-    """GitHub identity for the invite chain: local user_data first, then the
-    platform cloud DB, then the existing github_username_map (needs the member)."""
-    entry = get_user_data(discord_id)
-    if entry.get("github_username"):
-        return entry["github_username"]
+    """GitHub identity for the invite chain: platform cloud DB first, then
+    the in-memory session cache / name-heuristic guess (needs the member)."""
     cloud = await load_member_profile(discord_id)
     if cloud.get("github_username"):
         return cloud["github_username"]
@@ -1068,22 +1065,15 @@ def _is_valid_announcement_signature(raw_body: bytes, signature_header: str, sec
 
 
 def _load_github_username_map() -> dict:
-    """Full-table discord_id->github_username reverse index for the fast
-    path in _resolve_discord_member_for_github_login. Reads from the local
-    user_data.json backup mirror -- deliberately NOT the Postgres
-    member_emails table, since the platform webhook API only supports
-    lookup by a single discord_id, not "list every row" the way this needs.
-    Checks both "github_username" (current field name, written by
-    plaky_invite.remember_user_data) and the legacy "github" key (written by
-    this file's own _remember_user_data before the Postgres cutover) so
-    entries recorded before this change still resolve."""
-    data = _load_user_data()
-    return {k: (v.get("github_username") or v.get("github") or "") for k, v in data.items() if v.get("github_username") or v.get("github")}
-
-
-def _save_github_username_map(mapping: dict) -> None:
-    """Legacy wrapper — no-op; prefer _remember_user_data."""
-    pass
+    """discord_id->github_username reverse index for the fast path in
+    _resolve_discord_member_for_github_login. Backed by
+    _GITHUB_USERNAME_SESSION_CACHE (this process's in-memory-only cache,
+    not Postgres) since the platform webhook API only supports lookup by a
+    single discord_id, not "list every row" the way a full-table reverse
+    scan needs. A cache miss here just means step 1 of that resolver skips
+    straight to its own fuzzy-match steps -- not a hard failure, since
+    Postgres is still checked per-person elsewhere in the chain."""
+    return dict(_GITHUB_USERNAME_SESSION_CACHE)
 
 
 async def _remember_github_username(discord_id: int, github_username: str) -> None:
@@ -1137,10 +1127,9 @@ def _get_github_username_for_member(member: discord.Member) -> Optional[str]:
     The name fallback is not authoritative. Critical operations should first collect
     an explicit mapping through ``/github-invite-request``.
     """
-    data = _load_user_data()
-    entry = data.get(str(member.id))
-    if entry and (entry.get("github_username") or entry.get("github")):
-        return entry.get("github_username") or entry.get("github")
+    cached = _GITHUB_USERNAME_SESSION_CACHE.get(str(member.id))
+    if cached:
+        return cached
     # Fallback: try display name or global name if it looks like a github username
     for candidate in [getattr(member, "global_name", None), getattr(member, "display_name", None), str(member.name) if hasattr(member, "name") else None]:
         if candidate and GITHUB_USERNAME_RE.match(candidate.strip()) and candidate.strip().lower() not in GITHUB_RESERVED_PATHS:
@@ -3796,11 +3785,6 @@ def _create_and_register_bot() -> DeepiriBot:
         asyncio.create_task(_heartbeat_last_online())
         asyncio.create_task(_pr_staleness_scan_loop())
         asyncio.create_task(_security_assessment_loop())
-        # One-time (idempotent -- safe every restart) backfill of anything
-        # still only in the local user_data.json backup mirror into
-        # Postgres, now the primary identity store. See
-        # migrate_user_data_json_to_postgres's docstring.
-        asyncio.create_task(migrate_user_data_json_to_postgres())
 
     @new_bot.event  # type: ignore[attr-defined]
     async def on_member_join(member: discord.Member) -> None:  # type: ignore[no-redef]

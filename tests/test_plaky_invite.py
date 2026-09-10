@@ -1,6 +1,8 @@
 """Plaky invite pipeline: support-ticket 'add to plaky' intent parsing, the
-ordered email-resolution chain (local -> cloud DB -> GitHub -> Plaky roster),
-in-thread email asks, and routing invites through the headless bridge."""
+ordered email-resolution chain (cloud DB -> GitHub -> Plaky roster -- see
+plaky_invite's module docstring for why there's no local-JSON step any
+more), in-thread email asks, and routing invites through the headless
+bridge."""
 
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -12,9 +14,12 @@ import plaky_invite
 
 
 @pytest.fixture(autouse=True)
-def _user_data_tmp(monkeypatch, tmp_path):
-    """Keep every test's identity writes out of the repo working tree."""
-    monkeypatch.setattr(plaky_invite, "USER_DATA_PATH", tmp_path / "user_data.json")
+def _cloud_identity_stub(monkeypatch):
+    """Default no-op cloud stubs so tests that don't care about identity
+    resolution/persistence don't make real HTTP calls -- individual tests
+    override these with their own mocks/assertions as needed."""
+    monkeypatch.setattr(plaky_invite, "load_member_profile", AsyncMock(return_value={"email": None, "real_name": None, "github_username": None}))
+    monkeypatch.setattr(plaky_invite, "save_member_identity", AsyncMock(return_value=True))
 
 
 def _member(discord_id: int = 42, name: str = "jane"):
@@ -90,32 +95,18 @@ def test_is_plaky_add_intent_rejects_removal_and_report_noise(text):
 
 
 @pytest.mark.asyncio
-async def test_remember_user_data_never_overwrites_with_none(monkeypatch, tmp_path):
-    from plaky_invite import remember_user_data, get_user_data
+async def test_remember_user_data_never_overwrites_with_none(monkeypatch):
+    from plaky_invite import remember_user_data
 
-    monkeypatch.setattr(plaky_invite, "USER_DATA_PATH", tmp_path / "user_data.json")
-    await remember_user_data(1, email="a@deepiri.com")
-    assert get_user_data(1)["email"] == "a@deepiri.com"
+    monkeypatch.setattr(plaky_invite, "load_member_profile", AsyncMock(return_value={"email": None, "real_name": None, "github_username": None}))
+    save_identity = AsyncMock(return_value=True)
+    monkeypatch.setattr(plaky_invite, "save_member_identity", save_identity)
+
     await remember_user_data(1, email=None, github_username="jane")
-    assert get_user_data(1)["email"] == "a@deepiri.com"
-    assert get_user_data(1)["github_username"] == "jane"
 
-
-@pytest.mark.asyncio
-async def test_remember_user_data_overwrite_flag_replaces_existing_value(monkeypatch, tmp_path):
-    """Real incident: a corrected email ("joeblack@deepiri.com") never
-    replaced the stale one on file ("joeblacky@deepiri.com") because every
-    persistence path funneled through the monotonic-only default. An
-    explicit, deliberate correction (overwrite=True) must always win."""
-    from plaky_invite import remember_user_data, get_user_data
-
-    monkeypatch.setattr(plaky_invite, "USER_DATA_PATH", tmp_path / "user_data.json")
-    await remember_user_data(1, email="joeblacky@deepiri.com")
-    assert get_user_data(1)["email"] == "joeblacky@deepiri.com"
-
-    await remember_user_data(1, email="joeblack@deepiri.com", overwrite=True)
-
-    assert get_user_data(1)["email"] == "joeblack@deepiri.com"
+    save_identity.assert_awaited_once()
+    assert save_identity.await_args.kwargs["email"] is None
+    assert save_identity.await_args.kwargs["github_username"] == "jane"
 
 
 @pytest.mark.asyncio
@@ -213,14 +204,16 @@ async def test_invite_already_in_workspace_flags_reused_email_too(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_invite_explicit_email_persists_even_when_bridge_says_already(monkeypatch, tmp_path):
-    """Real incident, end to end: the stored email is "joeblacky@deepiri.com".
+async def test_invite_explicit_email_persists_even_when_bridge_says_already(monkeypatch):
+    """Real incident, end to end: Postgres has the stale "joeblacky@deepiri.com".
     The requester explicitly corrects it to "joeblack@deepiri.com" -- even
     though the Plaky bridge reports that address as "already" a member too,
-    the CORRECTION ITSELF (what's on file for next time) must still be saved,
-    since the requester explicitly, deliberately gave this exact address."""
-    monkeypatch.setattr(plaky_invite, "USER_DATA_PATH", tmp_path / "user_data.json")
-    await plaky_invite.remember_user_data(42, email="joeblacky@deepiri.com")
+    the CORRECTION ITSELF (what's saved to Postgres for next time) must
+    still go through, since the requester explicitly, deliberately gave
+    this exact address."""
+    monkeypatch.setattr(plaky_invite, "load_member_profile", AsyncMock(return_value={"email": "joeblacky@deepiri.com", "real_name": None, "github_username": None}))
+    save_identity = AsyncMock(return_value=True)
+    monkeypatch.setattr(plaky_invite, "save_member_identity", save_identity)
     monkeypatch.setattr(main, "PLAKY_API_KEY", "pk")
     monkeypatch.setattr(main, "call_plaky_bridge_invite", AsyncMock(return_value={"success": False, "already": True}))
 
@@ -230,7 +223,8 @@ async def test_invite_explicit_email_persists_even_when_bridge_says_already(monk
 
     assert status == "already"  # explicitly given, so NOT the "_from_file" variant
     assert email == "joeblack@deepiri.com"
-    assert plaky_invite.get_user_data(42)["email"] == "joeblack@deepiri.com"
+    save_identity.assert_awaited_once()
+    assert save_identity.await_args.kwargs["email"] == "joeblack@deepiri.com"
 
 
 @pytest.mark.asyncio
@@ -522,13 +516,12 @@ async def test_dm_pending_email_reply_ignored_for_other_member(monkeypatch):
     assert 42 in main.PENDING_PLAKY_EMAIL_THREADS
 
 @pytest.mark.asyncio
-async def test_resolve_member_email_checks_cloud_before_local(monkeypatch, tmp_path):
+async def test_resolve_member_email_uses_cloud_as_the_only_durable_source(monkeypatch):
     """Real incident (root cause of the whole "correction never sticks" saga):
-    local user_data.json used to be checked FIRST, so it could permanently
-    shadow a more recent, correct value already sitting in Postgres. Cloud
-    must win whenever it has an answer, regardless of what local also has."""
-    monkeypatch.setattr(plaky_invite, "USER_DATA_PATH", tmp_path / "user_data.json")
-    plaky_invite._save_user_data({"1": {"email": "stale-local@deepiri.com"}})
+    a local user_data.json step used to be checked before -- or as a fallback
+    after -- cloud, and could shadow a more recent, correct value in
+    Postgres. That step is gone entirely now (see plaky_invite's module
+    docstring): cloud is the only source resolve_member_email trusts."""
     monkeypatch.setattr(plaky_invite, "load_member_profile", AsyncMock(return_value={"email": "correct-cloud@deepiri.com", "real_name": None, "github_username": None}))
 
     email = await plaky_invite.resolve_member_email(1)
@@ -537,28 +530,9 @@ async def test_resolve_member_email_checks_cloud_before_local(monkeypatch, tmp_p
 
 
 @pytest.mark.asyncio
-async def test_resolve_member_email_falls_back_to_local_and_backfills_cloud(monkeypatch, tmp_path):
-    """When cloud has nothing yet (not-migrated entry, or a transient outage),
-    local is still a usable fallback -- and finding it there triggers a
-    best-effort backfill so the gap closes for next time."""
-    monkeypatch.setattr(plaky_invite, "USER_DATA_PATH", tmp_path / "user_data.json")
-    plaky_invite._save_user_data({"1": {"email": "local-only@deepiri.com"}})
-    monkeypatch.setattr(plaky_invite, "load_member_profile", AsyncMock(return_value={"email": None, "real_name": None, "github_username": None}))
-    save_identity = AsyncMock(return_value=True)
-    monkeypatch.setattr(plaky_invite, "save_member_identity", save_identity)
-
-    email = await plaky_invite.resolve_member_email(1)
-
-    assert email == "local-only@deepiri.com"
-    save_identity.assert_awaited_once()
-    assert save_identity.await_args.kwargs["email"] == "local-only@deepiri.com"
-
-
-@pytest.mark.asyncio
-async def test_remember_user_data_writes_cloud_with_overwrite_semantics(monkeypatch, tmp_path):
+async def test_remember_user_data_writes_cloud_with_overwrite_semantics(monkeypatch):
     """overwrite=False must not clobber a value Postgres already has (one
     extra GET first); overwrite=True must always send the new value."""
-    monkeypatch.setattr(plaky_invite, "USER_DATA_PATH", tmp_path / "user_data.json")
     monkeypatch.setattr(plaky_invite, "load_member_profile", AsyncMock(return_value={"email": "existing@deepiri.com", "real_name": None, "github_username": None}))
     save_identity = AsyncMock(return_value=True)
     monkeypatch.setattr(plaky_invite, "save_member_identity", save_identity)
@@ -569,44 +543,3 @@ async def test_remember_user_data_writes_cloud_with_overwrite_semantics(monkeypa
     await plaky_invite.remember_user_data(1, email="new@deepiri.com", overwrite=True)
     save_identity.assert_awaited_once()
     assert save_identity.await_args.kwargs["email"] == "new@deepiri.com"
-
-
-@pytest.mark.asyncio
-async def test_migrate_user_data_json_to_postgres_fills_gaps_without_clobbering(monkeypatch, tmp_path):
-    """The startup backfill: existing Postgres rows are never touched
-    (overwrite=False under the hood), only genuinely-missing fields get
-    filled in from the local backup mirror."""
-    monkeypatch.setattr(plaky_invite, "USER_DATA_PATH", tmp_path / "user_data.json")
-    plaky_invite._save_user_data({
-        "1": {"email": "already-migrated@deepiri.com"},
-        "2": {"github_username": "needs-migrating"},
-        "not-an-id": {"email": "skip-me@deepiri.com"},
-    })
-    profiles = {
-        1: {"email": "already-migrated@deepiri.com", "real_name": None, "github_username": None},
-        2: {"email": None, "real_name": None, "github_username": None},
-    }
-    save_identity = AsyncMock(return_value=True)
-
-    async def fake_load(discord_id):
-        return dict(profiles.get(discord_id, {"email": None, "real_name": None, "github_username": None}))
-
-    async def fake_save(discord_id, **kwargs):
-        if kwargs.get("github_username"):
-            profiles[discord_id]["github_username"] = kwargs["github_username"]
-        return await save_identity(discord_id, **kwargs)
-
-    monkeypatch.setattr(plaky_invite, "load_member_profile", fake_load)
-    monkeypatch.setattr(plaky_invite, "save_member_identity", fake_save)
-
-    summary = await plaky_invite.migrate_user_data_json_to_postgres()
-
-    assert summary["total"] == 3
-    assert summary["migrated"] == 1  # only discord_id 2 actually changed
-    # Explicit non-overwrite check: discord_id 1 already has an email in
-    # Postgres, so no call is ever made for it -- save_identity's single
-    # call, asserted below, is for discord_id 2's github_username only.
-    save_identity.assert_awaited_once()
-    assert save_identity.await_args.args[0] == 2
-    assert save_identity.await_args.kwargs["github_username"] == "needs-migrating"
-    assert save_identity.await_args.kwargs["email"] is None

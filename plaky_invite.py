@@ -10,37 +10,31 @@ Emails are resolved through an ordered trust chain:
 
     1. Platform cloud DB  -- member_email_store's member_emails table on
                             platform.deepiri.com (Postgres, via the signed
-                            webhook channel), the PRIMARY store. Survives bot
-                            container recycles and is the only store every
-                            write path keeps correctly overwritten.
-    2. user_data.json     -- local backup mirror, checked only when the cloud
-                            lookup comes up empty (a transient outage, or an
-                            entry not yet migrated -- see
-                            migrate_user_data_json_to_postgres below). Never
-                            the primary source any more: real incident, when
-                            it WAS checked first, a corrected email could
-                            never actually take effect because the stale
-                            local copy always won the race.
-    3. GitHub profile     -- public email on a self-reported GitHub link.
-    4. Plaky roster fuzzy -- find_user_email matching GitHub real name/login +
+                            webhook channel), the ONLY durable store. Survives
+                            bot container recycles.
+    2. GitHub profile     -- public email on a self-reported GitHub link.
+    3. Plaky roster fuzzy -- find_user_email matching GitHub real name/login +
                             Discord display/global/username against the Plaky
                             workspace roster (only meaningful for existing
                             members, never for a brand-new invite).
 
-Every email the bot ever sees is persisted into BOTH the cloud DB and
-user_data.json (the local write is now purely a backup/full-table-scan
-source -- see get_user_data's docstring), so the chain only gets stronger
-over time. The bridge is deliberately left as the ground truth for whether
-an address is already in the workspace -- an invite attempt to an existing
-address fails fast with "Already ..." rather than being speculated on here.
+There used to be a local user_data.json step between 1 and 2, framed as a
+"backup mirror" -- removed entirely. Turned out this service's Render
+deployment has no persistent disk: the file is baked into the container
+image at build time (Dockerfile's `COPY . .`) and reset to that exact
+git-committed snapshot on every single restart/redeploy, which happens on
+every merge. Any write the running bot made to it during its lifetime was
+gone the moment the container recycled -- it was never actually a backup of
+anything, on top of having caused the real bug this whole chain fix started
+from (checking it before cloud let a stale local copy permanently shadow a
+correct cloud value). Postgres has been the only thing that actually
+persists across restarts the entire time.
 """
 
 import asyncio
-import json
 import logging
 import os
 import re
-from pathlib import Path
 from typing import List, Optional
 
 import httpx
@@ -57,11 +51,7 @@ INTERNAL_SERVICE_SECRET = os.getenv("INTERNAL_SERVICE_SECRET", "").strip()
 GITHUB_PAT = os.getenv("GITHUB_PAT", "").strip() or os.getenv("GITHUB_TOKEN", "").strip()
 PLAKY_API_KEY = os.getenv("PLAKY_API_KEY", "").strip() or os.getenv("PLAKY_API_TOKEN", "").strip()
 
-USER_DATA_PATH = Path(os.getenv("USER_DATA_FILE", "user_data.json"))
-
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
-
-_user_data_lock = asyncio.Lock()
 
 
 def is_valid_email(text: Optional[str]) -> bool:
@@ -75,66 +65,6 @@ def is_valid_email(text: Optional[str]) -> bool:
     return EMAIL_RE.fullmatch(candidate) is not None
 
 
-def _load_user_data() -> dict:
-    try:
-        if not USER_DATA_PATH.exists():
-            return {}
-        data = json.loads(USER_DATA_PATH.read_text(encoding="utf-8") or "{}")
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        logger.exception("Failed to load user data from %s", USER_DATA_PATH)
-        return {}
-
-
-def _save_user_data(data: dict) -> None:
-    try:
-        USER_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = USER_DATA_PATH.with_suffix(f"{USER_DATA_PATH.suffix}.tmp")
-        temporary_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        temporary_path.replace(USER_DATA_PATH)
-    except Exception:
-        logger.exception("Failed to save user data to %s", USER_DATA_PATH)
-
-
-def get_user_data(discord_id: int) -> dict:
-    """Local per-member record: {email, github_username, real_name, recorded_at}.
-    This is now a BACKUP mirror only -- platform.deepiri.com's Postgres
-    member_emails table (member_email_store.load_member_profile) is the
-    primary source of truth. Kept around as: (1) a fallback when the cloud
-    lookup is briefly unreachable, and (2) the source for the one thing
-    Postgres genuinely can't do today -- a full-table reverse scan (see
-    main.py's _load_github_username_map), since the webhook API only
-    supports lookup by a single discord_id, not "list every row" or
-    "find by github_username"."""
-    entry = _load_user_data().get(str(discord_id))
-    return entry if isinstance(entry, dict) else {}
-
-
-def _remember_user_data_local(
-    discord_id: int,
-    *,
-    email: Optional[str] = None,
-    github_username: Optional[str] = None,
-    real_name: Optional[str] = None,
-    overwrite: bool = False,
-) -> None:
-    """Local-JSON half of remember_user_data -- kept as an always-on backup
-    write (never the primary store any more, see get_user_data's docstring)."""
-    data = _load_user_data()
-    key = str(discord_id)
-    entry = data.get(key) if isinstance(data.get(key), dict) else {}
-    data[key] = entry
-    for field, value in {
-        "email": email,
-        "github_username": github_username,
-        "real_name": real_name,
-    }.items():
-        if value and (overwrite or not entry.get(field)):
-            entry[field] = value
-    entry["recorded_at"] = entry.get("recorded_at") or _now_iso()
-    _save_user_data(data)
-
-
 async def remember_user_data(
     discord_id: int,
     *,
@@ -145,33 +75,21 @@ async def remember_user_data(
     overwrite: bool = False,
 ) -> None:
     """Merge newly-confirmed facts into platform.deepiri.com's Postgres
-    member_emails table (the primary store) AND the local user_data.json
-    backup mirror. By default never overwrites an existing value -- an
-    opportunistic background capture (a name spotted while scraping a
-    GitHub profile, a fuzzy Plaky-roster guess) shouldn't clobber a
-    previously-confirmed real value.
+    member_emails table -- the only durable store (see module docstring for
+    why the local-JSON "backup" was removed). By default never overwrites an
+    existing value -- an opportunistic background capture (a name spotted
+    while scraping a GitHub profile, a fuzzy Plaky-roster guess) shouldn't
+    clobber a previously-confirmed real value.
 
     Pass overwrite=True when the person EXPLICITLY, deliberately supplied
     this value in the current request -- that's a correction, not a guess,
-    and must always win. Real incident this fixed: a corrected email
-    ("joeblack@deepiri.com") replied in response to "that's the email
-    already on file, reply with a different one if wrong" never actually
-    got saved, because every persistence path funneled through the old
-    monotonic-only, LOCAL-ONLY version of this function -- the correction
-    was silently discarded and the next lookup kept returning the original
-    stale ("joeblacky@...") address forever, with no way to ever fix it.
-    Moving to Postgres as primary fixes this at the root: the platform's
-    own upsert (`COALESCE(EXCLUDED.x, member_emails.x)`) already overwrites
+    and must always win. Postgres's own upsert
+    (`COALESCE(EXCLUDED.x, member_emails.x)`) already overwrites
     unconditionally whenever a non-null value is sent, so overwrite=True
     here just means "send the value"; overwrite=False means "only send it
     if Postgres doesn't already have one" (one extra read first)."""
-    # Normalized once here, the single canonical write path, rather than
-    # separately by each caller (main.py's _remember_user_data wrapper used
-    # to duplicate this same .lower()/.strip() -- one copy avoids drift).
     email = email.lower().strip() if email else None
     github_username = github_username.lower().strip() if github_username else None
-
-    _remember_user_data_local(discord_id, email=email, github_username=github_username, real_name=real_name, overwrite=overwrite)
 
     payload_email, payload_github, payload_real_name = email, github_username, real_name
     if not overwrite and (email or github_username or real_name):
@@ -190,12 +108,6 @@ async def remember_user_data(
             real_name=payload_real_name,
             github_username=payload_github,
         )
-
-
-def _now_iso() -> str:
-    import datetime
-
-    return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
 async def call_plaky_bridge_invite(email: str, role: str = "MEMBER") -> dict:
@@ -260,28 +172,14 @@ async def resolve_member_email(
 ) -> Optional[str]:
     """Ordered trust chain for one member's Plaky invite email. Returns the
     first confirmed address found, or None when nothing is known yet (callers
-    then ask the person in-thread rather than guessing).
-
-    Cloud (platform.deepiri.com's Postgres member_emails table) is checked
-    FIRST -- it's the primary store and the only one every write path keeps
-    correctly overwritten (see remember_user_data). Local user_data.json is
-    now only a fallback for when the cloud lookup is briefly unreachable,
-    not a source that can shadow a more recent cloud correction the way it
-    used to (real incident: local being checked first meant a corrected
-    email could never actually take effect, even after the write itself
-    succeeded)."""
+    then ask the person in-thread rather than guessing). Cloud
+    (platform.deepiri.com's Postgres member_emails table) is the only
+    durable store checked -- see module docstring for why there's no local
+    fallback any more."""
     cloud = await load_member_profile(discord_id)
     cloud_email = cloud.get("email")
     if cloud_email:
         return cloud_email
-
-    local = get_user_data(discord_id)
-    local_email = local.get("email")
-    if local_email:
-        # Cloud didn't have it but local backup does -- not yet migrated (or a
-        # transient cloud hiccup). Backfill cloud so this converges for next time.
-        await remember_user_data(discord_id, email=local_email, overwrite=False)
-        return local_email
 
     if github_username and GITHUB_PAT:
         profile = await asyncio.to_thread(get_user_profile, github_username, GITHUB_PAT)
@@ -298,9 +196,8 @@ async def resolve_member_email(
             names.append(github_username)
         if cloud.get("real_name"):
             names.append(cloud["real_name"])
-        known_emails = [local_email, cloud_email]
         match = await asyncio.to_thread(
-            find_user_email, names, api_key, [e for e in known_emails if e]
+            find_user_email, names, api_key, [cloud_email] if cloud_email else []
         )
         if match:
             await remember_user_data(discord_id, email=match)
@@ -310,8 +207,7 @@ async def resolve_member_email(
 
 
 async def persist_member_email(discord_id: int, discord_username: Optional[str], email: str, *, github_username: Optional[str] = None, overwrite: bool = False) -> None:
-    """Save a confirmed email into platform.deepiri.com's Postgres (the
-    primary store) AND the local user_data.json backup mirror, so every
+    """Save a confirmed email into platform.deepiri.com's Postgres, so every
     capture path (onboarding DM, in-thread answer, IPCA sign, staff
     /plaky-invite) feeds the same chain.
 
@@ -326,58 +222,3 @@ async def persist_member_email(discord_id: int, discord_username: Optional[str],
         discord_username=discord_username,
         overwrite=overwrite,
     )
-
-
-async def migrate_user_data_json_to_postgres() -> dict:
-    """One-time (but idempotent -- safe to run on every startup) backfill of
-    whatever's in the local user_data.json backup mirror into
-    platform.deepiri.com's Postgres member_emails table, now the primary
-    store. Never overwrites a value Postgres already has (overwrite=False on
-    every call here) -- this only fills gaps for entries that predate the
-    cutover to cloud-primary reads, it never clobbers a more recent cloud
-    correction with a possibly-stale local value. Safe to call every startup:
-    once every row has been backfilled, every field is already non-empty in
-    Postgres and remember_user_data's own existing-value check makes each
-    call here a fast no-op (one GET, no POST).
-
-    Returns {"total": N, "migrated": N, "skipped": N, "failed": N} for
-    startup-log visibility into whether the backfill actually did anything.
-    """
-    data = _load_user_data()
-    summary = {"total": len(data), "migrated": 0, "skipped": 0, "failed": 0}
-    for key, entry in data.items():
-        if not isinstance(entry, dict):
-            continue
-        try:
-            discord_id = int(key)
-        except (TypeError, ValueError):
-            summary["skipped"] += 1
-            continue
-        email = entry.get("email")
-        github_username = entry.get("github_username") or entry.get("github")
-        real_name = entry.get("real_name")
-        if not (email or github_username or real_name):
-            summary["skipped"] += 1
-            continue
-        try:
-            before = await load_member_profile(discord_id)
-            await remember_user_data(
-                discord_id,
-                email=email,
-                github_username=github_username,
-                real_name=real_name,
-                overwrite=False,
-            )
-            after = await load_member_profile(discord_id)
-            if after != before:
-                summary["migrated"] += 1
-            else:
-                summary["skipped"] += 1
-        except Exception:
-            logger.exception("Failed to migrate user_data.json entry for discord_id %s to Postgres", key)
-            summary["failed"] += 1
-    logger.info(
-        "user_data.json -> Postgres backfill: %s total, %s migrated, %s skipped (already had it), %s failed",
-        summary["total"], summary["migrated"], summary["skipped"], summary["failed"],
-    )
-    return summary
