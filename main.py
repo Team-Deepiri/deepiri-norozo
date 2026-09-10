@@ -680,6 +680,9 @@ async def _maybe_handle_plaky_pending_email_reply(message: discord.Message) -> b
     return True
 
 
+PLAKY_ASK_HISTORY_SCAN_LIMIT = 15
+
+
 async def _thread_had_prior_plaky_ask(channel: object) -> bool:
     """Scans this ticket thread's own message history for a prior Norozo
     message about the Plaky invite -- Discord's message history is durable
@@ -690,7 +693,7 @@ async def _thread_had_prior_plaky_ask(channel: object) -> bool:
     Plaky ask/status message is always one of the last few things Norozo
     said in a ticket thread, never buried under dozens of replies."""
     try:
-        async for msg in channel.history(limit=15):
+        async for msg in channel.history(limit=PLAKY_ASK_HISTORY_SCAN_LIMIT):
             if getattr(msg.author, "bot", False) and "plaky" in (msg.content or "").lower():
                 return True
     except Exception:
