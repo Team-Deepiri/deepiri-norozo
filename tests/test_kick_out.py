@@ -61,6 +61,70 @@ async def test_summary_lands_in_thread_discovered_after_handler_started(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_plaky_kick_falls_back_to_roster_match_when_email_on_file_is_stale(monkeypatch):
+    """Real incident: a member self-reported a garbled email
+    ('ryansaenz@gmaileleler.com') that got persisted as their email on file,
+    then GitHub org removal later resolved their real login during the same
+    kick-out. The bridge kick on the stale email 404s ('User not found in
+    workspace') -- this must retry via the Plaky roster fuzzy match keyed on
+    that GitHub login instead of just reporting failure."""
+    target = SimpleNamespace(id=42)
+    monkeypatch.setattr(main, "_get_github_username_for_member", lambda m: "absolemzz")
+    monkeypatch.setattr(main, "_member_name_hints", lambda m: ["Absolem"])
+    monkeypatch.setattr(main, "resolve_member_email", AsyncMock(return_value="ryansaenz@gmaileleler.com"))
+    monkeypatch.setattr(main, "PLAKY_API_KEY", "test-key")
+
+    kick_calls = []
+
+    async def fake_kick(email):
+        kick_calls.append(email)
+        if email == "ryansaenz@gmaileleler.com":
+            return {"success": False, "not_found": True, "error": "User not found in workspace"}
+        return {"success": True}
+
+    monkeypatch.setattr(main, "call_plaky_bridge_kick", fake_kick)
+    find_user_email_mock = Mock(return_value="ryan.saenzv@gmail.com")
+    monkeypatch.setattr(main, "find_user_email", find_user_email_mock)
+    monkeypatch.setattr(main, "GITHUB_PAT", "test-pat")
+    monkeypatch.setattr(main, "get_user_profile", Mock(return_value={"email": None, "name": "Ryan S."}))
+    remember_mock = AsyncMock()
+    monkeypatch.setattr(main, "remember_user_data", remember_mock)
+
+    result = await main._maybe_handle_plaky_kick_on_kickout(SimpleNamespace(), target)
+
+    assert kick_calls == ["ryansaenz@gmaileleler.com", "ryan.saenzv@gmail.com"]
+    assert "ryan.saenzv@gmail.com" in result
+    assert "stale" in result.lower()
+    remember_mock.assert_awaited_once_with(42, email="ryan.saenzv@gmail.com", overwrite=True)
+    # The raw login alone rarely resembles a Plaky roster entry -- the GitHub
+    # profile's real name ("Ryan S.") must be in the candidate list too.
+    searched_names = find_user_email_mock.call_args[0][0]
+    assert "Ryan S." in searched_names
+    assert "absolemzz" in searched_names
+
+
+@pytest.mark.asyncio
+async def test_plaky_kick_not_found_with_no_roster_match_reports_failure(monkeypatch):
+    """Roster fallback finds nothing better -- must still surface the original
+    not-found failure, not silently succeed or crash."""
+    target = SimpleNamespace(id=43)
+    monkeypatch.setattr(main, "_get_github_username_for_member", lambda m: "someuser")
+    monkeypatch.setattr(main, "_member_name_hints", lambda m: [])
+    monkeypatch.setattr(main, "resolve_member_email", AsyncMock(return_value="stale@example.com"))
+    monkeypatch.setattr(main, "PLAKY_API_KEY", "test-key")
+    monkeypatch.setattr(
+        main,
+        "call_plaky_bridge_kick",
+        AsyncMock(return_value={"success": False, "not_found": True, "error": "User not found in workspace"}),
+    )
+    monkeypatch.setattr(main, "find_user_email", Mock(return_value=None))
+
+    result = await main._maybe_handle_plaky_kick_on_kickout(SimpleNamespace(), target)
+
+    assert result == "Plaky: kick failed (User not found in workspace)"
+
+
+@pytest.mark.asyncio
 async def test_org_roster_fallback_matches_truncated_discord_handle(monkeypatch):
     """Real case: Discord handle 'mahlaka.' vs GitHub login 'samimahlaka' -- no
     explicit mapping, not found in #github-profiles, but the org roster itself
