@@ -900,12 +900,24 @@ def _github_it_team_dm_ask_text(member_name: str) -> str:
 async def _maybe_handle_plaky_kick_on_kickout(message: discord.Message, target: discord.Member) -> str:
     """Best-effort Plaky deactivate during kick-out: resolve the target's email
     (already-loaded identity chain) and hand it to the bridge. Returns a short
-    status line for the kick-out summary."""
+    status line for the kick-out summary.
+
+    resolve_member_email returns the cloud-DB email unconditionally once one
+    is on file, even if it's a stale/mistyped self-report that predates a
+    GitHub username later resolved during this same kick-out (org removal
+    step runs first and can pin down a real login). So when the bridge
+    reports the email-on-file as not-found in the workspace, retry once via
+    the Plaky roster fuzzy match keyed on that GitHub username/member hints
+    -- the same signal an invite would have used -- instead of just giving up
+    on a person who might still be sitting in the roster under their real
+    email."""
+    github_username = _get_github_username_for_member(target)
+    member_hints = _member_name_hints(target)
     try:
         email = await resolve_member_email(
             target.id,
-            github_username=_get_github_username_for_member(target),
-            member_hints=_member_name_hints(target),
+            github_username=github_username,
+            member_hints=member_hints,
             api_key=PLAKY_API_KEY or None,
         )
     except Exception:
@@ -916,6 +928,30 @@ async def _maybe_handle_plaky_kick_on_kickout(message: discord.Message, target: 
     result = await call_plaky_bridge_kick(email)
     if result.get("success"):
         return f"Plaky: deactivated {email}"
+    if result.get("not_found") and PLAKY_API_KEY and (github_username or member_hints):
+        names = [n for n in member_hints if n]
+        if github_username:
+            names.append(github_username)
+            # The raw login ('absolemzz') rarely resembles a Plaky roster
+            # entry -- GitHub's `name` field ('Ryan S.') is the same real-name
+            # signal find_user_email needs to fuzzy-match "Ryan Saenz".
+            if GITHUB_PAT:
+                try:
+                    profile = await asyncio.to_thread(get_user_profile, github_username, GITHUB_PAT)
+                    if profile.get("name"):
+                        names.append(profile["name"])
+                except Exception:
+                    logger.exception("GitHub profile lookup failed during Plaky kick fallback for %s", github_username)
+        try:
+            better_email = await asyncio.to_thread(find_user_email, names, PLAKY_API_KEY, [email])
+        except Exception:
+            logger.exception("Plaky roster fallback lookup failed for kick-out target %s", target.id)
+            better_email = None
+        if better_email and better_email.lower() != email.lower():
+            retry = await call_plaky_bridge_kick(better_email)
+            if retry.get("success"):
+                await remember_user_data(target.id, email=better_email, overwrite=True)
+                return f"Plaky: deactivated {better_email} (email on file was stale: {email})"
     return f"Plaky: kick failed ({result.get('error')})"
 
 
