@@ -209,6 +209,27 @@ async def test_invite_already_in_workspace_flags_reused_email_too(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_invite_reports_bridge_reactivation_distinctly(monkeypatch):
+    """The Plaky bridge now auto-reactivates a previously-deactivated member
+    instead of just reporting "already a member" -- e.g. resigning the IPCA
+    after being deactivated. That must surface as its own status ("Your
+    account was deactivated -- it's been reactivated"), not the generic
+    "invite sent, accept it from your inbox" text, since there's no invite
+    email to accept in this case."""
+    monkeypatch.setattr(main, "PLAKY_API_KEY", "pk")
+    monkeypatch.setattr(main, "call_plaky_bridge_invite", AsyncMock(return_value={"success": True, "status": "reactivated", "via": "browser"}))
+
+    status, email = await main._invite_member_to_plaky(
+        discord_id=42, discord_username="jane", email="joeblack@deepiri.com",
+    )
+
+    assert status == "reactivated"  # explicitly given -> not the "_from_file" variant
+    text = main._plaky_invite_status_text(status, email, "")
+    assert "reactivated" in text.lower()
+    assert "accept it from your inbox" not in text.lower()
+
+
+@pytest.mark.asyncio
 async def test_invite_explicit_email_persists_even_when_bridge_says_already(monkeypatch):
     """Real incident, end to end: Postgres has the stale "joeblacky@deepiri.com".
     The requester explicitly corrects it to "joeblack@deepiri.com" -- even

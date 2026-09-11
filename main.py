@@ -594,6 +594,13 @@ async def _invite_member_to_plaky(
     result = await call_plaky_bridge_invite(email, role=role)
     if result.get("success"):
         await persist_member_email(discord_id, discord_username, email, github_username=github_username, overwrite=email_was_given)
+        # The bridge auto-reactivates a previously-deactivated member instead
+        # of just reporting "already a member" and doing nothing -- surfaced
+        # as its own status so the reply says "reactivated", not "invite
+        # sent" (they're not accepting a fresh invite email; nothing to
+        # accept, they already have an account, it's just live again).
+        if result.get("status") == "reactivated":
+            return ("reactivated" if email_was_given else "reactivated_from_file", email)
         return ("ok" if email_was_given else "ok_from_file", email)
     # overwrite=email_was_given here too -- an explicit correction must be
     # saved even when the bridge reports "already" for the new address (real
@@ -609,6 +616,11 @@ def _plaky_invite_status_text(status: str, email: Optional[str], sender_mention:
     if status in ("ok", "ok_from_file"):
         text = f"✅ For the Plaky board invite, we just sent one to **{email}** — you should get an email shortly, accept it from there."
         if status == "ok_from_file":
+            text += " That's the email already on file for you -- reply with a different one if that's wrong."
+        return text
+    if status in ("reactivated", "reactivated_from_file"):
+        text = f"✅ For the Plaky board, your account for **{email}** was deactivated -- it's been reactivated, you should have access again."
+        if status == "reactivated_from_file":
             text += " That's the email already on file for you -- reply with a different one if that's wrong."
         return text
     if status in ("already", "already_from_file"):
@@ -766,7 +778,7 @@ async def _maybe_handle_plaky_add_request(message: discord.Message) -> bool:
             email=email,
             role="MEMBER",
         )
-        if status in ("asked", "ok_from_file", "already_from_file"):
+        if status in ("asked", "ok_from_file", "already_from_file", "reactivated_from_file"):
             # Real gap this closes: telling the requester "reply with a
             # different email if that's wrong" (the "_from_file" wording) did
             # nothing if they actually did reply -- no pending entry was ever
