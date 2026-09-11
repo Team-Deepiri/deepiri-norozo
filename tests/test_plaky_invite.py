@@ -218,6 +218,11 @@ async def test_invite_reports_bridge_reactivation_distinctly(monkeypatch):
     email to accept in this case."""
     monkeypatch.setattr(main, "PLAKY_API_KEY", "pk")
     monkeypatch.setattr(main, "call_plaky_bridge_invite", AsyncMock(return_value={"success": True, "status": "reactivated", "via": "browser"}))
+    # Explicit even though the autouse _cloud_identity_stub fixture already
+    # covers load_member_profile/save_member_identity (what persist_member_email
+    # calls into) -- named here per /sorge review for clarity that this
+    # success path's persistence isn't hitting anything real.
+    monkeypatch.setattr(main, "persist_member_email", AsyncMock())
 
     status, email = await main._invite_member_to_plaky(
         discord_id=42, discord_username="jane", email="joeblack@deepiri.com",
